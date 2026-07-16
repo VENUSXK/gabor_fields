@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+*.sublime-project
+*.sublime-workspace
+/.vscode
+/.vs
+.idea
+
+# ---------------------------------------------------------------------------
+# Python / packaging
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+/wheelhouse/
+build/
+# uv environment created by ./install.sh (holds the compiled Mitsuba wire-in)
+/.venv/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Jupyter
+# ---------------------------------------------------------------------------
+/.ipynb_checkpoints/
+*checkpoint.ipynb
+
+# ---------------------------------------------------------------------------
+# OS files
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Mitsuba submodule build artefacts
+# ---------------------------------------------------------------------------
+/submodules/mitsuba3/build*/
+/submodules/mitsuba3/dist*/
+
+# ---------------------------------------------------------------------------
+# Render output / experiment binaries (never tracked)
+# ---------------------------------------------------------------------------
+*.exr
+*.png
+*.jpg
+*.jpeg
+*.hdr
+*.npy
+*.mp4
+*.ply
+*.vol
+*.vdb
+*.zip
+
+# ...except the small reference assets shipped under data/.
+!data/**/*.png
+!data/**/*.jpg
+!data/**/*.jpeg
+!data/**/*.exr
+!data/**/*.npy
+!data/**/*.ply
+!data/**/*.vol
+
+# ---------------------------------------------------------------------------
+# results/  — everything written by the scripts.  Never tracked.
+# ---------------------------------------------------------------------------
+/results/
+
+# ---------------------------------------------------------------------------
+# Local data stores (hundreds of GB) — never tracked
+# ---------------------------------------------------------------------------
+/assets/
+/outputs/
+/renders/
+/resources/
+/teaser_scattering/
+
+
+# ---------------------------------------------------------------------------
+# Viewer session artifacts (polyscope / imgui write these to the CWD)
+# ---------------------------------------------------------------------------
+.polyscope.ini
+imgui.ini
+
+# Source volume grids (downloaded / converted locally, hundreds of MB–GB each,
+# never tracked).  See data/volumes/asset_sources.md for where to get them.
+/data/volumes/grids/
+
+# Slides / talk material — local only, never tracked.
+/presentation/
+
+.claude
+/results/
+/docs/

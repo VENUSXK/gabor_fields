@@ -1,0 +1,10 @@
+[submodule "mitsuba3"]
+	path = submodules/mitsuba3
+	url = https://github.com/Arcanous98/mitsuba3_gfields
+	branch = main
+[submodule "submodules/volprim"]
+	path = submodules/volprim
+	# TEMP: our fork with the fixed integral-math + 3.9/Dr.Jit-1.4
+	# fixes. Re-point to facebookresearch/volumetric_primitives once merged.
+	url = https://github.com/Arcanous98/volumetric_primitives.git
+	branch = main
