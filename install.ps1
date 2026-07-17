@@ -71,7 +71,8 @@ $Py = Join-Path $Venv "Scripts\python.exe"
 if (-not (Test-Path $Py)) { $Py = Join-Path $Venv "bin/python" }
 
 Write-Host "== 2/4  install python packages (editable) =="
-uv pip install --python $Py -e .
+# [viewer] pulls in polyscope so `gfields viewer` works out of the box.
+uv pip install --python $Py -e ".[viewer]"
 # volprim provides the `volprim.*` package gfields imports. Install it editable
 # with --no-deps so its 'mitsuba>=3.9' / 'drjit>=1.4' pins do NOT pull the stock
 # PyPI wheels over the locally compiled fork wired in step 3 (its other deps —

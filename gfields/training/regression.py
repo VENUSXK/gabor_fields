@@ -119,9 +119,10 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--track_grads',         action='store_true', help='Track gradients during optimization')
 
     # Post-training asset-refinement passes (run once optimization finishes)
+    parser.add_argument('--post_refine',         action='store_true', help='(experimental, off by default -- does not reliably improve results yet) After training, automatically prune then adaptively clamp the trained asset (implies --post_prune and --post_clamp; the clamp is baked into the asset .ply so renders use the tighter extents with no extra flag). Mirrors the render-time --refine.')
     parser.add_argument('--post_clamp',          action='store_true', help='After training, compute per-primitive adaptive extents for each level (gfields.training.adaptive) and save them.')
     parser.add_argument('--post_prune',          action='store_true', help='After training, run PSNR-budget pruning (gfields.training.post_pruning) on the trained asset.')
-    parser.add_argument('--post_prune_budget',   type=float, default=0.1,     help='PSNR budget (dB) for --post_prune: prune until PSNR would drop by this much. Safe default 0.1 dB.')
+    parser.add_argument('--post_prune_budget',   type=float, default=0.1,     help='PSNR budget (dB) for --post_prune / --post_refine: prune until PSNR would drop by this much. Safe default 0.1 dB.')
 
     # Optimization parameters
     parser.add_argument('--iterations_gaussian', type=int,   default=4096,    help='Number of iterations for the gradient descent optimization')
@@ -184,7 +185,7 @@ def setup() -> argparse.Namespace:
                      "raw --volume_grid mode you must also pass --output DIR")
 
     # create all output directories
-    output = Path(args.output)  # we don't overwrite the output in the args yet, so we can serialize the args to json file
+    output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
 
     (output / 'frames_pyr0').mkdir(exist_ok=True)
@@ -201,7 +202,7 @@ def setup() -> argparse.Namespace:
     if wandb is not None:
         wandb.init(project='gabor', entity='nihermann', config=vars(args))
 
-    args.output = output  # now we can overwrite the output in the args
+    args.output = output  # reassign as Path only after args were serialized to json
 
     if args.skip_gaussian_optim and args.from_gaussian_checkpoint == "":
         if (ckpt_path := (output / "optimized_asset_pyr0" / "npy_data")).exists():
@@ -406,7 +407,6 @@ def render_reference_images(
             len(ref_image_paths) == len(cameras)
         )
     else:
-        # Fall back to old behavior if cache params not provided
         cache_valid = len(ref_image_paths) == len(cameras)
 
     if cache_valid and not regen:
@@ -798,7 +798,7 @@ def create_scene_dict_from_primitives(
         albedo: (N, 3) primitive albedo colors
         omega: (N, 1) or (N, 3) Gabor frequency parameters. A level oscillates
             (is "Gabor") wherever omega != 0 and is a plain Gaussian where
-            omega == 0; the shape no longer carries a separate is_gabor flag.
+            omega == 0.
         extent: Bounding extent in sigma units (default 3.0)
             Higher frequency Gabors can use smaller extents due to exp(-ω²/2) decay.
             See gfields.training.adaptive for computing optimal per-level extents.
@@ -823,8 +823,7 @@ def create_scene_dict_from_primitives(
         integrator['use_anyhit'] = True
         
     # The shape derives Gabor vs Gaussian purely from the per-primitive
-    # ``omega`` column (nonzero => oscillates); it no longer accepts an
-    # is_gabor/kernel_type property.
+    # ``omega`` column (nonzero => oscillates).
     prim_dict: Dict[str, Any] = {
         'type': 'ellipsoidsmesh',
         'shell': 'uv_sphere',
@@ -989,9 +988,9 @@ def load_model(path: Path, max_depth: int, integrator_type: str = 'gfields_tomog
         'integrator': integrator,
         'environment': { 'type': 'constant' }
     }
-    # Discover pyramid levels from the canonical unified store: one
+    # Discover pyramid levels from the unified store: one
     # root.primitives_pyr*.ply per level under <asset>/data/ (written by
-    # save_model). Legacy per-array centers_pyr*.npy are no longer read.
+    # save_model).
     import gfields.io
     ply_dir = (path.parent if path.name == 'npy_data' else path) / 'data'
     levels = sorted(int(f.name.split('_pyr')[-1].split('.')[0])
@@ -1068,13 +1067,10 @@ def relocate_dead_primitives(opt: gfields.optimizers.BoundedAdam, params: mi.Sce
     alive_opacities = dr.abs(opacities[alive_indices])
 
     # Sample live primitives with replacement to get target indices for the
-    # dead ones, proportional to |opacity| (the 3DGS-MCMC convention).
-    # NOTE: this was previously proportional to opacity / volume, which is
-    # catastrophic in the presence of near-zero scales: a collapsed primitive
-    # has astronomical point density, dominates the target distribution, and
-    # every relocation round then *clones its degenerate geometry onto all
-    # dead primitives* (legacy assets accumulated up to 33% collapsed
-    # primitives this way).
+    # dead ones, proportional to |opacity| (the 3DGS-MCMC convention). Weighting
+    # by opacity/volume instead is catastrophic with near-zero scales: a
+    # collapsed primitive has astronomical point density, dominates the target
+    # distribution, and clones its degenerate geometry onto every dead primitive.
     sampling_probs = alive_opacities / dr.sum(alive_opacities)
     probs = np.nan_to_num(np.asarray(sampling_probs.numpy(), dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     total = probs.sum()
@@ -1122,8 +1118,7 @@ def add_primitives_to_opt_and_scene(opt: mi.ad.Optimizer, params: mi.SceneParame
         # Build the new-primitive values as type(old_vals), robust to the source
         # layout. 1D params (Float: opacities/omega) need a flat (num_kernels,)
         # array; vector params (Vector3f/Quaternion4f) need component-major
-        # (C, num_kernels) -- np.array(Vector3f) is (C, N). The old code did
-        # type(old_vals)(2D) which crashed for the Float params.
+        # (C, num_kernels) -- np.array(Vector3f) is (C, N).
         nv = np.asarray(new_vals.numpy() if hasattr(new_vals, 'numpy') else new_vals)
         nv = np.squeeze(nv)
         if old_vals.ndim == 1:
@@ -1214,7 +1209,7 @@ def prune(opt: mi.ad.Optimizer, scene_params: mi.SceneParameters, level: int, ru
     if custom_th is not None:
         th = custom_th
 
-    valid = (weight > th) # Pruning threshold based on density and scale 1e-6 and 1e-4 originally
+    valid = (weight > th)
 
     # Scale-collapsed primitives are invisible at render resolution (no data
     # gradient, ~zero covariance-scaled MCMC noise) and must not survive to

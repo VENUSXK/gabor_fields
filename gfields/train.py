@@ -529,8 +529,7 @@ densify_idx = 0
 # and the coarser entries are lower-frequency references. densify() adds new
 # primitives where |pyr[0] - pyr[band]| (the high-frequency residual) is large.
 # ref_volume (gabor target) and gauss_ref_volume (gaussian/low-pass target) share
-# the same grid shape, so their difference is the gabor-relevant detail. This was
-# previously undefined, which crashed any run with densify_until > 0.
+# the same grid shape, so their difference is the gabor-relevant detail.
 pyr = [ref_volume, gauss_ref_volume]
 
 lr_scheduler = LRScheduler(
@@ -740,27 +739,41 @@ callbacks.on_optim_end()
 # here never invalidates the already-saved optimized asset.
 # ---------------------------------------------------------------------------
 _asset_dir = args.output / f'optimized_asset_pyr{GABOR_LVL}'
+# --post_refine is the one-flag combo: prune, then adaptively clamp. --post_prune
+# / --post_clamp still enable each half on its own (clamp then writes only the
+# sidecar extents; the combo bakes them into the asset so renders pick them up).
+_post_refine = getattr(args, 'post_refine', False)
+_do_prune = getattr(args, 'post_prune', False) or _post_refine
+_do_clamp = getattr(args, 'post_clamp', False) or _post_refine
+# Prune runs first so the clamp only sizes the survivors; when refining, the
+# clamp retargets the freshly-written pruned asset.
+_clamp_dir = _asset_dir
 
-if getattr(args, 'post_clamp', False):
-    blue(f'\n{Effect.BOLD}Post-training: adaptive extent clamping{Effect.BOLD_OFF}')
-    try:
-        from gfields.training.adaptive import clamp_asset_level
-        for _lvl in range(GABOR_LVL + 1):
-            try:
-                clamp_asset_level(_asset_dir, _lvl)
-            except FileNotFoundError as _e:
-                yellow(f'  [post_clamp] skipped level {_lvl}: {_e}')
-    except Exception as _e:  # noqa: BLE001 - never lose the trained asset
-        yellow(f'  [post_clamp] failed (trained asset is intact): {_e}')
-
-if getattr(args, 'post_prune', False):
+if _do_prune:
     blue(f'\n{Effect.BOLD}Post-training: PSNR-budget pruning '
          f'(budget {args.post_prune_budget:.2f} dB){Effect.BOLD_OFF}')
     try:
         from gfields.training.post_pruning import prune as _prune_asset
-        _prune_asset(_asset_dir, 'opacity',
-                     PSNR_budget=args.post_prune_budget, save_assets=True)
+        _stats = _prune_asset(_asset_dir, 'opacity',
+                              PSNR_budget=args.post_prune_budget, save_assets=True)
+        if _post_refine and isinstance(_stats, dict) and _stats.get('output_dir'):
+            _pruned = Path(_stats['output_dir']) / f'optimized_asset_pyr{GABOR_LVL}'
+            if _pruned.exists():
+                _clamp_dir = _pruned
     except Exception as _e:  # noqa: BLE001 - never lose the trained asset
         yellow(f'  [post_prune] failed (trained asset is intact): {_e}')
+
+if _do_clamp:
+    blue(f'\n{Effect.BOLD}Post-training: adaptive extent clamping'
+         f'{" (baking into pruned asset)" if _post_refine else ""}{Effect.BOLD_OFF}')
+    try:
+        from gfields.training.adaptive import clamp_asset_level
+        for _lvl in range(GABOR_LVL + 1):
+            try:
+                clamp_asset_level(_clamp_dir, _lvl, bake_into_ply=_post_refine)
+            except FileNotFoundError as _e:
+                yellow(f'  [post_clamp] skipped level {_lvl}: {_e}')
+    except Exception as _e:  # noqa: BLE001 - never lose the trained asset
+        yellow(f'  [post_clamp] failed (trained asset is intact): {_e}')
 
 

@@ -83,6 +83,15 @@ the presets and assets used in the paper, and are kept just as a reference.
 
 Output -> `results/checkpoints/<asset>/`.
 
+The optional **`--post_refine`** flag (off by default; **experimental** refines
+the asset once optimization finishes: it prunes very shallow primitives
+(with a PSNR loss budget, `--post_prune_budget`, default 0.1 dB) then adaptively
+clamps the survivors' per-primitive extents, baking the tighter extents into the
+asset `.ply` so later renders use them with no extra flag. `--post_prune` and
+`--post_clamp` run each half on its own (the standalone clamp writes only a
+sidecar `extents_pyr*.npy`). We are still tuning this feature so use with
+caution.
+
 ---
 
 ## Render
@@ -113,12 +122,24 @@ We include several trained assets under `data/examples/`and you can interactivel
 visualize them with our viewer:
 
 ```bash
-gfields viewer                                      # bundled wdas8 cloud + env map
+gfields viewer                                      # bundled wdas8 cloud (tomography, constant emitter)
+gfields viewer --integrator prb                     # multiple scattering + bundled env map
 gfields viewer data/examples/tornado --envmap sky.exr --integrator prb
 ```
 
 Interactive polyscope viewer with progressive accumulation and an LOD slider;
-launcher: `examples/view.{sh,ps1}`.
+all three integrators are switchable live (`tomography` / `prb` /
+`prb_stochastic` — the latter Gaussian-only assets) together with their
+stochastic LOD criteria, NEE transmittance / shell-truncation modes and the
+any-hit fast paths (on by default; `--no_anyhit` disables them at launch). The launch defaults are
+deterministic tomography with any-hit and the constant emitter (radiance 1.0,
+matching training); the multiple-scattering modes default to the bundled
+environment map instead — also when switching modes live (an explicit
+`--envmap` applies to every mode).
+Launcher: `examples/view.{sh,ps1}`. The installer pulls in its
+[polyscope](https://polyscope.run/py/) dependency; if you set up the environment
+before that or see `No module named 'polyscope'`, install it with
+`uv pip install -e ".[viewer]"` (or `pip install polyscope`).
 
 ---
 

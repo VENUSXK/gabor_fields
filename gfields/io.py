@@ -28,10 +28,9 @@ def get_plugin_type(obj):
     '''
     if isinstance(obj, mi.Scene):
         return 'scene'
-    # Mitsuba 3.9 removed `class_().alias()` (and offers no class-name -> alias
-    # lookup); use `class_name()` (the C++ class name -- `type(obj).__name__`
-    # only reports the bound base, e.g. 'Mesh' for an EllipsoidsMesh). Older
-    # builds keep the alias() path.
+    # Resolve the C++ class name. `type(obj).__name__` only reports the bound
+    # base (e.g. 'Mesh' for an EllipsoidsMesh), so prefer `class_().alias()` /
+    # `class_name()` depending on which the current Mitsuba build exposes.
     if hasattr(obj, 'class_') and callable(obj.class_):
         cname = obj.class_().alias()
     elif hasattr(obj, 'class_name'):
@@ -544,12 +543,11 @@ def load_steerable_ply(filename):
 
 
 # ---------------------------------------------------------------------------
-# Legacy per-array npy asset layout (DEPRECATED)
+# Legacy per-array npy asset layout
 # ---------------------------------------------------------------------------
-# Before the unified data/*.ply store, assets were kept as one .npy per
-# attribute per level under ``npy_data/``. These loaders read that layout
-# directly so pre-migration assets still open; the npy layout is deprecated
-# and will be removed -- re-save assets via ``dict_to_asset`` / a fresh run.
+# Assets kept as one .npy per attribute per level under ``npy_data/``. These
+# loaders read that layout directly so pre-.ply assets still open; new assets
+# use the unified data/*.ply store written by ``dict_to_asset``.
 
 def npy_asset_levels(npy_dir):
     """Sorted pyramid level indices present in a legacy ``npy_data/`` dir."""

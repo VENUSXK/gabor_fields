@@ -61,6 +61,7 @@ setup(
         "test": ["pytest>=7.0"],
         "metrics": ["scikit-image>=0.19", "torch>=1.13", "lpips>=0.1.4", "flip-evaluator>=1.0"],
         "training": ["torch>=1.13", "wandb>=0.15"],
+        "viewer": ["polyscope>=2.2"],  # interactive Polyscope viewer (gfields viewer)
     },
     classifiers=[
         "Programming Language :: Python :: 3",

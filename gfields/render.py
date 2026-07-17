@@ -32,7 +32,11 @@ mi.set_variant('cuda_ad_rgb')
 import drjit as dr
 import gfields as vp
 
-from gfields.training.adaptive import clamp_extents as compute_adaptive_extent_per_primitive
+from gfields.training.adaptive import (
+    clamp_extents as compute_adaptive_extent_per_primitive,
+    refine_level_arrays,
+    DEFAULT_REFINE_PRUNE_THRESHOLD as ADAPTIVE_REFINE_DEFAULT,
+)
 from gfields.rendering.pipeline import (
     AssetInfo,
     apply_asset_render_defaults,
@@ -51,50 +55,95 @@ ADAPTIVE_EXTENT_AVAILABLE = True
 
 np.random.seed(0)
 
+
+def _level_primitive_subset(asset_info: AssetInfo, level: int, args):
+    """Boolean keep-index (or None) for one level's ``load_pyramid_level`` call.
+
+    Combines a render-time ``--refine`` prune mask (``asset_info.prune_masks``)
+    with an explicit ``--primitive_subset`` head slice. Returns ``None`` when
+    neither is active, so the default all-primitives path is unchanged.
+    """
+    mask = asset_info.prune_masks.get(level)
+    if args.primitive_subset is not None:
+        n = asset_info.num_primitives[level]
+        head = np.zeros(n, dtype=bool)
+        head[:int(args.primitive_subset)] = True
+        mask = head if mask is None else (mask & head)
+    return mask
+
 # =============================================================================
 # Output Path Utilities
 # =============================================================================
 
+def build_flags_summary(args, render_mode: str, scattering_mode: str) -> str:
+    """Short, readable folder name summarising the render settings.
+
+    Examples::
+
+        tomography_spp1                 # the plain default
+        ms_stochastic_spp64             # multiple scattering, stochastic, 64 spp
+        gauss_pyr_tomography_spp8       # Gaussian-pyramid render
+        tomography_spp1_refine          # with --refine
+
+    The asset name is a separate path component, so it is not repeated here.
+    """
+    tokens: List[str] = []
+    mode_token = {
+        'full': None,  # the common case -> keep the folder short
+        'gaussian_pyr': 'gauss_pyr',
+        'laplacian_pyr': 'lap_pyr',
+        'steerable': 'steerable',
+    }.get(render_mode, render_mode)
+    if mode_token:
+        tokens.append(mode_token)
+    tokens.append('ms' if scattering_mode == 'multi' else 'tomography')
+    if getattr(args, 'stochastic_sampling', False):
+        tokens.append('stochastic')
+    tokens.append(f'spp{args.spp}')
+    if getattr(args, 'refine', False):
+        tokens.append('refine')
+    elif getattr(args, 'adaptive_extent', False):
+        tokens.append('ae')
+    extra = str(getattr(args, 'path_add', '') or '').strip()
+    if extra:
+        tokens.append(extra.replace(' ', '-'))
+    return '_'.join(tokens)
+
+
 @dataclass
 class OutputConfig:
-    """Configuration for output file naming and organization."""
+    """Where renders are written: ``<base_dir>/<asset_name>/<flags_summary>/``."""
     base_dir: str
     asset_name: str
-    render_mode: str      # 'full', 'gaussian_pyr', 'laplacian_pyr'
-    scattering_mode: str  # 'tomography', 'multi'
-    
+    flags_summary: str  # compact render-settings tag, see build_flags_summary
+
     @property
     def experiment_dir(self) -> str:
-        """Get the experiment output directory."""
-        return os.path.join(self.base_dir, f"{self.asset_name}_{self.render_mode}_{self.scattering_mode}")
-    
-    def get_frame_path(self, 
+        """Per-render output directory: ``output/<asset>/<flags summary>``."""
+        return os.path.join(self.base_dir, self.asset_name, self.flags_summary)
+
+    def get_frame_path(self,
                        frame_idx: int = 0,
                        cam_idx: Optional[int] = None,
                        level_idx: Optional[int] = None,
                        suffix: str = "") -> str:
+        """Path for one rendered image inside :attr:`experiment_dir`.
+
+        A plain single render is just ``render.exr``. A run that emits several
+        images at once (all cameras, pyramid levels, benchmark frames) adds the
+        minimal disambiguator it needs (``render_cam05.exr``,
+        ``render_level2.exr``, ...). Re-rendering the same settings overwrites
+        the file on purpose -- keeping earlier renders is left to the user.
         """
-        Generate a descriptive filename for a rendered frame.
-        
-        Examples:
-            cloud_1_full_tomography_cam11.exr
-            cloud_1_gaussian_pyr_multi_level2_cam05.exr
-            cloud_1_full_multi_video_frame0042.exr
-        """
-        parts = [self.asset_name]
-        
+        parts: List[str] = ["render"]
         if level_idx is not None:
             parts.append(f"level{level_idx}")
-        
         if cam_idx is not None:
             parts.append(f"cam{str(cam_idx).zfill(2)}")
-        
+        if frame_idx > 0:
+            parts.append(f"frame{str(frame_idx).zfill(4)}")
         if suffix:
             parts.append(suffix)
-        
-        if frame_idx > 0 or (cam_idx is None and level_idx is None and not suffix):
-            parts.append(f"frame{str(frame_idx).zfill(4)}")
-        
         filename = "_".join(parts) + ".exr"
         return os.path.join(self.experiment_dir, filename)
 
@@ -217,7 +266,24 @@ def parse_args():
                         help='Minimum extent value for adaptive extent (default: 0.1)')
     parser.add_argument('--envelope_only', action='store_true',
                         help='Ignore frequency term, use only Gaussian envelope for extent (treats Gabors like Gaussians)')
-    
+
+    # One-shot asset refinement before rendering (non-destructive): drop
+    # negligible primitives and adaptively clamp the survivors' extents.
+    parser.add_argument('--refine', '-R', action='store_true',
+                        help='(experimental, off by default -- does not reliably improve results yet) Before '
+                             'rendering, auto-prune low-density primitives and adaptively clamp per-primitive '
+                             'extents (implies --adaptive_extent; pairs with --prune_threshold). Non-destructive: '
+                             'the on-disk asset is untouched. Same math as train.py --post_refine.')
+    parser.add_argument('--prune_threshold', type=float, default=None,
+                        help='Peak-density cutoff for render-time pruning: drop primitives whose peak contribution '
+                             'is below this. Enables pruning on its own; with --refine and left unset it defaults '
+                             f'to {ADAPTIVE_REFINE_DEFAULT:g}.')
+    parser.add_argument('--prune_include_frequency', action='store_true', default=True,
+                        help='Include the Gabor frequency decay in the peak-density estimate used for pruning '
+                             '(default: on).')
+    parser.add_argument('--no_prune_include_frequency', dest='prune_include_frequency', action='store_false',
+                        help='Estimate peak density from the Gaussian envelope only when pruning.')
+
     # Environment
     parser.add_argument('--envmap', type=str,
                         default='./data/envmaps/qwantani_dusk_2_1k.exr',
@@ -324,8 +390,8 @@ def _video_parse_args() -> argparse.Namespace:
     p.add_argument('--envmap', default=str(default_envmap),
                    help='Environment map (EXR/HDR)')
     p.add_argument('--envmap_scale', type=float, default=0.8)
-    p.add_argument('--output', default='results/renders/video',
-                   help='Output directory for frames + MP4')
+    p.add_argument('--output', default='output',
+                   help='Output root; frames + MP4 go to <output>/<asset>/video_<motion>_spp<N>/')
     p.add_argument('--spp', type=int, default=64)
     p.add_argument('--frames', type=int, default=120)
     p.add_argument('--framerate', type=float, default=30.0)
@@ -414,14 +480,15 @@ def run_video() -> None:
     from gfields.cameras import create_side_top_camera
     from gfields.rendering import video as video_io
     args = _video_parse_args()
-    out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
     asset_dir = resolve_asset_path(args.asset)
     # Prefer the human-readable asset name (e.g. "smoke") over the resolved
     # "optimized_asset_pyrN" subfolder when naming the outputs.
     name = get_asset_name(asset_dir)
     if name.startswith('optimized_asset_pyr') or name == 'npy_data':
         name = get_asset_name(Path(asset_dir).parent)
+    # output/<asset>/video_<motion>_spp<N>/ , matching the still-render layout.
+    out_dir = Path(args.output) / name / f'video_{args.motion}_spp{args.spp}'
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f'Rendering {args.motion} video: {asset_dir}')
     print(f'  envmap: {args.envmap}  | frames: {args.frames} @ {args.framerate}fps'
@@ -454,12 +521,12 @@ def run_video() -> None:
                 params.update()
             img = mi.render(scene, params, sensor=fixed_sensor,
                             spp=args.spp, seed=args.seed)
-        frame_path = str(out_dir / f'{name}_{args.motion}_{f:04d}.exr')
+        frame_path = str(out_dir / f'frame_{f:04d}.exr')
         mi.util.write_bitmap(frame_path, img)
         frame_paths.append(frame_path)
 
     if not args.no_video and frame_paths:
-        out_mp4 = str(out_dir / f'{name}_{args.motion}.mp4')
+        out_mp4 = str(out_dir / 'render.mp4')
         video_io.assemble(frame_paths, out_mp4, framerate=args.framerate,
                           crf=args.crf)
     print(f'Done: {len(frame_paths)} frames in {out_dir}')
@@ -502,12 +569,22 @@ def main():
     asset_info = detect_asset_info(args.asset)
     print(f"Detected asset: {asset_info}")
     
-    # Compute per-primitive adaptive extents if requested (overrides asset extents)
-    if args.adaptive_extent:
+    # One-shot pre-render refinement (opt-in, non-destructive): adaptively clamp
+    # per-primitive extents and/or prune negligible primitives. --refine turns on
+    # both; --adaptive_extent / --prune_threshold enable each half on its own.
+    do_clamp = args.adaptive_extent or args.refine
+    prune_threshold = args.prune_threshold
+    if prune_threshold is None and args.refine:
+        prune_threshold = ADAPTIVE_REFINE_DEFAULT
+    do_prune = prune_threshold is not None
+
+    if do_clamp or do_prune:
         if not ADAPTIVE_EXTENT_AVAILABLE:
             print("Warning: adaptive_extent module not available, using default extents")
         else:
-            print("\nComputing per-primitive adaptive extents...")
+            what = " + ".join([w for w, on in
+                               (("adaptive extents", do_clamp), ("pruning", do_prune)) if on])
+            print(f"\nRefining asset before render ({what})...")
             import gfields.io
             for level in range(asset_info.num_levels):
                 # Load scales, omega, opacities for this level from the unified
@@ -516,37 +593,32 @@ def main():
                     os.path.join(asset_info.ply_folder, f'root.primitives_pyr{level}.ply'))
                 scales = np.asarray(a['scales'], dtype=np.float32)
 
-                # Load omega if available
-                omega = None
-                if 'omega' in a:
-                    omega = np.asarray(a['omega'], dtype=np.float32)
+                omega = np.asarray(a['omega'], dtype=np.float32) if 'omega' in a else None
+                opac_key = next((k for k in ('opacities', 'sigma_t', 'sigmat') if k in a), None)
+                opacities = np.asarray(a[opac_key], dtype=np.float32) if opac_key else None
 
-                # Load opacities (try different naming conventions)
-                if 'opacities' in a:
-                    opacities = np.asarray(a['opacities'], dtype=np.float32)
-                elif 'sigma_t' in a:
-                    opacities = np.asarray(a['sigma_t'], dtype=np.float32)
-                elif 'sigmat' in a:
-                    opacities = np.asarray(a['sigmat'], dtype=np.float32)
-                else:
-                    opacities = None
-
-                # Compute per-primitive adaptive extents
-                per_prim_extents = compute_adaptive_extent_per_primitive(
-                    scales=scales,
-                    omega=omega,
-                    opacities=opacities,
-                    base_extent=args.kernel_extent,
-                    min_extent=args.min_extent,
-                    threshold=args.extent_threshold,
+                keep_mask, per_prim_extents = refine_level_arrays(
+                    scales, omega=omega, opacities=opacities,
+                    prune_threshold=prune_threshold,
+                    prune_include_frequency=args.prune_include_frequency,
+                    clamp=do_clamp,
+                    base_extent=args.kernel_extent, min_extent=args.min_extent,
+                    extent_threshold=args.extent_threshold,
                     envelope_only=args.envelope_only,
                 )
-                asset_info.extents[level] = per_prim_extents
-                print(f"  Level {level}: n={len(per_prim_extents)}, "
-                      f"extent range=[{per_prim_extents.min():.3f}, {per_prim_extents.max():.3f}], "
-                      f"mean={per_prim_extents.mean():.3f}")
+
+                summary = [f"n={len(scales)}"]
+                if per_prim_extents is not None:
+                    asset_info.extents[level] = per_prim_extents
+                    summary.append(f"extent=[{per_prim_extents.min():.3f}, {per_prim_extents.max():.3f}] "
+                                   f"mean={per_prim_extents.mean():.3f}")
+                if keep_mask is not None:
+                    asset_info.prune_masks[level] = keep_mask
+                    kept = int(keep_mask.sum())
+                    summary.append(f"kept {kept}/{len(keep_mask)} (pruned {len(keep_mask) - kept})")
+                print(f"  Level {level}: " + ", ".join(summary))
             print()
-    
+
     # Determine rendering mode
     if args.render_pyramid_gaussian:
         render_mode = 'gaussian_pyr'
@@ -556,15 +628,14 @@ def main():
         render_mode = 'full'
     
     scattering_mode = 'multi' if args.multiple_scattering else 'tomography'
-    
-    # Setup output configuration
+
+    # Setup output configuration: output/<asset>/<flags summary>/
     output_config = OutputConfig(
         base_dir=args.output,
         asset_name=get_asset_name(args.asset),
-        render_mode=render_mode,
-        scattering_mode=scattering_mode,
+        flags_summary=build_flags_summary(args, render_mode, scattering_mode),
     )
-    
+
     # Create experiment output directory
     os.makedirs(output_config.experiment_dir, exist_ok=True)
     print(f"Output directory: {output_config.experiment_dir}")
@@ -657,7 +728,8 @@ def render_pyramid_mode(args, asset_info: AssetInfo, cameras: List, output_confi
             level_extent = asset_info.extents.get(j, args.kernel_extent)
             primitives = load_pyramid_level(
                 asset_info, j, albedo_scale=args.albedo, opacity_scale=args.opacity_scaler,
-                primitive_subset=args.primitive_subset, extent=level_extent, world_scale=args.asset_scale,
+                primitive_subset=_level_primitive_subset(asset_info, j, args),
+                extent=level_extent, world_scale=args.asset_scale,
                 albedo_rgb=args.albedo_rgb, use_asset_albedo=args.use_asset_albedo,
             )
             primitives['visibility_mask'] = 2 ** j
@@ -674,10 +746,10 @@ def render_pyramid_mode(args, asset_info: AssetInfo, cameras: List, output_confi
         else:
             scene = mi.load_dict(scene_dict)
             img = render_single_frame(scene, cameras[args.cam_index], args.spp)
-            output_path = output_config.get_frame_path(level_idx=level_idx, cam_idx=args.cam_index)
+            output_path = output_config.get_frame_path(level_idx=level_idx)
             mi.util.write_bitmap(output_path, img)
             print(f"  Saved: {os.path.basename(output_path)}")
-        
+
         # Cleanup
         gc.collect()
         dr.flush_kernel_cache()
@@ -734,25 +806,21 @@ def render_full_asset(args, asset_info: AssetInfo, cameras: List, output_config:
         ),
     }
     
-    # Convert primitive_subset from int to slice if provided
-    primitive_subset = None
-    if args.primitive_subset is not None:
-        primitive_subset = slice(0, args.primitive_subset)
-    
     # Add pyramid levels up to max_level
     for level in range(max_level):
         # Use per-level extent from asset, or fall back to command-line argument
         level_extent = asset_info.extents.get(level, args.kernel_extent)
         primitives = load_pyramid_level(
             asset_info, level, albedo_scale=args.albedo, opacity_scale=args.opacity_scaler,
-            primitive_subset=primitive_subset, extent=level_extent, world_scale=args.asset_scale,
+            primitive_subset=_level_primitive_subset(asset_info, level, args),
+            extent=level_extent, world_scale=args.asset_scale,
             albedo_rgb=args.albedo_rgb, use_asset_albedo=args.use_asset_albedo,
         )
         # visibility_mask = 2**level: the LODSelector's per-ray mask (driven by
         # pyramid_level_count + the selection criterion) picks which levels a ray
-        # traverses. This works once the integrator receives pyramid_level_count
-        # (see create_integrator_config -- the tomography config previously dropped
-        # it, collapsing the ray mask to bit 0 and hiding every Gabor level).
+        # traverses. Requires the integrator to receive pyramid_level_count (see
+        # create_integrator_config); without it the ray mask collapses to bit 0
+        # and every Gabor level is hidden.
         vis_bit = 2 ** level
         primitives['visibility_mask'] = vis_bit
         scene_dict[f'primitives_pyr{level}'] = primitives
@@ -777,7 +845,7 @@ def render_full_asset(args, asset_info: AssetInfo, cameras: List, output_config:
     else:
         scene = mi.load_dict(scene_dict)
         img = render_single_frame(scene, cameras[args.cam_index], args.spp)
-        output_path = output_config.get_frame_path(cam_idx=args.cam_index)
+        output_path = output_config.get_frame_path()
         mi.util.write_bitmap(output_path, img)
         print(f"Saved: {os.path.basename(output_path)}")
 
@@ -800,13 +868,12 @@ def render_steerable_asset(args):
     
     # Determine rendering mode
     scattering_mode = 'multi' if args.multiple_scattering else 'tomography'
-    
-    # Setup output configuration
+
+    # Setup output configuration: output/<asset>/<flags summary>/
     output_config = OutputConfig(
         base_dir=args.output,
         asset_name=get_asset_name(args.asset),
-        render_mode='steerable',
-        scattering_mode=scattering_mode,
+        flags_summary=build_flags_summary(args, 'steerable', scattering_mode),
     )
     os.makedirs(output_config.experiment_dir, exist_ok=True)
     print(f"Output directory: {output_config.experiment_dir}")
@@ -933,7 +1000,7 @@ def render_steerable_asset(args):
     else:
         print(f"Rendering camera {args.cam_index}...")
         img = render_single_frame(scene, cameras[args.cam_index], args.spp)
-        output_path = output_config.get_frame_path(cam_idx=args.cam_index)
+        output_path = output_config.get_frame_path()
         mi.util.write_bitmap(output_path, img)
         print(f"Saved: {os.path.basename(output_path)}")
     
@@ -970,7 +1037,7 @@ def render_with_benchmark(args, scene_dict: Dict, cameras: List, output_config: 
         img = render_asset(
             spp=args.spp, sensor=cameras[args.cam_index], scene=scene, label='single_cam'
         )
-        output_path = output_config.get_frame_path(cam_idx=args.cam_index, suffix="benchmark")
+        output_path = output_config.get_frame_path(suffix="benchmark")
         mi.util.write_bitmap(output_path, img)
         print(f"Saved: {os.path.basename(output_path)}")
 

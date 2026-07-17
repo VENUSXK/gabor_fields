@@ -123,8 +123,8 @@ def resolve_volume(volume: str | Path) -> Path:
 #     slightly lower PSNR than starting at the budget — so densification stays
 #     off; slower MCMC noise decay and gentler LRs bring no gain.)
 #
-# Primitive counts and density (--opacity_scale) are basically the only knobs
-# that differ across volumes in practice, so a single default recipe covers
+# Primitive counts and density (--opacity_scale) are the main knobs that differ
+# across volumes in practice, so a single default recipe covers
 # most assets; override --gauss_count/--gabor_count/--opacity_scale from the
 # CLI for anything unusual (they win over the injected defaults below). Other
 # known-good (gauss, gabor) combos, roughly increasing in quality/cost:
@@ -161,10 +161,9 @@ GAUSSIAN_MODE = "--gauss_target_level 0 --gauss_count 24576 --skip_gabor_optim".
 # (only "smoke" ships in the repo; the others require external volume data).
 DEFAULT_ASSET = "smoke"
 
-# Named assets -> volume-grid path. This is just a shorthand for known volume
-# files; per-asset training flags aren't baked in here anymore (see
-# TRAIN_RECIPE above) — pass --gauss_count/--gabor_count/--opacity_scale etc.
-# on the CLI to tune an individual asset.
+# Named assets -> volume-grid path. Shorthand for known volume files; per-asset
+# training flags are not baked in here (see TRAIN_RECIPE above) — pass
+# --gauss_count/--gabor_count/--opacity_scale etc. on the CLI to tune an asset.
 TRAIN_ASSETS = {
     "wdas8": "data/volumes/grids/wdas8.npy",
     "embergen": "data/volumes/grids/embergen.npy",

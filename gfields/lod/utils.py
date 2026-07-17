@@ -219,11 +219,10 @@ def load_pyramid_target_levels(asset_root: Path) -> tuple[int, int]:
 def is_gabor_from_omega(omega: Any) -> bool:
     """Single source of truth for "does this band oscillate?".
 
-    The shape plugin no longer carries an ``is_gabor``/``kernel_type`` flag: the
-    Gabor-Gaussian kernel is a plain Gaussian exactly when ``omega == 0``
-    (``cos(0) == 1``) and oscillates for any nonzero ``omega``. Gabor-ness is
-    therefore derived from the ``omega`` column wherever a boolean is needed.
-    ``omega is None`` (a level stored without the column) is treated as Gaussian.
+    The Gabor-Gaussian kernel is a plain Gaussian exactly when ``omega == 0``
+    (``cos(0) == 1``) and oscillates for any nonzero ``omega``, so Gabor-ness is
+    derived from the ``omega`` column wherever a boolean is needed. ``omega is
+    None`` (a level stored without the column) is treated as Gaussian.
     """
     if omega is None:
         return False
@@ -370,8 +369,8 @@ def numpy_level_to_mesh_entry(
     n = data["centers"].shape[0]
     # Gabor-ness is read straight off the ``omega`` column by the kernel: a
     # primitive is a plain Gaussian exactly when ``omega == 0`` (cos(0)=1). To
-    # render a level as Gaussian, zero its omega before calling this (the shape
-    # no longer takes an is_gabor/kernel_type flag). See is_gabor_from_omega.
+    # render a level as Gaussian, zero its omega before calling this
+    # (see is_gabor_from_omega).
     extent = data["extent"]
     if np.asarray(extent).shape[0] != n:
         extent = np.full((n, 1), float(np.asarray(extent).reshape(-1)[0]), dtype=np.float32)

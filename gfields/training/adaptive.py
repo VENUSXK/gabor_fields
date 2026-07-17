@@ -17,8 +17,13 @@ smaller OptiX shells -> faster traversal with negligible visual change.
 
 This is a post-training asset-refinement pass: :func:`clamp_asset_level`
 computes the extents for one on-disk pyramid level, and ``train.py`` can run it
-automatically at the end of optimization (``--post_clamp``). The CLI
+automatically at the end of optimization (``--post_clamp``, or ``--post_refine``
+to prune first and bake the extents into the asset). The CLI
 (``gfields decompose clamp``) exposes the same helper standalone.
+
+:func:`refine_level_arrays` is the shared prune+clamp core used by both the
+render-time ``--refine`` flag (in-memory, non-destructive) and the post-training
+bake, so the two paths agree exactly.
 """
 from __future__ import annotations
 
@@ -139,9 +144,91 @@ def compute_pruning_mask(
     return compute_peak_density(scales, opacities, omega, include_frequency=include_frequency) >= threshold
 
 
+# Conservative default peak-density cutoff for the one-shot ``refine`` pass:
+# drops primitives whose peak contribution is below this before rendering /
+# baking. Small enough to be visually lossless on the shipped assets; tune with
+# ``--prune_threshold``.
+DEFAULT_REFINE_PRUNE_THRESHOLD = 1e-6
+
+
+def refine_level_arrays(
+    scales: np.ndarray,
+    *,
+    opacities: Optional[np.ndarray] = None,
+    omega: Optional[np.ndarray] = None,
+    prune_threshold: Optional[float] = None,
+    prune_include_frequency: bool = True,
+    clamp: bool = True,
+    base_extent: float = 3.0,
+    min_extent: float = 0.1,
+    extent_threshold: float = 1e-4,
+    envelope_only: bool = False,
+    freq_chi: float = 1.0,
+):
+    """Prune and adaptively clamp one pyramid level's arrays in a single pass.
+
+    This is the shared math behind the render-time ``--refine`` flag and the
+    post-training ``--post_refine`` bake, so both routes agree exactly.
+
+    Returns ``(keep_mask, extents)``, both indexed over all ``N`` input
+    primitives:
+
+    * ``keep_mask`` -- boolean ``(N,)`` peak-density keep-mask, or ``None`` when
+      ``prune_threshold`` is ``None`` (no pruning requested).
+    * ``extents`` -- float32 ``(N,)`` per-primitive bounding extents, or ``None``
+      when ``clamp`` is ``False``.
+
+    Both are returned over the *full* primitive set; the caller applies
+    ``keep_mask`` to every per-primitive array (extents included) so the two
+    stay aligned.
+    """
+    scales = _to_numpy(scales)
+    keep_mask = None
+    if prune_threshold is not None:
+        keep_mask = compute_pruning_mask(
+            scales, opacities=opacities, omega=omega,
+            threshold=float(prune_threshold),
+            include_frequency=prune_include_frequency and omega is not None,
+        )
+    extents = None
+    if clamp:
+        extents = clamp_extents(
+            scales, omega=omega, opacities=opacities,
+            base_extent=base_extent, min_extent=min_extent,
+            threshold=extent_threshold, envelope_only=envelope_only,
+            freq_chi=freq_chi,
+        )
+    return keep_mask, extents
+
+
 # ---------------------------------------------------------------------------
 # Asset-level helper (used by the CLI and the post-training auto-clamp hook)
 # ---------------------------------------------------------------------------
+
+def _bake_extent_into_ply(ply_path: Path, a: dict, extents: np.ndarray) -> None:
+    """Rewrite one level's ``.ply`` with a per-primitive ``extent`` column.
+
+    ``a`` is the dict from :func:`gfields.io.load_ellipsoid_ply`; every column it
+    carries is preserved (opacity column name and all) and the extent column is
+    (re)set, so :func:`gfields.rendering.pipeline.detect_asset_info` picks the
+    tightened extents straight up on the next render -- no sidecar needed.
+    """
+    import gfields.io
+
+    d: dict = {
+        "centers": np.asarray(a["centers"], np.float32),
+        "scales": np.asarray(a["scales"], np.float32),
+        "quaternions": np.asarray(a["quaternions"], np.float32),
+    }
+    extras: list[str] = []
+    for key in ("opacities", "sigma_t", "sigmat", "omega", "albedo"):
+        if key in a:
+            d[key] = np.asarray(a[key], np.float32)
+            extras.append(key)
+    d["extent"] = np.asarray(extents, np.float32).reshape(-1, 1)
+    extras.append("extent")
+    gfields.io.ellipsoid_dict_to_ply(d, extras, str(ply_path))
+
 
 def clamp_asset_level(
     asset_dir: Path | str,
@@ -153,13 +240,17 @@ def clamp_asset_level(
     envelope_only: bool = False,
     freq_chi: float = 1.0,
     output: Optional[Path] = None,
+    bake_into_ply: bool = False,
     verbose: bool = True,
 ) -> np.ndarray:
     """Compute per-primitive extents for one on-disk pyramid level and save them.
 
     Reads ``<asset_dir>/data/root.primitives_pyr{level}.ply``, computes the
     adaptive extents, and writes them to ``output`` (default
-    ``<asset_dir>/npy_data/extents_pyr{level}.npy``). Returns the extent array.
+    ``<asset_dir>/npy_data/extents_pyr{level}.npy``). When ``bake_into_ply`` is
+    set, the extents are also written back into the level's ``.ply`` so the
+    renderer uses them automatically (via ``detect_asset_info``) without any
+    extra flag. Returns the extent array.
     """
     import gfields.io
 
@@ -190,6 +281,10 @@ def clamp_asset_level(
     np.save(out, extents)
     if verbose:
         print(f"[adaptive]   wrote {out}")
+    if bake_into_ply:
+        _bake_extent_into_ply(ply_path, a, extents)
+        if verbose:
+            print(f"[adaptive]   baked extents into {ply_path}")
     return extents
 
 
@@ -224,6 +319,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", "-o", type=Path, default=None,
                         help="Where to write the per-primitive extent array. "
                              "Defaults to <asset>/npy_data/extents_pyr{level}.npy.")
+    parser.add_argument("--bake", action="store_true",
+                        help="Also write the extents back into the level's .ply so renders "
+                             "use them automatically (otherwise only the sidecar .npy is written).")
     args = parser.parse_args(argv)
 
     level = _resolve_level(args.asset, args.level)
@@ -231,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         args.asset, level,
         base_extent=args.base_extent, min_extent=args.min_extent,
         threshold=args.threshold, envelope_only=args.envelope_only,
-        freq_chi=args.freq_chi, output=args.output)
+        freq_chi=args.freq_chi, output=args.output, bake_into_ply=args.bake)
     return 0
 
 
@@ -240,6 +338,8 @@ __all__ = [
     "clamp_extents",
     "compute_peak_density",
     "compute_pruning_mask",
+    "refine_level_arrays",
+    "DEFAULT_REFINE_PRUNE_THRESHOLD",
     "clamp_asset_level",
     "main",
 ]

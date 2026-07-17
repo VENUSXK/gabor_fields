@@ -658,10 +658,10 @@ class GfieldsPRBIntegrator(RBIntegrator):
 
             it += 1
 
-        # Clamp final transmittance to [0, 1]. We allow Gabor negative/positive densities 
+        # Clamp final transmittance to [0, 1]. We allow Gabor negative/positive densities
         # to cancel out during the loop, but prevent energy amplification at the end. This
         # can create a bit of bias if you are very aggressive with the NEE parameters, but
-        # I think it is better than allowing weird energy amplification artifacts - Jorge. 
+        # I think it is better than allowing weird energy amplification artifacts - Jorge.
         total_tr = dr.clamp(total_tr, 0.0, 1.0)
         return total_tr
     

@@ -7,9 +7,9 @@
 """Interactive viewer for volumetric-primitive assets (polyscope).
 
 Progressive accumulation, continuous frequency-domain LOD slider, integrator
-performance controls (tomography / prb, stochastic LOD criteria, depths,
-spp), environment-map rotation, EXR/PNG frame export and full Mitsuba
-XML+PLY scene export.
+performance controls (tomography / prb / prb stochastic, stochastic LOD
+criteria, any-hit fast paths, depths, spp), environment-map rotation, EXR/PNG
+frame export and full Mitsuba XML+PLY scene export.
 
 Usage:
     gfields viewer <asset_dir> [--envmap path.exr] [--integrator prb]
@@ -40,17 +40,23 @@ def parse_args():
                         'cloud) example asset.')
     parser.add_argument('--asset_pyr', type=int, default=None,
                         help='Pyramid variant to load (optimized_asset_pyr<N>)')
-    parser.add_argument('--envmap', default=str(DEFAULT_ENVMAP),
-                        help='Environment map (EXR/HDR). Defaults to the '
-                        'bundled env map; pass an empty string for a constant '
-                        'emitter (matches training).')
+    parser.add_argument('--envmap', default=None,
+                        help='Environment map (EXR/HDR). Default is mode-'
+                        'dependent: tomography uses the constant emitter '
+                        '(radiance 1.0, matches training) and the multiple-'
+                        'scattering modes (prb / prb_stochastic) use the '
+                        'bundled env map -- also when switching modes live. '
+                        'Pass a path to force that env map in every mode, or '
+                        'an empty string to force the constant emitter.')
     parser.add_argument('--integrator',
                         choices=['tomography', 'prb', 'prb_stochastic'],
                         default='tomography',
                         help='Tomography matches training; prb enables '
                         'multiple scattering with an env map; prb_stochastic '
                         'uses decomposition-tracking distance sampling '
-                        '(docs/prb_stochastic.md).')
+                        '(docs/prb_stochastic.md). prb_stochastic is '
+                        'Gaussian-only: on assets containing Gabor kernels '
+                        'it falls back to prb with a warning.')
     parser.add_argument('--resolution', type=int, default=512,
                         help='Full render resolution when the camera is still')
     parser.add_argument('--preview_resolution', type=int, default=128,
@@ -79,12 +85,28 @@ def parse_args():
     parser.add_argument('--no-freeze', '--no_freeze', dest='freeze',
                         action='store_false', help=argparse.SUPPRESS)
     parser.set_defaults(freeze=False)
-    parser.add_argument('--use_anyhit', action='store_true',
-                        help='Tomography: render the primal pass with a '
-                             'single OptiX any-hit traversal instead of the '
-                             'sequential walk (adjoint pass unaffected). '
-                             'Also toggleable live in the Integrator panel.')
-    return parser.parse_args()
+    parser.add_argument('--use_anyhit', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='Any-hit fast paths, ON by default for every '
+                             'integrator that supports one: tomography renders '
+                             'the primal pass with a single OptiX any-hit '
+                             'traversal instead of the sequential walk '
+                             '(adjoint pass unaffected; falls back to the hit '
+                             'walk on unsupported configs), and prb_stochastic '
+                             'resolves NEE shadow rays with its any-hit query. '
+                             'Each is also toggleable live in the Integrator '
+                             'panel.')
+    parser.add_argument('--no_anyhit', dest='use_anyhit', action='store_false',
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    # --envmap unset -> mode-dependent default: the bundled env map is carried
+    # along but only *activates* in the multiple-scattering modes (the viewer
+    # checks ``envmap_explicit``); tomography launches with the constant
+    # emitter, matching training.
+    args.envmap_explicit = args.envmap is not None
+    if not args.envmap_explicit:
+        args.envmap = str(DEFAULT_ENVMAP)
+    return args
 
 
 if __name__ == '__main__':

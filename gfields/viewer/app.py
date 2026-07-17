@@ -14,10 +14,13 @@ Features:
 - continuous frequency-domain LOD slider (perceptually equalized through the
   asset's visibility CDF), driven through ``mi.traverse`` without scene
   rebuilds,
-- tomography / path-traced (prb) integrator switch with **all** the exposed
-  performance options (stochastic-analytic LOD criteria for primary and NEE
-  paths, power-law betas, Russian-roulette depths, solver, primitive overlap
-  budget, phase function, kernel options),
+- tomography / path-traced (prb / prb stochastic) integrator switch with
+  **all** the exposed performance options (stochastic LOD criteria for
+  primary and NEE paths, power-law betas, Russian-roulette depths, solver,
+  primitive overlap budget, phase function, kernel options, the stochastic
+  sampler's NEE-transmittance / shell-truncation / residual-clamp modes, and
+  the any-hit fast paths -- on by default wherever an integrator supports
+  them),
 - intuitive environment-map rotation (azimuth/elevation) and intensity,
 - real-time exposure tonemapping, and a single **Save frame** capture that
   writes EXR + tonemapped PNG + a JSON sidecar (accumulated samples, full
@@ -60,15 +63,19 @@ from .sample_accum_helpers import (
     tomography_integrator_props,
 )
 
-# Kernel / solver / phase choices exposed in the UI. The stochastic-analytic
-# criteria lists are pulled from ``gfields.lod`` at launch so they
-# can never drift from what the integrators actually accept.
-KERNEL_TYPES = ['gabor_gaussian_mixture', 'gaussian', 'gabor']
+# Kernel / solver / phase choices exposed in the UI. 'gabor' is the canonical
+# kernel name (a Gaussian is its omega=0 special case; the plugins still accept
+# the legacy 'gabor_gaussian_mixture' alias). The stochastic criteria lists are
+# pulled from ``gfields.lod`` at launch so they can never drift from what the
+# integrators actually accept.
+KERNEL_TYPES = ['gabor', 'gaussian']
 SOLVER_TYPES = ['bisection', 'newton', 'disabled']
 PHASE_TYPES = ['isotropic', 'hg']
 INTEGRATOR_MODES = ['tomography', 'path tracing (prb)',
                     'path tracing (prb stochastic)']
-NEE_TRANSMITTANCE_MODES = ['stochastic', 'analytic']
+# 'analytic' first: the plugin default and the better estimator at equal
+# variance (docs/prb_stochastic.md); 'stochastic' is kept for comparison.
+NEE_TRANSMITTANCE_MODES = ['analytic', 'stochastic']
 
 
 def _input_int(psim, label: str, value: int, *, vmin: int | None = None,
@@ -145,10 +152,10 @@ class AssetState:
                 albedo_scale=albedo_scale, opacity_scale=opacity_scale,
                 extent=extent, world_scale=world_scale,
                 use_asset_albedo=use_asset_albedo)
-            # Gabor-ness is carried by omega now: to view a band as Gaussian
+            # Gabor-ness is carried by omega: to view a band as Gaussian
             # (gaussian_only mode, or an LOD policy that maps this band to the
             # Gaussian target) we zero its omega up front, then everything
-            # downstream derives the flag from omega via is_gabor_from_omega.
+            # downstream derives it via is_gabor_from_omega.
             render_as_gabor = (not self.gaussian_only) and A.is_gabor_for_level(
                 level, gabor_target, gauss_target,
                 num_levels=self.info.num_levels,
@@ -178,6 +185,14 @@ class AssetState:
         self.freq_max = f_max if f_max > 0 else 1.0
         self.lut_fractions, self.lut_thresholds = L.build_freq_threshold_lut(
             bands, self.freq_max)
+        # True when the rendered scene will contain Gabor primitives
+        # (omega != 0). Gates the Gaussian-only gfields_prb_stochastic mode,
+        # whose free-flight inversion / delta tracking is biased for signed
+        # Gabor densities (steerable sub-bands above frequency level 0 are
+        # Gabor by construction).
+        self.contains_gabors = self.has_gabors or (
+            self.steerable_info is not None
+            and self.steerable_info.num_frequency_levels > 1)
 
     def threshold_for_fraction(self, fraction: float) -> float:
         return float(np.interp(fraction, self.lut_fractions, self.lut_thresholds))
@@ -331,12 +346,20 @@ def viewer_tau_accumulation_config(ui, envmap_path: Optional[str]) -> dict[str, 
 
 
 def build_integrator_dict(ui) -> dict[str, Any]:
+    # gfields_prb_stochastic is Gaussian-only (it raises on Gabor kernels) and
+    # never consults the LOD selector (single-level min-of-free-flights
+    # sampler), so pin its kernel and criteria here; the UI hides those
+    # controls in that mode.
+    stochastic_sampler = ui.integrator_idx == 2
     common: dict[str, Any] = {
-        'kernel_type': KERNEL_TYPES[ui.kernel_idx],
+        'kernel_type': ('gaussian' if stochastic_sampler
+                        else KERNEL_TYPES[ui.kernel_idx]),
         'kernel_normalized': ui.kernel_normalized,
         'kernel_full_range': ui.kernel_full_range,
         'pyramid_level_count': ui.level_count,
-        'stochastic_selection_criteria': ui.primary_criteria()[ui.criteria_idx],
+        'stochastic_selection_criteria': (
+            'deterministic' if stochastic_sampler
+            else ui.primary_criteria()[ui.criteria_idx]),
         'power_law_beta': ui.power_law_beta,
     }
     # Training and the integrator default use freq_threshold=-1 (filter off).
@@ -351,7 +374,11 @@ def build_integrator_dict(ui) -> dict[str, Any]:
             'orientation_selection': ui.orientation_criteria[ui.orientation_idx],
             'orientation_threshold': ui.orientation_threshold,
             'orientation_decay_rate': ui.orientation_decay_rate,
+            'importance_mix_weight': ui.importance_mix_weight,
         })
+        if ui.integrator_idx == 1:  # NEE exists only on the prb path
+            common['orientation_selection_nee'] = (
+                ui.orientation_criteria[ui.orientation_nee_idx])
 
     if ui.integrator_idx == 0:  # tomography
         d = tomography_integrator_props(
@@ -371,12 +398,10 @@ def build_integrator_dict(ui) -> dict[str, Any]:
                 else 'deterministic'),
             steerable=ui.is_steerable and ui.asset_encoding_steerable,
         )
-        if ui.integrator_idx == 1 and ui.primary_criteria()[ui.criteria_idx] == 'gaussian_ms':
-            d['num_bounces_gaussian_ms'] = ui.num_bounces_gaussian_ms
         return d
 
     d: dict[str, Any] = {
-        'type': ('gfields_prb_stochastic' if ui.integrator_idx == 2
+        'type': ('gfields_prb_stochastic' if stochastic_sampler
                  else 'gfields_prb'),
         'max_depth': ui.max_depth,
         'rr_depth': ui.rr_depth,
@@ -389,17 +414,21 @@ def build_integrator_dict(ui) -> dict[str, Any]:
         'solver_type': SOLVER_TYPES[ui.solver_idx],
         'solver_max_iterations': ui.solver_max_iterations,
         'num_bounces_gaussian_ms': ui.num_bounces_gaussian_ms,
-        'stochastic_selection_criteria_nee': ui.nee_criteria[ui.criteria_nee_idx],
+        'stochastic_selection_criteria_nee': (
+            'deterministic' if stochastic_sampler
+            else ui.nee_criteria[ui.criteria_nee_idx]),
         'power_law_beta_nee': ui.power_law_beta_nee,
+        'nee_truncate_at_shell': ui.nee_truncate_at_shell,
         'phasefunction': ({'type': 'hg', 'g': ui.hg_g} if ui.phase_idx == 1
                           else {'type': 'isotropic'}),
         **common,
     }
-    if ui.integrator_idx == 2:
+    if stochastic_sampler:
         d['nee_transmittance'] = NEE_TRANSMITTANCE_MODES[ui.nee_transmittance_idx]
         d['use_anyhit'] = ui.use_anyhit_nee
         d['use_anyhit_sampling'] = ui.use_anyhit_sampling
         d['residual_weight_clamp'] = ui.residual_weight_clamp
+        d['truncate_at_shell'] = ui.truncate_at_shell
     return d
 
 
@@ -449,6 +478,9 @@ def _apply_tomography_integrator_preset(ui) -> None:
     # Tomography integrates each kernel's full contribution along the ray in one
     # pass -> the full-line integral is the intended quantity.
     ui.kernel_full_range = True
+    # The tomography criteria list is shorter than the prb one (no gaussian_ms),
+    # so reset the selection to keep the index from dangling past the new list.
+    ui.criteria_idx = _deterministic_criteria_idx(ui.primary_criteria())
 
 
 def _scaled_level_data(data: dict[str, Any], opacity_weight: float,
@@ -575,19 +607,28 @@ class UIState:
                                'prb_stochastic': 2}.get(args.integrator, 1)
         # ``--freeze`` drives the tomography integrator's *internal* @dr.freeze
         # (use_kernel_freeze): it passes the integrator as traversable state via
-        # state_fn, so it records cleanly (the viewer's old outer
-        # ``dr.freeze(mi.render)`` leaked integrator attributes like max_depth and
-        # aborted recording). Frozen replay is ~2.4x faster per frame; scene
-        # params (opacity/albedo) and freq_threshold still propagate on replay.
+        # state_fn so it records cleanly. Frozen replay is ~2.4x faster per frame;
+        # scene params (opacity/albedo) and freq_threshold still propagate on replay.
         self.use_kernel_freeze = bool(getattr(args, 'freeze', False))
-        # Tomography-only primal any-hit fast path (adjoint pass unaffected).
-        self.use_anyhit = bool(getattr(args, 'use_anyhit', False))
-        # prb_stochastic any-hit toggles (NEE any-hit is on by default in the
-        # plugin; distance-sampling any-hit is opt-in) and envelope
-        # delta-tracking null-weight clamp.
-        self.use_anyhit_nee = True
+        # Any-hit fast paths default ON everywhere an integrator supports one:
+        # tomography's primal-pass traversal (falls back to the sequential hit
+        # walk on unsupported scene configs) and prb_stochastic's NEE any-hit.
+        # ``--no-use_anyhit`` disables both at launch; each stays toggleable in
+        # the Integrator panel.
+        self.use_anyhit = bool(getattr(args, 'use_anyhit', True))
+        self.use_anyhit_nee = self.use_anyhit
+        # Distance-sampling any-hit stays opt-in (validated but currently
+        # slower than the hit walk -- prb_stochastic.md §5); the clamp caps the
+        # envelope delta-tracking null-weight amplification.
         self.use_anyhit_sampling = False
         self.residual_weight_clamp = 1.0
+        # prb_stochastic shell-truncation conventions (docs/prb_stochastic.md):
+        # kernels are unbounded by default (shells are BVH discovery proxies);
+        # truncate_at_shell reproduces gfields_prb's shell-truncated transport,
+        # nee_truncate_at_shell the shadow-ray origin-overlap convention
+        # (honored by both prb integrators).
+        self.truncate_at_shell = False
+        self.nee_truncate_at_shell = False
         if asset.steerable_info is not None:
             self.level_count = max(1, min(
                 8, asset.steerable_info.num_frequency_levels))
@@ -611,7 +652,9 @@ class UIState:
         self.rr_depth_primitive = 256
         self.phase_idx = 0
         self.hg_g = 0.857
-        self.nee_transmittance_idx = 0  # prb stochastic only
+        # prb stochastic only; 0 = 'analytic' (plugin default, best at equal
+        # variance).
+        self.nee_transmittance_idx = 0
 
         # Kernel (match training: normalized + full-range tomography).
         # full_range is mode-dependent: tomography integrates each kernel fully
@@ -636,8 +679,10 @@ class UIState:
             asset.steerable_info.num_orientations
             if asset.steerable_info is not None else 3)
         self.orientation_idx = 0
+        self.orientation_nee_idx = 0
         self.orientation_threshold = 0.7
         self.orientation_decay_rate = 1.5
+        self.importance_mix_weight = 0.5
 
         # Environment
         self.env_azimuth = 0.0
@@ -699,6 +744,7 @@ class UIState:
                 self.nee_transmittance_idx,
                 self.use_anyhit, self.use_anyhit_nee, self.use_anyhit_sampling,
                 round(self.residual_weight_clamp, 4),
+                self.truncate_at_shell, self.nee_truncate_at_shell,
                 self.kernel_idx, self.kernel_normalized, self.kernel_full_range,
                 self.freq_filter_active, round(self.freq_band_sigma, 4),
                 # Quantized freq so the hard prune (build_scene) re-applies as the
@@ -707,8 +753,10 @@ class UIState:
                 round(self.freq_fraction, 2),
                 self.level_count,
                 self.asset_encoding_steerable, self.num_orientations,
-                self.orientation_idx, round(self.orientation_threshold, 4),
+                self.orientation_idx, self.orientation_nee_idx,
+                round(self.orientation_threshold, 4),
                 round(self.orientation_decay_rate, 4),
+                round(self.importance_mix_weight, 4),
                 self.adaptive_extent, round(self.min_contribution, 8),
                 round(self.min_extent, 4), round(self.base_extent, 4))
 
@@ -735,8 +783,15 @@ class UIState:
 # ---------------------------------------------------------------------------
 
 def run_viewer(args) -> None:
-    import polyscope as ps
-    import polyscope.imgui as psim
+    try:
+        import polyscope as ps
+        import polyscope.imgui as psim
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "The interactive viewer needs polyscope, which is not installed.\n"
+            "  Install it with:  uv pip install -e \".[viewer]\"   (or: pip install polyscope)\n"
+            "  (re-running install.sh / install.ps1 also pulls it in.)"
+        ) from e
 
     if mi.variant() is None:
         mi.set_variant('cuda_ad_rgb', 'llvm_ad_rgb')
@@ -771,6 +826,12 @@ def run_viewer(args) -> None:
                  prb_criteria, ORIENTATION_CRITERIA)
     if args.integrator == 'prb' and args.albedo_scale != MS_ALBEDO_DEFAULT:
         ui.albedo_scale = float(args.albedo_scale)
+    if ui.integrator_idx == 2 and asset.contains_gabors:
+        print('[viewer] --integrator prb_stochastic is Gaussian-only and this '
+              'asset contains Gabor kernels (its distance sampler is biased '
+              'for signed Gabor densities, see docs/prb_stochastic.md); '
+              'falling back to prb.')
+        ui.integrator_idx = 1
     print(f'  ortho scale (default): {ui.ortho_scale:.4g}')
     out_dir = Path(args.output)
 
@@ -780,15 +841,31 @@ def run_viewer(args) -> None:
         'polyscope_projection': None, 'prev_integrator_idx': ui.integrator_idx,
     }
 
+    def active_envmap() -> Optional[str]:
+        """Env-map path for the *current* integrator mode.
+
+        An explicitly passed ``--envmap`` applies to every mode; the launch
+        default only activates in the multiple-scattering modes -- tomography
+        then uses the constant emitter (radiance 1.0), matching training. The
+        emitter is part of the scene, so mode switches pick this up through
+        the integrator rebuild.
+        """
+        if not args.envmap:
+            return None
+        if getattr(args, 'envmap_explicit', True):
+            return args.envmap
+        return args.envmap if ui.integrator_idx >= 1 else None
+
     def rebuild():
         """Rebuild the scene/session; on failure keep the previous one so a bad
         parameter combination cannot crash the interactive loop."""
         try:
-            scene = build_scene(asset, ui, args.envmap)
-            tau_cfg = viewer_tau_accumulation_config(ui, args.envmap)
+            envmap_path = active_envmap()
+            scene = build_scene(asset, ui, envmap_path)
+            tau_cfg = viewer_tau_accumulation_config(ui, envmap_path)
             # Freeze is driven by the integrator's internal use_kernel_freeze
-            # (see UIState.use_kernel_freeze), not the old leaky outer
-            # dr.freeze(mi.render); keep the outer path off.
+            # (see UIState.use_kernel_freeze), so keep the outer
+            # dr.freeze(mi.render) path off.
             session = RenderSession(
                 scene, max_spp=ui.max_spp, try_freeze=False,
                 **tau_cfg)
@@ -892,22 +969,31 @@ def run_viewer(args) -> None:
                     asset.steerable_info.num_frequency_levels
                     if asset.steerable_info is not None and ui.asset_encoding_steerable
                     else (asset.info.num_levels if asset.info is not None else 8)))))
-            _, ui.criteria_idx = psim.Combo(
-                'criteria (primary)', ui.criteria_idx, ui.primary_criteria())
-            crit = ui.primary_criteria()[ui.criteria_idx]
-            if 'power_law' in crit:
-                _, ui.power_law_beta = _input_float(
-                    psim, 'power-law beta', ui.power_law_beta, vmin=0.05, vmax=0.95)
-            if ui.integrator_idx >= 1 and crit == 'gaussian_ms':
-                _, ui.num_bounces_gaussian_ms = _input_int(
-                    psim, 'gaussian_ms bounces', ui.num_bounces_gaussian_ms, vmin=0)
-            if ui.integrator_idx >= 1:
-                _, ui.criteria_nee_idx = psim.Combo(
-                    'criteria (NEE)', ui.criteria_nee_idx, ui.nee_criteria)
-                if 'power_law' in ui.nee_criteria[ui.criteria_nee_idx]:
-                    _, ui.power_law_beta_nee = _input_float(
-                        psim, 'power-law beta (NEE)', ui.power_law_beta_nee,
+            if ui.integrator_idx == 2:
+                # prb_stochastic never consults the LOD selector (single-level
+                # Gaussian min-of-free-flights sampler); build_integrator_dict
+                # pins the criteria to 'deterministic'.
+                psim.TextUnformatted(
+                    'prb stochastic: LOD criteria not used (single-level)')
+            else:
+                _, ui.criteria_idx = psim.Combo(
+                    'criteria (primary)', ui.criteria_idx, ui.primary_criteria())
+                crit = ui.primary_criteria()[ui.criteria_idx]
+                if 'power_law' in crit:
+                    _, ui.power_law_beta = _input_float(
+                        psim, 'power-law beta', ui.power_law_beta,
                         vmin=0.05, vmax=0.95)
+                if ui.integrator_idx == 1 and crit == 'gaussian_ms':
+                    _, ui.num_bounces_gaussian_ms = _input_int(
+                        psim, 'gaussian_ms bounces', ui.num_bounces_gaussian_ms,
+                        vmin=0)
+                if ui.integrator_idx == 1:
+                    _, ui.criteria_nee_idx = psim.Combo(
+                        'criteria (NEE)', ui.criteria_nee_idx, ui.nee_criteria)
+                    if 'power_law' in ui.nee_criteria[ui.criteria_nee_idx]:
+                        _, ui.power_law_beta_nee = _input_float(
+                            psim, 'power-law beta (NEE)', ui.power_law_beta_nee,
+                            vmin=0.05, vmax=0.95)
             psim.TreePop()
 
         if ui.is_steerable and psim.TreeNodeEx('Steerable orientations'):
@@ -919,17 +1005,40 @@ def run_viewer(args) -> None:
                 _, ui.orientation_idx = psim.Combo(
                     'orientation selection', ui.orientation_idx,
                     ui.orientation_criteria)
+                if ui.integrator_idx == 1:
+                    _, ui.orientation_nee_idx = psim.Combo(
+                        'orientation (NEE)', ui.orientation_nee_idx,
+                        ui.orientation_criteria)
                 _, ui.orientation_threshold = _input_float(
                     psim, 'orientation threshold', ui.orientation_threshold,
                     vmin=0.0, vmax=1.0)
                 _, ui.orientation_decay_rate = _input_float(
                     psim, 'orientation decay', ui.orientation_decay_rate,
                     vmin=0.1, vmax=4.0)
+                ori_modes = {ui.orientation_criteria[ui.orientation_idx]}
+                if ui.integrator_idx == 1:
+                    ori_modes.add(ui.orientation_criteria[ui.orientation_nee_idx])
+                if ori_modes & {'importance', 'control_variate_threshold'}:
+                    _, ui.importance_mix_weight = _input_float(
+                        psim, 'importance mix', ui.importance_mix_weight,
+                        vmin=0.0, vmax=1.0)
             psim.TreePop()
 
         if psim.TreeNodeEx('Integrator', psim.ImGuiTreeNodeFlags_DefaultOpen):
             _, ui.integrator_idx = psim.Combo(
                 'mode', ui.integrator_idx, INTEGRATOR_MODES)
+            if asset.contains_gabors and ui.integrator_idx == 2:
+                # gfields_prb_stochastic is Gaussian-only: refuse the switch
+                # (before the preset check below, so nothing else changes) and
+                # raise the alarm text.
+                prev = state['prev_integrator_idx']
+                ui.integrator_idx = prev if prev != 2 else 1
+                state['stochastic_denied'] = True
+            if asset.contains_gabors:
+                psim.TextColored(
+                    (1.0, 0.35, 0.35, 1.0) if state.get('stochastic_denied')
+                    else (0.6, 0.6, 0.6, 1.0),
+                    'prb stochastic unavailable: asset has Gabor kernels')
             if ui.integrator_idx != state['prev_integrator_idx']:
                 if ui.integrator_idx >= 1:
                     _apply_ms_integrator_preset(ui)
@@ -970,6 +1079,10 @@ def run_viewer(args) -> None:
                     _, ui.residual_weight_clamp = _input_float(
                         psim, 'residual weight clamp',
                         ui.residual_weight_clamp, vmin=0.0, vmax=100.0)
+                    _, ui.truncate_at_shell = psim.Checkbox(
+                        'truncate at shell', ui.truncate_at_shell)
+                _, ui.nee_truncate_at_shell = psim.Checkbox(
+                    'NEE truncate at shell', ui.nee_truncate_at_shell)
                 _, ui.phase_idx = psim.Combo('phase', ui.phase_idx, PHASE_TYPES)
                 if ui.phase_idx == 1:
                     _, ui.hg_g = _input_float(
@@ -978,12 +1091,17 @@ def run_viewer(args) -> None:
             psim.TreePop()
 
         if psim.TreeNodeEx('Kernel'):
-            _, ui.kernel_idx = psim.Combo('kernel', ui.kernel_idx, KERNEL_TYPES)
+            if ui.integrator_idx == 2:
+                psim.TextUnformatted(
+                    'kernel: gaussian (prb stochastic is Gaussian-only)')
+            else:
+                _, ui.kernel_idx = psim.Combo(
+                    'kernel', ui.kernel_idx, KERNEL_TYPES)
             _, ui.kernel_normalized = psim.Checkbox('normalized', ui.kernel_normalized)
             _, ui.kernel_full_range = psim.Checkbox('full range', ui.kernel_full_range)
             psim.TreePop()
 
-        if args.envmap and psim.TreeNodeEx('Environment'):
+        if active_envmap() and psim.TreeNodeEx('Environment'):
             _, ui.env_azimuth = _input_float(
                 psim, 'azimuth', ui.env_azimuth, vmin=-180.0, vmax=180.0, fmt='%.2f')
             _, ui.env_elevation = _input_float(
@@ -1023,18 +1141,19 @@ def run_viewer(args) -> None:
                 if session.image is not None:
                     hdr = session.image
                     display = tomography_radiance_for_display(
-                        hdr, ui, envmap_path=args.envmap,
+                        hdr, ui, envmap_path=active_envmap(),
                         accumulator_is_tau=session.accumulate_tau)
                     paths = exporters.save_frame_bundle(
                         hdr, out_dir, exposure=ui.exposure,
                         display_image=display,
                         metadata=capture_metadata(
-                            ps, ui, session, args.envmap,
+                            ps, ui, session, active_envmap(),
                             camera_moving=state['camera_moving']))
                     print('Saved frame bundle:', paths['exr'].name,
                           '/', paths['png'].name, '/', paths['json'].name)
             if psim.Button('Export Mitsuba scene'):
-                xml = export_current_scene(ps, ui, asset, args, out_dir)
+                xml = export_current_scene(ps, ui, asset, out_dir,
+                                           envmap_path=active_envmap())
                 print('Exported scene:', xml)
             psim.TreePop()
         psim.PopItemWidth()
@@ -1057,8 +1176,8 @@ def run_viewer(args) -> None:
         session.set_albedo_scale(ui.albedo_scale, asset.albedo_base_levels(),
                                  absolute=(ui.integrator_idx >= 1))
         session.emitter_scale = (
-            ui.env_scale if args.envmap else 1.0)
-        if args.envmap:
+            ui.env_scale if active_envmap() else 1.0)
+        if active_envmap():
             session.set_runtime_param(session.envmap_to_world_key, env_to_world(ui))
             session.set_runtime_param(session.envmap_scale_key, mi.Float(ui.env_scale))
 
@@ -1092,7 +1211,7 @@ def run_viewer(args) -> None:
         img = session.step()
         if img is not None:
             rad = tomography_radiance_for_display(
-                img, ui, envmap_path=args.envmap,
+                img, ui, envmap_path=active_envmap(),
                 accumulator_is_tau=session.accumulate_tau)
             disp = np.clip(rad * (2.0 ** ui.exposure), 0.0, None) ** (1.0 / 2.2)
             ps.add_color_image_quantity(
@@ -1154,7 +1273,8 @@ def capture_metadata(ps, ui, session,
     }
 
 
-def export_current_scene(ps, ui, asset, args, out_dir):
+def export_current_scene(ps, ui, asset, out_dir, *,
+                         envmap_path: Optional[str] = None):
     cam = ps.get_view_camera_parameters()
     origin = np.asarray(cam.get_position())
     target = origin + np.asarray(cam.get_look_dir())
@@ -1184,12 +1304,14 @@ def export_current_scene(ps, ui, asset, args, out_dir):
     })
     levels = []
     for data, meta in zip(asset.levels, asset.meta):
+        # Albedo stays unscaled here, matching build_scene (the live albedo
+        # slider is applied through mi.traverse, not baked into the export).
         levels.append(_level_with_extents(
-            _scaled_level_data(data, ui.opacity_weight), meta, ui))
+            _scaled_level_data(data, ui.opacity_weight, 1.0), meta, ui))
     return exporters.export_scene(
         out_dir,
         levels=levels,
         level_meta=asset.meta,
         integrator=build_integrator_dict(ui),
         sensor=sensor_dict,
-        emitter=build_emitter_dict(ui, args.envmap))
+        emitter=build_emitter_dict(ui, envmap_path))

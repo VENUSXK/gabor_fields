@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -54,6 +54,10 @@ class AssetInfo:
     extents: Dict[int, Any]  # float or np.ndarray (per-primitive)
     is_steerable: bool = False
     ply_folder: Optional[str] = None  # canonical .ply store (data/); None -> legacy npy
+    # Per-level boolean keep-masks from a render-time ``--refine`` prune pass.
+    # Empty unless pruning is active; consumed by the render CLIs as a
+    # ``primitive_subset`` when building each level's scene entry.
+    prune_masks: Dict[int, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
         extent_summary: Dict[int, Any] = {}

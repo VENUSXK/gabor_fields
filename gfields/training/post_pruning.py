@@ -69,7 +69,6 @@ def prepare_mixture(path: Path) -> Tuple[bool, mi.Scene, mi.SceneParameters, Bou
     assert 'primitives_pyr2' not in model.keys(), "Pyramids with more than 2 levels are not supported."
     max_level = int(has_gabor)
 
-    # Log what was loaded
     prim_keys = [k for k in model.keys() if k.startswith('primitives_pyr')]
     blue(f"Loaded model with levels: {prim_keys} (has_gabor={has_gabor}, max_level={max_level})")
     
