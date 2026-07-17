@@ -38,12 +38,14 @@ cd gabor_fields
 #   ./install.sh --extras    # + torch / lpips / wandb / metrics (needed for the voxelizer)
 ```
 
-This builds a reproducible [uv](https://docs.astral.sh/uv/) `.venv` and
-**compiles the vendored Mitsuba 3 fork against it**
+This builds a [uv](https://docs.astral.sh/uv/) environment and
+**compiles our custom Mitsuba 3 and DrJIT forks**
 ([Arcanous98/mitsuba3_gfields](https://github.com/Arcanous98/mitsuba3_gfields),
-which adds per-ray visibility masking, the `is_gabor` shape flag, and
-per-primitive `extent` tensors). Needs `uv`, `cmake`, a C++ compiler
-(MSVC/VS 2022 on Windows; gcc/clang + Ninja on Linux), and an NVIDIA driver.
+which adds per-ray visibility masking,
+per-primitive `extent` tensors and anyhit shaders). Needs `uv`, `cmake`, a C++ compiler
+(MSVC/VS 2022 on Windows; gcc/clang + Ninja on Linux), and an NVIDIA driver. 
+We currently don't support LLVM and Metal backends but
+we are happy to welcome contributions :)
 
 Validate:
 
@@ -57,24 +59,24 @@ python -c "import mitsuba as mi; mi.set_variant('cuda_ad_rgb'); import gfields; 
 ## Train
 
 ```bash
-examples/train.sh                     # bundled smoke asset, 512 Gauss + 4096 Gabor
-examples/train.sh wdas8                # a named preset (needs its volume, see below)
+examples/train.sh                      # bundled smoke asset, 512 Gauss + 4096 Gabor
+examples/train.sh wdas8                # a named asset (needs its volume, see below)
 examples/train.sh data/volumes/grids/mine.npy --opacity_scale 12   # your own volume
 examples/train.sh --gaussian           # Gaussian-only baseline
 ```
 
 Optimization is **tomographic** (absorption-only) and defaults to the OptiX
-**any-hit** fast path for the primal pass — the main reason training is fast
-here (`--no_anyhit` to fall back to the overlap-list walk). Tune primitive
+**any-hit** shader. Tune primitive
 budget and density from the CLI (`--gauss_count`, `--gabor_count`,
 `--opacity_scale`) — see [`examples/README.md`](examples/README.md) for good
-combos and how presets/recipe live in `gfields/presets.py`. Named presets
-(`wdas8`, `embergen`, `explosion`, `fire`, `smoke`, `smokev2`, `tornado`,
-`dust`) resolve to volumes under `data/volumes/grids/`, downloaded per
-[`data/volumes/asset_sources.md`](data/volumes/asset_sources.md); only
-`smoke` ships with the repo.
+combos and how the recipe and named-asset lookup live in `gfields/presets.py`.
+Named assets (`wdas8`, `embergen`, `explosion`, `fire`, `smoke`, `smokev2`,
+`tornado`, `dust`) resolve to volumes under `data/volumes/grids/`, downloaded
+per [`data/volumes/asset_sources.md`](data/volumes/asset_sources.md); only
+`smoke` ships with the repo (as `data/volumes/smoke.vol`). These are roughly
+the presets and assets used in the paper, and are kept just as a reference.
 
-Output → `results/checkpoints/<asset>/`.
+Output -> `results/checkpoints/<asset>/`.
 
 ---
 
@@ -91,10 +93,10 @@ python -m gfields.render video <asset> --motion turntable --frames 120       # M
 decomposition-tracking path tracer for Gaussian assets: instead of collecting
 the overlapping primitive set and solving for the mixture optical depth
 (Newton/bisection), it draws one closed-form free flight per primitive and
-takes the minimum — no acceptance test, no overlap bookkeeping. Combine with
-`--stochastic_selection_criteria power_law` / `--orientation_selection
-importance` (steerable assets) for the Laplacian/orientation speedups
-described above.
+takes the minimum of all traversed primitives along a ray (decomposition tracking, Kutz et al. 2017). Combine with
+`--stochastic_selection_criteria control_variate_power_law` or `--orientation_selection
+importance` (steerable assets) for the Laplacian/orientation-selective speedups
+described in the paper. 
 
 Full flag list: `python -m gfields.render --help` (and `... video --help`).
 
@@ -102,8 +104,8 @@ Full flag list: `python -m gfields.render --help` (and `... video --help`).
 
 ## Visualize
 
-Three trained Gabor Fields ship in `data/examples/` (`wdas8`, `smoke`,
-`tornado`) so the viewer works straight after a clone:
+We include several trained assets under `data/examples/`and you can interactively
+visualize them with our viewer:
 
 ```bash
 gfields viewer                                      # bundled wdas8 cloud + env map
@@ -132,14 +134,14 @@ gfields decompose clamp <asset> --level 1                            # adaptive 
 gfields decompose prune  -p <asset> -r opacity -b 0.5 -a             # PSNR-budget pruning
 ```
 
-`.vol` grids convert automatically on first use (no separate tool needed).
+Old `.vol` mitsuba grids convert automatically on first use (no separate tool needed).
 
 ---
 
 ## Tests
 
 ```bash
-python -m pytest gfields/tests/test_gfields.py -q     # closed-form integrals, LOD parity, stochastic vs analytic
+python -m pytest gfields/tests/test_gfields.py -q     
 ```
 
 Auto-skips without a `cuda_ad_rgb` build.
@@ -149,24 +151,24 @@ Auto-skips without a `cuda_ad_rgb` build.
 ## BibTeX
 
 ```bibtex
-@article{10.1145/3811369,
-author = {Condor, Jorge and Hermann, Nicolai and Yurtsever, Mehmet Ata and Didyk, Piotr},
-title = {Gabor Fields: Orientation-Selective Level-of-Detail for Volume Rendering},
-year = {2026},
-issue_date = {July 2026},
-publisher = {Association for Computing Machinery},
-address = {New York, NY, USA},
-volume = {45},
-number = {4},
-issn = {0730-0301},
-url = {https://doi.org/10.1145/3811369},
-doi = {10.1145/3811369},
-journal = {ACM Trans. Graph.},
-month = jul,
-articleno = {62},
-numpages = {20}
+@article{condor2026gaborfields,
+    author = {Condor, Jorge and Hermann, Nicolai and Yurtsever, Mehmet Ata and Didyk, Piotr},
+    title = {Gabor Fields: Orientation-Selective Level-of-Detail for Volume Rendering},
+    year = {2026},
+    issue_date = {July 2026},
+    publisher = {Association for Computing Machinery},
+    address = {New York, NY, USA},
+    volume = {45},
+    number = {4},
+    issn = {0730-0301},
+    url = {https://doi.org/10.1145/3811369},
+    doi = {10.1145/3811369},
+    journal = {ACM Trans. Graph.},
+    month = jul,
+    articleno = {62},
+    numpages = {20}
 }
-@article{condor2025volprim,
+@article{condor2025dsyg,
     author  = {Condor, Jorge and Speierer, Sebastien and Bode, Lukas and Bozic, Aljaz and Green, Simon and Didyk, Piotr and Jarabo, Adrian},
     title   = {Don't Splat your Gaussians: Volumetric Ray-Traced Primitives for Modeling and Rendering Scattering and Emissive Media},
     journal = {ACM Trans. Graph.}, year = {2025}, doi = {10.1145/3711853},
