@@ -48,16 +48,18 @@ def _setup_mi():
 # ---------------------------------------------------------------------------
 
 def _prims_dict(mi, centers, gabor, omega=5.0):
+    # Gabor-ness is carried by omega alone: a Gaussian band has omega == 0.
     n = len(centers)
+    omega_val = omega if gabor else 0.0
     return {
         "type": "ellipsoidsmesh", "shell": "uv_sphere",
         "centers": mi.TensorXf(sum(centers, []), shape=(n, 3)),
         "scales": mi.TensorXf([0.3] * (3 * n), shape=(n, 3)),
         "quaternions": mi.TensorXf([0, 0, 0, 1] * n, shape=(n, 4)),
         "opacities": mi.TensorXf([1.0] * n, shape=(n, 1)),
-        "omega": mi.TensorXf([omega] * n, shape=(n, 1)),
+        "omega": mi.TensorXf([omega_val] * n, shape=(n, 1)),
         "albedo": mi.TensorXf([1, 1, 1] * n, shape=(n, 3)),
-        "extent": 3.0, "is_gabor": gabor,
+        "extent": 3.0,
     }
 
 
@@ -271,7 +273,7 @@ def _prb_prim_cloud(mi, n=200, gabor=False, seed=3):
         "centers": mi.TensorXf(centers), "scales": mi.TensorXf(scales),
         "quaternions": mi.TensorXf(quats), "opacities": mi.TensorXf(opac),
         "albedo": mi.TensorXf(alb), "omega": mi.TensorXf(omega),
-        "extent": 3.0, "is_gabor": gabor,
+        "extent": 3.0,
     }
 
 

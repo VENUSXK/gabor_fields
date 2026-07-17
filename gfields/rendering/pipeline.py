@@ -151,13 +151,14 @@ def detect_asset_info(asset_path: str | os.PathLike[str]) -> AssetInfo:
 
 def _ellipsoidsmesh_entry(
     *, centers, scales, quaternions, opacities, omega, albedo, extent,
-    is_gabor: bool, visibility_mask: int,
+    visibility_mask: int,
 ) -> Dict[str, Any]:
     """Pack per-primitive numpy arrays into an ``ellipsoidsmesh`` scene-dict entry.
 
     Shared by :func:`load_pyramid_level` and :func:`load_steerable_asset`; all
     array args are numpy (scales already applied by the caller). ``extent`` is a
-    scalar or a per-primitive array (packed as a TensorXf column).
+    scalar or a per-primitive array (packed as a TensorXf column). Gabor vs
+    Gaussian is derived from ``omega`` by the shape, so no flag is emitted.
     """
     import mitsuba as mi
 
@@ -174,7 +175,6 @@ def _ellipsoidsmesh_entry(
         "omega": mi.TensorXf(np.ravel(omega), shape=(n, 1)),
         "albedo": mi.TensorXf(np.ravel(albedo), shape=(n, 3)),
         "extent": extent_value,
-        "is_gabor": is_gabor,
         "visibility_mask": visibility_mask,
     }
 
@@ -239,7 +239,6 @@ def load_steerable_asset(
 
         n_prims = len(centers)
         total_primitives += n_prims
-        is_gabor = freq_level > 0
 
         if albedo_rgb is not None:
             rgb = np.asarray(albedo_rgb, dtype=np.float32).reshape(3) * float(albedo_scale)
@@ -250,10 +249,10 @@ def load_steerable_asset(
         primitives_dict[subband_key] = _ellipsoidsmesh_entry(
             centers=centers, scales=scales, quaternions=quaternions,
             opacities=opacities, omega=omega, albedo=albedo_values, extent=extent,
-            is_gabor=is_gabor, visibility_mask=subband_info["visibility_mask"])
+            visibility_mask=subband_info["visibility_mask"])
 
         mask_bin = f"0b{subband_info['visibility_mask']:08b}"
-        prim_type = "Gabor" if is_gabor else "Gaussian"
+        prim_type = "Gabor" if freq_level > 0 else "Gaussian"
         extent_str = (
             f", extent=per-prim(mean={extent.mean():.2f})"
             if isinstance(extent, np.ndarray)
@@ -348,7 +347,7 @@ def load_pyramid_level(
         centers=centers, scales=scales, quaternions=quaternions,
         opacities=opacities * opacity_scale, omega=omega,
         albedo=albedo * albedo_scale, extent=extent_out,
-        is_gabor=level > 0, visibility_mask=2 ** level)
+        visibility_mask=2 ** level)
 
 
 # ---------------------------------------------------------------------------

@@ -145,14 +145,21 @@ class AssetState:
                 albedo_scale=albedo_scale, opacity_scale=opacity_scale,
                 extent=extent, world_scale=world_scale,
                 use_asset_albedo=use_asset_albedo)
-            is_gabor = (not self.gaussian_only) and A.is_gabor_for_level(
+            # Gabor-ness is carried by omega now: to view a band as Gaussian
+            # (gaussian_only mode, or an LOD policy that maps this band to the
+            # Gaussian target) we zero its omega up front, then everything
+            # downstream derives the flag from omega via is_gabor_from_omega.
+            render_as_gabor = (not self.gaussian_only) and A.is_gabor_for_level(
                 level, gabor_target, gauss_target,
                 num_levels=self.info.num_levels,
                 skip_gabor_optim=self.pyramid_meta['skip_gabor_optim'],
                 skip_gaussian_optim=self.pyramid_meta['skip_gaussian_optim'])
+            if not render_as_gabor:
+                data = {**data, 'omega': np.zeros_like(
+                    np.asarray(data['omega'], dtype=np.float32))}
             self.levels.append(data)
             self.meta.append({
-                'is_gabor': bool(is_gabor),
+                'is_gabor': A.is_gabor_from_omega(data['omega']),
                 'visibility_mask': 1 << min(level, 7),
             })
 
@@ -542,8 +549,7 @@ def build_scene(asset: AssetState, ui, envmap_path: Optional[str]) -> mi.Scene:
         if int(np.asarray(prepared['centers']).shape[0]) == 0:
             continue  # whole level filtered out
         scene[f'primitives_{mesh_idx}'] = A.numpy_level_to_mesh_entry(
-            prepared, is_gabor=meta['is_gabor'],
-            visibility_mask=meta['visibility_mask'])
+            prepared, visibility_mask=meta['visibility_mask'])
         mesh_idx += 1
     return mi.load_dict(scene)
 

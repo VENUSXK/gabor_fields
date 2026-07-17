@@ -35,6 +35,7 @@ from gfields.lod.utils import (
     double_spaced,
     equal_partitioning,
     generate_orientation_bins,
+    is_gabor_from_omega,
 )
 
 
@@ -289,19 +290,22 @@ def _lod_partition_prepare(path: Path, num_cams=None, res_x=None, res_y=None):
     scene: mi.Scene = mi.load_dict(model)
     cam_array = gu.create_cam_array(gu.prepare_cameras(num_cams, res_x, res_y, 1.0))
 
-    is_gabor = "primitives_pyr1" in model
+    has_gabor = "primitives_pyr1" in model
     assert "primitives_pyr2" not in model, (
         "More than 2 levels are available. This is not supported and likely a bug, "
         "as this model might already be decomposed.")
 
-    return params, model, scene, cam_array, is_gabor
+    return params, model, scene, cam_array, has_gabor
 
 
 # --- shared level plumbing (Gabor + Gaussian) ------------------------------
 
 
-def _add_level(decomposed_model, level_primitives, source, mask, level, *, is_gabor):
-    """Extract the ``mask`` subset of ``source`` as pyramid level ``level``."""
+def _add_level(decomposed_model, level_primitives, source, mask, level):
+    """Extract the ``mask`` subset of ``source`` as pyramid level ``level``.
+
+    Gabor vs Gaussian is carried entirely by the ``omega`` column: Gaussian
+    levels have omega==0 (or no omega), so nothing else marks the kernel type."""
     import mitsuba as mi
     import gfields.training.regression as gu
 
@@ -311,11 +315,8 @@ def _add_level(decomposed_model, level_primitives, source, mask, level, *, is_ga
         "scales": level_prims["scales"].numpy(),
         "omega": level_prims["omega"].numpy() if "omega" in level_prims else None,
         "opacities": level_prims["opacities"].numpy() if "opacities" in level_prims else None,
-        "is_gabor": is_gabor,
     }
     entry = gu.create_scene_dict_from_primitives(-1, level, **level_prims)[f"primitives_pyr{level}"]
-    if not is_gabor:
-        entry["is_gabor"] = False
     decomposed_model[f"primitives_pyr{level}"] = entry
 
 
@@ -328,7 +329,7 @@ def _apply_adaptive_extents(level_primitives, decomposed_model, args) -> Dict[in
 
     all_extents: Dict[int, np.ndarray] = {}
     for lvl, prims in sorted(level_primitives.items()):
-        is_gabor_level = prims.get("is_gabor", lvl != 0)
+        is_gabor_level = is_gabor_from_omega(prims.get("omega"))
         extents = clamp_extents(
             scales=prims["scales"],
             omega=prims.get("omega"),
@@ -354,7 +355,7 @@ def _apply_pruning(level_primitives, decomposed_model, all_extents, args) -> Non
 
     for lvl in list(level_primitives.keys()):
         prims = level_primitives[lvl]
-        is_gabor_level = prims.get("is_gabor", lvl != 0)
+        is_gabor_level = is_gabor_from_omega(prims.get("omega"))
         keep = compute_pruning_mask(
             scales=prims["scales"],
             opacities=prims.get("opacities"),
@@ -376,7 +377,6 @@ def _apply_pruning(level_primitives, decomposed_model, all_extents, args) -> Non
             "scales": prims["scales"][keep],
             "omega": prims["omega"][keep] if prims.get("omega") is not None else None,
             "opacities": prims["opacities"][keep] if prims.get("opacities") is not None else None,
-            "is_gabor": is_gabor_level,
         }
         if lvl in all_extents:
             all_extents[lvl] = all_extents[lvl][keep]
@@ -440,7 +440,6 @@ def _lod_partition_gabor(args, model, scene, cam_array, grid, volume_config, a, 
             "scales": _np(gauss_pyr0["scales"]),
             "omega": None,
             "opacities": _np(gauss_pyr0.get("opacities")),
-            "is_gabor": False,
         }
 
     for i in range(1, n_bands):
@@ -448,7 +447,7 @@ def _lod_partition_gabor(args, model, scene, cam_array, grid, volume_config, a, 
         n = int(np.sum(mask))
         print(f"Level {i}: {n} components in [{lod_bounds[i - 1]:.2f}, {lod_bounds[i]:.2f})")
         if n:
-            _add_level(decomposed_model, level_primitives, gabor, mask, i, is_gabor=True)
+            _add_level(decomposed_model, level_primitives, gabor, mask, i)
 
     all_extents = _apply_adaptive_extents(level_primitives, decomposed_model, args)
     _apply_pruning(level_primitives, decomposed_model, all_extents, args)
@@ -499,7 +498,7 @@ def _lod_partition_gaussian(args, model, scene, cam_array, grid, a, b, gauss_tar
         n = int(np.sum(mask))
         print(f"Level {i}: {n} components in [{lod_bounds[i]:.2f}, {lod_bounds[i + 1]:.2f})")
         if n:
-            _add_level(decomposed_model, level_primitives, gauss, mask, i, is_gabor=False)
+            _add_level(decomposed_model, level_primitives, gauss, mask, i)
 
     all_extents = _apply_adaptive_extents(level_primitives, decomposed_model, args)
     _apply_pruning(level_primitives, decomposed_model, all_extents, args)
@@ -518,7 +517,7 @@ def lod_partition_main() -> None:
     import gfields.training.configs as volume_configs
 
     args = _lod_partition_setup()
-    params, model, scene, cam_array, is_gabor = _lod_partition_prepare(
+    params, model, scene, cam_array, has_gabor = _lod_partition_prepare(
         args.path, args.num_cams, args.cam_res_x, args.cam_res_y)
     grid = np.load(str(args.path / "grid_pyr0.npy"))
     volume_config = volume_configs.get_volume_config(params["volume_grid"])
@@ -527,7 +526,7 @@ def lod_partition_main() -> None:
     n_bands = args.output_levels
     output_path = Path(args.output)
 
-    if is_gabor:
+    if has_gabor:
         _lod_partition_gabor(args, model, scene, cam_array, grid, volume_config,
                              a, b, gauss_target_level, n_bands, output_path)
     else:

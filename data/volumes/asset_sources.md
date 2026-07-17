@@ -8,10 +8,7 @@ their original, freely-available sources and drop the resulting grids into
 data/volumes/grids/
 ```
 
-which is git-ignored. The one exception is **`smoke.vol`** (the smoke plume used
-in the paper), which is bundled at `data/volumes/smoke.vol` (we have permission
-to redistribute it), so `examples/train.sh smoke` works out of the box — the
-`.vol` grid is converted to a cached `.npy` on first use.
+The one exception is **`smoke.vol`** (the smoke plume used in the paper), which is bundled at `data/volumes/smoke.vol` 
 
 The training presets in [`gfields/presets.py`](../../gfields/presets.py) expect
 the following file names:
@@ -33,24 +30,21 @@ The Walt Disney Animation Studios "Clouds" dataset (CC BY-SA 3.0):
 
 <https://disneyanimation.com/resources/clouds/>
 
-Download the OpenVDB cloud pack and pick one cloud (we use the 8th, hence
-`wdas8`). Convert its `.vdb` to a dense grid as described below and save it as
-`data/volumes/grids/wdas8.npy`.
+Download the OpenVDB cloud pack and pick a downsampled version of the full cloud (we use the 1/8th, hence
+`wdas8`).
 
 ## JangaFX free VDB animations
 
-JangaFX publishes a large pack of free, royalty-free VDB volumes (`embergen`,
-`explosion`, `fire`, `smoke`, `tornado`, `dust`):
+JangaFX published a large pack of CC0 vdb data:
 
 <https://jangafx.com/software/embergen/download/free-vdb-animations/>
 
-Grab the volume you want, pick a single frame (these are animation sequences),
-convert the `.vdb` to a dense grid, and save it under `data/volumes/grids/` with
-the file name from the table above.
+Grab the volume you want, pick some frame (these are animation sequences),
+and convert the `.vdb` to a dense grid.
 
 ## Converting a `.vdb` (or Mitsuba `.vol`) into a voxel grid
 
-Two options — both produce the dense `.npy` grid the trainer consumes:
+Two options, both produce the dense `.npy` grid the trainer consumes:
 
 1. **Let the trainer convert on first use.** `resolve_volume()` in
    `gfields/presets.py` auto-converts `.vol` / `.vdb` to a cached `.npy`, so you
@@ -60,7 +54,7 @@ Two options — both produce the dense `.npy` grid the trainer consumes:
    examples/train.sh data/volumes/grids/wdas8.vdb --opacity_scale 12
    ```
 
-2. **Convert explicitly** with the bundled OpenVDB → dense-grid script:
+2. **Convert explicitly** with the bundled OpenVDB to dense-grid script:
 
    ```bash
    python -m gfields.references.vdb \
@@ -75,7 +69,7 @@ Two options — both produce the dense `.npy` grid the trainer consumes:
    conda install -c conda-forge openvdb
    ```
 
-Once `data/volumes/grids/<name>.npy` exists, the matching preset works directly:
+Once `data/volumes/grids/<name>.npy` exists, the matching preset, if desired, works directly:
 
 ```bash
 examples/train.sh wdas8

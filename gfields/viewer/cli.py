@@ -29,8 +29,7 @@ from gfields.rendering.pipeline import MS_ALBEDO_DEFAULT
 
 # Shipped defaults so `gfields viewer` just works for the release demo.
 DEFAULT_ASSET = REPO_ROOT / 'data' / 'examples' / 'wdas8'
-DEFAULT_ENVMAP = (REPO_ROOT / 'resources' / 'environment_maps'
-                  / 'rosendal_park_sunset_puresky_2k.exr')
+DEFAULT_ENVMAP = REPO_ROOT / 'data' / 'envmaps' / 'qwantani_dusk_2_1k.exr'
 
 
 def parse_args():
@@ -41,8 +40,9 @@ def parse_args():
                         'cloud) example asset.')
     parser.add_argument('--asset_pyr', type=int, default=None,
                         help='Pyramid variant to load (optimized_asset_pyr<N>)')
-    parser.add_argument('--envmap', default=None,
-                        help='Environment map (EXR/HDR). Omit for a constant '
+    parser.add_argument('--envmap', default=str(DEFAULT_ENVMAP),
+                        help='Environment map (EXR/HDR). Defaults to the '
+                        'bundled env map; pass an empty string for a constant '
                         'emitter (matches training).')
     parser.add_argument('--integrator',
                         choices=['tomography', 'prb', 'prb_stochastic'],

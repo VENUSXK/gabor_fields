@@ -164,8 +164,9 @@ def export_scene(out_dir: Path, *,
     environment settings.
 
     Args:
-        levels: numpy level dicts (centers/scales/quaternions/...).
-        level_meta: per-level ``{'is_gabor': bool, 'visibility_mask': int}``.
+        levels: numpy level dicts (centers/scales/quaternions/omega/...); a
+            level renders as Gaussian where its omega is 0 and Gabor otherwise.
+        level_meta: per-level ``{'visibility_mask': int}``.
         integrator / sensor / emitter: ``mi.load_dict``-style dicts using
             only XML-serializable values.
     """
@@ -185,7 +186,6 @@ def export_scene(out_dir: Path, *,
             'type': 'ellipsoidsmesh',
             'shell': 'uv_sphere',
             'filename': ply_path.name,
-            'is_gabor': bool(meta.get('is_gabor', False)),
             'visibility_mask': int(meta.get('visibility_mask', 255)),
         }
         scene[f'primitives_{i}'] = entry

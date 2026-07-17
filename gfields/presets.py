@@ -35,7 +35,7 @@ from gfields._paths import REPO_ROOT as REPO
 # ---------------------------------------------------------------------------
 
 def default_envmap() -> Path:
-    return REPO / "resources" / "environment_maps" / "rosendal_park_sunset_puresky_2k.exr"
+    return REPO / "data" / "envmaps" / "qwantani_dusk_2_1k.exr"
 
 
 def _abspath(path: str | Path) -> Path:

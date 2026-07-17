@@ -26,6 +26,11 @@ brings on top:
 - **`gfields_prb_stochastic`**, a new integrator based on decomposition
   tracking ([Kutz et al. 2017](https://doi.org/10.1145/3072959.3073665)):
   ~2× faster than regular `gfields_prb`. Gaussians only, for now.
+- **Lots of convenient tools for working with primitive volumes**, like a
+  voxelizer, a vdb2npy script, a fully fledged Polyscope viewer, a residual ratio tracking
+  integrator with supervoxels support for fast reference generation, and tools to
+  optimize performance and memory usage of your trained assets, like dynamic
+  pruning and adaptive extent clamping.
 
 ---
 

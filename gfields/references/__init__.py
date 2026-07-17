@@ -9,6 +9,8 @@
 Generates the ground-truth transmittance images the Gabor-field tomography
 optimiser regresses against. A small, self-contained residual-ratio tracker (Novak et al. 2014)
 over supervoxel local majorants (Szirmay-Kalos et al. 2011) on top of Mitsuba 3.
+The control grid is a per-supervoxel *lower* bound (not the mean), which keeps
+every collision weight — and hence the whole estimate — inside [0, 1].
 
 integrator = { 'type': 'gfields_reference',
                 'sigma_t': { 'type': 'gridvolume', 'data': ..., 'to_world': ... },
@@ -40,17 +42,40 @@ def _block_reduce(scalar: np.ndarray, factor: int, op: str) -> np.ndarray:
         scalar = np.pad(scalar, [(0, p) for p in pad], mode="edge")
     z, y, x = scalar.shape
     r = scalar.reshape(z // factor, factor, y // factor, factor, x // factor, factor)
-    out = r.max(axis=(1, 3, 5)) if op == "max" else r.mean(axis=(1, 3, 5))
+    out = r.max(axis=(1, 3, 5)) if op == "max" else r.min(axis=(1, 3, 5))
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
+def _dilate(scalar: np.ndarray, op: str) -> np.ndarray:
+    """3-wide min/max filter per axis (edge mode). The gridvolume samples sit
+    at voxel centers, so trilinear interpolation reaches half a voxel past a
+    supervoxel border; per-block bounds must include one voxel of margin."""
+    f = np.maximum if op == "max" else np.minimum
+    out = np.asarray(scalar, dtype=np.float32)
+    for ax in range(3):
+        idx = np.arange(out.shape[ax])
+        lo = out.take(np.maximum(idx - 1, 0), axis=ax)
+        hi = out.take(np.minimum(idx + 1, out.shape[ax] - 1), axis=ax)
+        out = f(out, f(lo, hi))
+    return out
+
+
 def build_supervoxel_grids(sigma_t: np.ndarray, factor: int, majorant_factor: float = 1.01):
-    """Return `(majorant, control)` coarse (Z,Y,X,1) grids from a σ_t volume."""
+    """Return `(majorant, control)` coarse (Z,Y,X,1) bound grids for a σ_t volume.
+
+    Majorant and control are per-supervoxel upper/lower bounds of the
+    *trilinearly interpolated* field (hence the 1-voxel dilation). Using a
+    lower bound as the control keeps every RRT collision weight
+    ``1 - (σ - ctrl)/(maj - ctrl)`` inside [0, 1], so the transmittance
+    estimate itself stays in [0, 1]: unbiased, no fireflies, and no need to
+    clip (a mean control makes samples overshoot 1 wherever σ < ctrl along
+    the ray, and clipping those was what caused blocky supervoxel artifacts).
+    """
     data = np.asarray(sigma_t, dtype=np.float32)
     if data.ndim == 4:
         data = data[..., 0] if data.shape[-1] == 1 else data.max(axis=-1)
-    maj = _block_reduce(data, factor, "max") * np.float32(majorant_factor)
-    ctrl = _block_reduce(data, factor, "mean")
+    maj = _block_reduce(_dilate(data, "max"), factor, "max") * np.float32(majorant_factor)
+    ctrl = _block_reduce(_dilate(data, "min"), factor, "min")
     return maj[..., None], ctrl[..., None]
 
 
@@ -103,7 +128,13 @@ def _eval1(vol, p, active):
 def _rrt_transmittance(ray, sigma_vol, maj_vol, ctrl_vol, bmin, bmax, res,
                        sampler, tmin, tmax, active):
     """Unbiased transmittance over [tmin, tmax] via residual ratio tracking
-    with supervoxel local majorants (advol.tr_rrt_local, self-contained)."""
+    with supervoxel local majorants (advol.tr_rrt_local, self-contained).
+
+    `maj_vol`/`ctrl_vol` must be per-supervoxel upper/lower bounds of the
+    interpolated σ_t (see `build_supervoxel_grids`): then each collision
+    weight (1 - delta) lies in [0, 1] and so does Tr * Tc, making the final
+    clip a pure FP guard. The DDA bbox (`bmin`/`bmax`) is the *padded*
+    supervoxel extent; the integral itself is still clipped to [tmin, tmax]."""
     dda_t, dda_tmax, dda_tdelta = _prepare_dda(bmin, bmax, res, ray, tmin, tmax)
     Tr = mi.Float(1.0)
     Tc = mi.Float(1.0)
@@ -172,15 +203,31 @@ class GfieldsReferenceIntegrator(mi.SamplingIntegrator):
         to_world = props.get("to_world", mi.ScalarTransform4f()) if props.has_property("to_world") \
             else mi.ScalarTransform4f()
         maj, ctrl = build_supervoxel_grids(grid, factor)
+        # The coarse grids describe ceil(N/factor) blocks of exactly `factor`
+        # fine voxels, i.e. they span [0, ceil(N/f)*f/N] >= 1 of the fine
+        # grid's unit cube per axis. Map them (and the DDA below) over that
+        # padded extent, otherwise the supervoxel cells shear against the
+        # fine voxels whenever the resolution is not a multiple of `factor`
+        # and the majorant no longer bounds σ_t.
+        nz, ny, nx = grid.shape[:3]
+        ext = (maj.shape[2] * factor / nx,   # (X,Y,Z)
+               maj.shape[1] * factor / ny,
+               maj.shape[0] * factor / nz)
+        coarse_tw = to_world @ type(to_world)().scale(ext)
         vd = lambda a: {"type": "gridvolume", "data": mi.TensorXf(a),
-                        "to_world": to_world, "filter_type": "nearest"}
+                        "to_world": coarse_tw, "filter_type": "nearest"}
         self.maj_vol = mi.load_dict(vd(maj))
         self.ctrl_vol = mi.load_dict(vd(ctrl))
-        # World-space AABB of the unit-cube gridvolume.
-        c = [to_world @ mi.ScalarPoint3f(x, y, z)
-             for x in (0, 1) for y in (0, 1) for z in (0, 1)]
-        self.bmin = mi.ScalarPoint3f(*(min(p[i] for p in c) for i in range(3)))
-        self.bmax = mi.ScalarPoint3f(*(max(p[i] for p in c) for i in range(3)))
+
+        # World-space AABBs: the unit-cube gridvolume (clips the transmittance
+        # integral) and the padded supervoxel grid (DDA traversal domain).
+        def aabb(sx, sy, sz):
+            c = [to_world @ mi.ScalarPoint3f(x * sx, y * sy, z * sz)
+                 for x in (0, 1) for y in (0, 1) for z in (0, 1)]
+            return (mi.ScalarPoint3f(*(min(p[i] for p in c) for i in range(3))),
+                    mi.ScalarPoint3f(*(max(p[i] for p in c) for i in range(3))))
+        self.bmin, self.bmax = aabb(1.0, 1.0, 1.0)
+        self.dda_bmin, self.dda_bmax = aabb(*ext)
         self.res = (maj.shape[2], maj.shape[1], maj.shape[0])  # (X,Y,Z)
 
     def sample(self, scene, sampler, ray, medium=None, active=True):
@@ -188,7 +235,8 @@ class GfieldsReferenceIntegrator(mi.SamplingIntegrator):
         hit, tmin, tmax = _ray_box(ray, self.bmin, self.bmax, active)
         T = dr.select(hit,
                       _rrt_transmittance(ray, self.sigma_t, self.maj_vol, self.ctrl_vol,
-                                         self.bmin, self.bmax, self.res, sampler, tmin, tmax, hit),
+                                         self.dda_bmin, self.dda_bmax, self.res,
+                                         sampler, tmin, tmax, hit),
                       mi.Float(1.0))
         return self.background * T, active, []
 

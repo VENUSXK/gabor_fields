@@ -57,7 +57,7 @@ def prepare_mixture(path: Path) -> Tuple[bool, mi.Scene, mi.SceneParameters, Bou
     :param path: Path to the saved Gabor mixture model.
     :type path: Path
     :return: A tuple containing:
-        - is_gabor: Boolean indicating if the model is a Gabor mixture.
+        - has_gabor: Boolean indicating if the model has a Gabor level.
         - scene: The Mitsuba scene object.
         - scene_params: The scene parameters for optimization.
         - adam: The BoundedAdam optimizer with model parameters.
@@ -65,13 +65,13 @@ def prepare_mixture(path: Path) -> Tuple[bool, mi.Scene, mi.SceneParameters, Bou
         - ref_images: The reference images for PSNR computation.
     """
     model = gu.load_model(path, -1)
-    is_gabor = 'primitives_pyr1' in model.keys()
+    has_gabor = 'primitives_pyr1' in model.keys()
     assert 'primitives_pyr2' not in model.keys(), "Pyramids with more than 2 levels are not supported."
-    max_level = int(is_gabor)
-    
+    max_level = int(has_gabor)
+
     # Log what was loaded
     prim_keys = [k for k in model.keys() if k.startswith('primitives_pyr')]
-    blue(f"Loaded model with levels: {prim_keys} (is_gabor={is_gabor}, max_level={max_level})")
+    blue(f"Loaded model with levels: {prim_keys} (has_gabor={has_gabor}, max_level={max_level})")
     
     scene: mi.Scene = mi.load_dict(model)
     scene_params = mi.traverse(scene)
@@ -101,7 +101,7 @@ def prepare_mixture(path: Path) -> Tuple[bool, mi.Scene, mi.SceneParameters, Bou
     ))
     ref_images = mi.TensorXf(mi.Bitmap(str(_find(f'reference_pyr{max_level}.exr'))))
 
-    return is_gabor, scene, scene_params, adam, cams, ref_images
+    return has_gabor, scene, scene_params, adam, cams, ref_images
 
 
 
@@ -291,7 +291,6 @@ def save_pruned_assets(
                 opacities=mi.TensorXf(opacities),
                 albedo=mi.TensorXf(albedo),
                 omega=mi.TensorXf(omega),
-                is_gabor=(l > 0)
             )
             pruned_model[f'primitives_pyr{l}'] = level_dict[f'primitives_pyr{l}']
             blue(f"      Successfully created primitives_pyr{l}")
@@ -397,16 +396,16 @@ def prune(
     :param prune_level: Which level to prune: 'auto' (highest), 'gauss'/'0', or 'gabor'/'1'.
     :return: Dictionary containing pruning statistics.
     """
-    is_gabor, scene, scene_params, adam, cams, ref_images = prepare_mixture(model_path)
-    max_level = int(is_gabor)
-    
+    has_gabor, scene, scene_params, adam, cams, ref_images = prepare_mixture(model_path)
+    max_level = int(has_gabor)
+
     # Determine which level to prune
     if prune_level in ['auto']:
         level = max_level  # highest available level
     elif prune_level in ['gauss', '0']:
         level = 0
     elif prune_level in ['gabor', '1']:
-        if not is_gabor:
+        if not has_gabor:
             raise ValueError("Cannot prune Gabors: model does not contain Gabor primitives (only Gaussians).")
         level = 1
     else:
@@ -418,11 +417,11 @@ def prune(
     scales_0 = adam['scales_0'].numpy()
     n_gaussians = scales_0.shape[-1] if scales_0.ndim > 1 else scales_0.shape[0] // 3
     n_gabors = 0
-    if is_gabor:
+    if has_gabor:
         scales_1 = adam['scales_1'].numpy()
         n_gabors = scales_1.shape[-1] if scales_1.ndim > 1 else scales_1.shape[0] // 3
-    
-    if is_gabor:
+
+    if has_gabor:
         blue(f"Loaded Gauss-Gabor mixture from {model_path} with {n_gaussians} Gaussians and {n_gabors} Gabors.")
     else:
         blue(f"Loaded Gaussian model from {model_path} with {n_gaussians} Gaussians.")
@@ -519,7 +518,7 @@ def prune(
         'spp': spp,
         'pyramid_level_pruned': level,
         'level_name': level_name,
-        'is_gabor': is_gabor,
+        'has_gabor': has_gabor,
         'metrics': {
             'initial_psnr_dB': float(PSNR_0),
             'final_psnr_dB': float(best_psnr),

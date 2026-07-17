@@ -125,8 +125,9 @@ def voxelize_asset(
         omegas = pyr_prims[pyr]['omegas']
         
         P = means.shape[0]
-        is_gabor = (pyr > 0) and (omegas is not None)
-        
+        # Gabor-ness is derived from omega: a level oscillates iff any omega != 0.
+        is_gabor = (omegas is not None) and bool(torch.any(omegas != 0))
+
         # Compute adaptive sample count per primitive based on volume coverage
         # A primitive with scale s covers ~(2*extent*s)^3 world-space volume
         # The number of voxels it spans is proportional to prod(s) / voxel_volume
@@ -233,8 +234,8 @@ def voxelize_asset(
     for pyr in range(num_levels):
         sigmats = pyr_prims[pyr]['sigmats']
         omegas = pyr_prims[pyr]['omegas']
-        is_gabor = (pyr > 0) and (omegas is not None)
-        
+        is_gabor = (omegas is not None) and bool(torch.any(omegas != 0))
+
         if is_gabor:
             beta_values = omegas
             gabor_damping = torch.exp(-0.5 * 3.0 * beta_values ** 2)

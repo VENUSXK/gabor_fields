@@ -334,7 +334,6 @@ def render_primitives(
             'omega': mi.TensorXf(np.ravel(omega), shape=(num_prims, 1)),
             'albedo': mi.TensorXf(np.ones((num_prims, 3), dtype=np.float32) * albedo),
             'extent': 3.0,
-            'is_gabor': pyr > 0,
             'visibility_mask': 2 ** pyr,
         }
         
@@ -407,8 +406,9 @@ def run_controlled_test(args):
     
     # Test primitives: 1 Gaussian + 1 Gabor at known locations
     # Single Gaussian for clean calibration
+    # A primitive is a Gabor iff its omega != 0 (a plain Gaussian otherwise).
     test_prims = [
-        {'center': [0.0, 0.0, 0.0], 'scale': [0.3, 0.3, 0.3], 'sigma': 1.0, 'omega': 0.0, 'is_gabor': False},
+        {'center': [0.0, 0.0, 0.0], 'scale': [0.3, 0.3, 0.3], 'sigma': 1.0, 'omega': 0.0},
     ]
     
     # Expected optical depth through center along z (from density_integral code):
@@ -457,7 +457,7 @@ def run_controlled_test(args):
         p = (grid_points - center) / scale
         gaussian = torch.exp(-0.5 * torch.sum(p * p, dim=-1))
         norm = (2.0 * np.pi) ** 1.5 * scale.prod().item()
-        if prim['is_gabor']:
+        if omega != 0:
             cosine = torch.cos(omega * torch.sum(p, dim=-1))
             kernel_val = gaussian * cosine / norm
         else:
@@ -510,7 +510,7 @@ def run_controlled_test(args):
         # Importance sampling from N(0,I):
         # IS from N(0,I) with (2π)^(3/2)*prod(s) norm: factors cancel exactly
         # contribution = sigma * cos_term / N, then divide by voxel_vol
-        if prim['is_gabor']:
+        if omega != 0:
             cosine_term = torch.cos(omega * local_samples.sum(dim=-1))
             contributions = (sigma * cosine_term / num_samples)
         else:
@@ -658,9 +658,9 @@ def run_controlled_test(args):
     
     n = len(test_prims)
     
-    # Gaussian level (pyr0)
-    gauss_mask = [not p['is_gabor'] for p in test_prims]
-    gabor_mask = [p['is_gabor'] for p in test_prims]
+    # Gaussian level (pyr0): split on omega (0 => Gaussian, nonzero => Gabor).
+    gauss_mask = [p['omega'] == 0 for p in test_prims]
+    gabor_mask = [p['omega'] != 0 for p in test_prims]
     
     gauss_idx = [i for i, m in enumerate(gauss_mask) if m]
     gabor_idx = [i for i, m in enumerate(gabor_mask) if m]
@@ -677,7 +677,6 @@ def run_controlled_test(args):
             'omega': mi.TensorXf(np.array([all_omegas[i] for i in gauss_idx], dtype=np.float32).ravel(), shape=(ng, 1)),
             'albedo': mi.TensorXf(np.array([all_albedos[i] for i in gauss_idx], dtype=np.float32).ravel(), shape=(ng, 3)),
             'extent': 3.0,
-            'is_gabor': False,
             'visibility_mask': 1,
         }
     
@@ -693,7 +692,6 @@ def run_controlled_test(args):
             'omega': mi.TensorXf(np.array([all_omegas[i] for i in gabor_idx], dtype=np.float32).ravel(), shape=(ngb, 1)),
             'albedo': mi.TensorXf(np.array([all_albedos[i] for i in gabor_idx], dtype=np.float32).ravel(), shape=(ngb, 3)),
             'extent': 3.0,
-            'is_gabor': True,
             'visibility_mask': 2,
         }
     
@@ -735,7 +733,7 @@ def main():
     parser.add_argument('--albedo', type=float, default=0.9,
                        help='Albedo value for multiple scattering')
     parser.add_argument('--envmap', type=str,
-                       default='./data/envmaps/rosendal_park_sunset_puresky_2k.exr',
+                       default='./data/envmaps/qwantani_dusk_2_1k.exr',
                        help='Path to environment map for multiple scattering')
     parser.add_argument('--envmap_scale', type=float, default=2.0,
                        help='Environment map intensity scale')

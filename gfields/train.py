@@ -216,7 +216,7 @@ if not args.skip_gaussian_optim:
     opt.set_learning_rate(lr_dict)
 
     opt.set_bounds('scales_0', lower=1e-08, upper=1.0) # if done correctly, this should cover roughly the Gaussian low pass region
-    opt.set_bounds('omega_0', lower=0.0, upper=0.0) # base is a TRUE Gaussian: omega==0. The mixture kernel oscillates ANY nonzero omega (is_gabor flag is ignored by the density eval), so a free base omega renders the base as Gabors.
+    opt.set_bounds('omega_0', lower=0.0, upper=0.0) # base is a TRUE Gaussian: omega==0. The mixture kernel oscillates for ANY nonzero omega (that is the sole thing marking a primitive as Gabor), so a free base omega would render the base as Gabors.
     opt.set_bounds('opacities_0', lower=1e-8, upper=1.0) # 1.0 for gabor, 1e-2 for gaussian
     opt.set_bounds('albedo_0', lower=1e-9, upper=1.0)
     opt.set_bounds('centers_0', lower=-1.0, upper=1.0)

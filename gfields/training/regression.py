@@ -777,12 +777,10 @@ def create_scene_dict_from_primitives(
     centers: mi.TensorXf, 
     scales: mi.TensorXf, 
     quaternions: mi.TensorXf, 
-    opacities: mi.TensorXf, 
-    albedo: mi.TensorXf, 
+    opacities: mi.TensorXf,
+    albedo: mi.TensorXf,
     omega: mi.TensorXf,
     extent: float = 3.0,
-    is_gabor: Optional[bool] = None,
-    kernel_type: Optional[int] = None,
     integrator_type: str = 'gfields_tomography',
     use_kernel_freeze: bool = False,
     use_anyhit: bool = False,
@@ -798,20 +796,17 @@ def create_scene_dict_from_primitives(
         quaternions: (N, 4) primitive rotation quaternions
         opacities: (N, 1) primitive opacity/sigmat values
         albedo: (N, 3) primitive albedo colors
-        omega: (N, 1) or (N, 3) Gabor frequency parameters
+        omega: (N, 1) or (N, 3) Gabor frequency parameters. A level oscillates
+            (is "Gabor") wherever omega != 0 and is a plain Gaussian where
+            omega == 0; the shape no longer carries a separate is_gabor flag.
         extent: Bounding extent in sigma units (default 3.0)
             Higher frequency Gabors can use smaller extents due to exp(-ω²/2) decay.
             See gfields.training.adaptive for computing optimal per-level extents.
-        is_gabor: Whether primitives are Gabor (True) or Gaussian (False).
-            Default: level != 0 (level 0 is Gaussian, higher levels are Gabor)
         integrator_type: Mitsuba integrator plugin name.
 
     Returns:
         Scene dictionary ready for mi.load_dict()
     """
-    if is_gabor is None:
-        is_gabor = level != 0
-
     integrator: Dict[str, Any] = {
         'type': integrator_type,
         'max_depth': max_depth,
@@ -827,11 +822,9 @@ def create_scene_dict_from_primitives(
         # pass keeps the sequential walk (identical estimand).
         integrator['use_anyhit'] = True
         
-    # Kernel marker. The C++ shape accepts the general integer ``kernel_type``
-    # (0=Gaussian, 1=Gabor, ...) and the legacy boolean ``is_gabor`` as a
-    # shorthand for kernel_type=1. We always emit ``is_gabor`` (understood by
-    # every build) and additionally emit the integer ``kernel_type`` only when a
-    # caller explicitly requests one (requires a build that supports it).
+    # The shape derives Gabor vs Gaussian purely from the per-primitive
+    # ``omega`` column (nonzero => oscillates); it no longer accepts an
+    # is_gabor/kernel_type property.
     prim_dict: Dict[str, Any] = {
         'type': 'ellipsoidsmesh',
         'shell': 'uv_sphere',
@@ -844,10 +837,7 @@ def create_scene_dict_from_primitives(
         'albedo': albedo,
         'extent': float(extent),
         # 'extent_adaptive_clamping': True,
-        'is_gabor': bool(is_gabor) if is_gabor is not None else (kernel_type == 1),
     }
-    if kernel_type is not None:
-        prim_dict['kernel_type'] = int(kernel_type)
     scene_dict = {
         'type': 'scene',
         'integrator': integrator,
@@ -1023,7 +1013,7 @@ def load_model(path: Path, max_depth: int, integrator_type: str = 'gfields_tomog
             'visibility_mask': 255,
             'extent': extent,
             # 'extent_adaptive_clamping': True,
-            'is_gabor': level != 0,  # Gabor primitives are only used for levels > 0
+            # Gabor vs Gaussian is read from each primitive's omega (loaded above).
         })
         prims_dict[f'primitives_pyr{level}'] = layer_dict
 

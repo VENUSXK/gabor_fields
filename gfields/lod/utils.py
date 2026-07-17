@@ -216,6 +216,20 @@ def load_pyramid_target_levels(asset_root: Path) -> tuple[int, int]:
     return meta["gabor_target_level"], meta["gauss_target_level"]
 
 
+def is_gabor_from_omega(omega: Any) -> bool:
+    """Single source of truth for "does this band oscillate?".
+
+    The shape plugin no longer carries an ``is_gabor``/``kernel_type`` flag: the
+    Gabor-Gaussian kernel is a plain Gaussian exactly when ``omega == 0``
+    (``cos(0) == 1``) and oscillates for any nonzero ``omega``. Gabor-ness is
+    therefore derived from the ``omega`` column wherever a boolean is needed.
+    ``omega is None`` (a level stored without the column) is treated as Gaussian.
+    """
+    if omega is None:
+        return False
+    return bool(np.any(np.asarray(omega, dtype=np.float32) != 0.0))
+
+
 def is_gabor_for_level(
     level: int,
     gabor_target_level: int,
@@ -350,19 +364,14 @@ def write_numpy_level_ply(data: dict[str, Any], ply_path: Path) -> None:
 def numpy_level_to_mesh_entry(
     data: dict[str, Any],
     *,
-    is_gabor: bool,
     visibility_mask: int,
     ply_path: Path | None = None,
 ) -> dict[str, Any]:
     n = data["centers"].shape[0]
-    # The scene-global GaborKernel treats a primitive as a plain Gaussian only
-    # when its omega is exactly 0 (cos(0)=1); the per-shape is_gabor/kernel_type
-    # flag is NOT consulted by the density eval. Gaussian (base) levels may still
-    # carry a trained/stored omega, so force it to zero here or the base
-    # oscillates and renders as Gabors. Matches the old voxelize contract
-    # (`beta = omega if is_gabor else 0.0`).
-    if not is_gabor and np.any(np.asarray(data["omega"]) != 0):
-        data = {**data, "omega": np.zeros_like(np.asarray(data["omega"], dtype=np.float32))}
+    # Gabor-ness is read straight off the ``omega`` column by the kernel: a
+    # primitive is a plain Gaussian exactly when ``omega == 0`` (cos(0)=1). To
+    # render a level as Gaussian, zero its omega before calling this (the shape
+    # no longer takes an is_gabor/kernel_type flag). See is_gabor_from_omega.
     extent = data["extent"]
     if np.asarray(extent).shape[0] != n:
         extent = np.full((n, 1), float(np.asarray(extent).reshape(-1)[0]), dtype=np.float32)
@@ -370,7 +379,6 @@ def numpy_level_to_mesh_entry(
         "type": "ellipsoidsmesh",
         "shell": "uv_sphere",
         "extent": _extent_mesh_value(extent, n),
-        "is_gabor": is_gabor,
         "visibility_mask": visibility_mask,
     }
     if ply_path is not None:
@@ -402,6 +410,7 @@ __all__ = [
     "equal_partitioning",
     "load_pyramid_metadata",
     "load_pyramid_target_levels",
+    "is_gabor_from_omega",
     "is_gabor_for_level",
     "compute_visual_aabb_from_levels",
     "subset_numpy_level",

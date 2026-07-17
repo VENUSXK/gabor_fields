@@ -220,7 +220,7 @@ def parse_args():
     
     # Environment
     parser.add_argument('--envmap', type=str,
-                        default='./data/envmaps/kloppenheim_02_puresky_2k.exr',
+                        default='./data/envmaps/qwantani_dusk_2_1k.exr',
                         help='Path to environment map')
     parser.add_argument('--envmap_scale', type=float, default=1.0,
                         help='Environment map intensity scale')
@@ -313,8 +313,8 @@ def parse_args():
 def _video_parse_args() -> argparse.Namespace:
     from gfields.rendering.pipeline import MS_ALBEDO_DEFAULT
     from gfields._paths import REPO_ROOT as _REPO_ROOT
-    default_envmap = (_REPO_ROOT / 'resources' / 'environment_maps'
-                      / 'rosendal_park_sunset_puresky_2k.exr')
+    default_envmap = (_REPO_ROOT / 'data' / 'envmaps'
+                      / 'qwantani_dusk_2_1k.exr')
     p = argparse.ArgumentParser(
         prog='gfields.render video',
         description='Env-map-lit turntable / rotating-envmap video of an asset')
