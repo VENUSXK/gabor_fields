@@ -1,10 +1,10 @@
 #!/usr/bin/env pwsh
-# Train volumetric primitives with the paper's winning recipe.
-#   .\train.ps1 <preset|volume>            # Gaussian base + Gabor residual (paper recipe)
-#   .\train.ps1 <preset|volume> --gaussian # Gaussian-only baseline
+# Train volumetric primitives
+#   .\train.ps1 <preset|volume>            # Gaussian base + Gabor residual
+#   .\train.ps1 <preset|volume> --gaussian # Gaussian-only (essentially improved Don't splat your Gaussians)
 # <preset> is a paper asset name (wdas8, embergen, ...); <volume> is a .npy/.vol/.vdb
 # file (give an unknown volume a density scale, e.g. --opacity_scale 12). Every
-# extra flag overrides the recipe; see `python -m gfields.train --help`.
+# extra flag overrides this; see `python -m gfields.train --help`.
 $ErrorActionPreference = "Stop"
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 

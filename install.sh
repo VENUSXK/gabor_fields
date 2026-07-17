@@ -16,7 +16,31 @@ cd "$here"
 PYVER="${VOLPRIM_PYTHON_VERSION:-3.13}"
 VENV="$here/.venv"
 
-command -v uv    >/dev/null 2>&1 || { echo "ERROR: 'uv' not found. Install it: https://docs.astral.sh/uv/getting-started/installation/  (curl -LsSf https://astral.sh/uv/install.sh | sh)" >&2; exit 1; }
+# Ensure uv (the Python package/venv manager this script drives) is available.
+# The official installer drops the binary in ~/.local/bin (or ~/.cargo/bin),
+# which may not be on PATH in a fresh shell, so first try to pick up an existing
+# install from there before downloading — avoids clobbering a working uv.
+if ! command -v uv >/dev/null 2>&1; then
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "'uv' not found; installing via https://astral.sh/uv/install.sh ..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    fi
+    command -v uv >/dev/null 2>&1 || { echo "ERROR: 'uv' still not found. Install it manually: https://docs.astral.sh/uv/getting-started/installation/  then reopen your shell." >&2; exit 1; }
+    # Persist ~/.local/bin on PATH for future shells so uv is found without
+    # re-running this. The installer normally does this, but do it ourselves too
+    # (covers the already-installed-but-not-on-PATH case). Guarded by a marker so
+    # it is appended at most once per profile file.
+    uv_dir="$(dirname "$(command -v uv)")"
+    marker="# added by gabor_fields install.sh (uv)"
+    for profile in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [[ -f "$profile" ]] || continue
+        grep -qF "$marker" "$profile" 2>/dev/null && continue
+        printf '\n%s\nexport PATH="%s:$PATH"\n' "$marker" "$uv_dir" >> "$profile"
+        echo "Added $uv_dir to PATH in $profile (permanent)."
+    done
+fi
 command -v cmake >/dev/null 2>&1 || { echo "ERROR: 'cmake' not found — required to compile the Mitsuba fork." >&2; exit 1; }
 command -v git   >/dev/null 2>&1 || { echo "ERROR: 'git' not found." >&2; exit 1; }
 command -v nvidia-smi >/dev/null 2>&1 || echo "WARNING: 'nvidia-smi' not found; the cuda_ad_rgb variant builds but needs an NVIDIA driver at runtime."

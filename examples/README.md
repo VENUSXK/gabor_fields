@@ -41,17 +41,21 @@ the last occurrence) — so any parameter can be tuned from here. See
 ./render.sh ms  data/examples/wdas8 --stochastic_sampling   # gfields_prb_stochastic integrator
 ./render.sh video data/examples/wdas8 --motion envmap --frames 240
 
-# Train a paper asset preset (framing / capacity / density auto-configured).
-# The source grid must live in data/volumes/grids/ — see
-# data/volumes/asset_sources.md for where to download it:
+# With no target at all, trains the bundled smoke asset (512 Gaussians +
+# 4096 Gabors, --opacity_scale 10.0):
+./train.sh
+./train.sh --gaussian
+
+# Train a named paper asset (same recipe/counts/density as above, only the
+# volume file differs). The source grid must live in data/volumes/grids/ —
+# see data/volumes/asset_sources.md for where to download it:
 ./train.sh wdas8
-./train.sh wdas8 --gaussian
 
-# Train your own volume (density scale required for unknown volumes):
-./train.sh data/volumes/grids/mine.npy --opacity_scale 12
+# Train your own volume:
+./train.sh data/volumes/grids/mine.npy
 
-# Override anything — later flags win over the recipe and the preset:
-./train.sh wdas8 --iterations_gabor 900 --cam_res_x 1024 --cam_res_y 1024
+# Override anything — later flags win over the recipe:
+./train.sh wdas8 --gauss_count 2048 --gabor_count 32768 --opacity_scale 20
 ```
 
 - **Output** defaults to `results/renders/<mode>` (renders) and
@@ -61,11 +65,13 @@ the last occurrence) — so any parameter can be tuned from here. See
 
 ## Where the presets live
 
-The recipe, per-asset presets, render-mode presets, and volume-file conversion
-all live in [`gfields/presets.py`](../gfields/presets.py) — the single source of
-truth. `python -m gfields.train <preset|volume>` and
+The recipe, named-asset volume lookup, render-mode presets, and volume-file
+conversion all live in [`gfields/presets.py`](../gfields/presets.py) — the
+single source of truth. `python -m gfields.train [preset|volume]` and
 `python -m gfields.render {tomo|ms}` pull their defaults from there, so the
-launchers stay thin and the same behavior is available without them.
+launchers stay thin and the same behavior is available without them. With no
+target, training defaults to the bundled `smoke` asset (`DEFAULT_ASSET` in
+`gfields/presets.py`).
 
 ## The winning training recipe (defaults)
 
@@ -80,35 +86,35 @@ Two settings are non-obvious but critical:
    a few oversized, over-smoothing ones.
 
 Other defaults: 32 cameras, `ref_spp 8192`, `opt_spp 2`, Gaussian base at
-pyramid level 3 → Gabor residual at level 0, 240 + 600 iterations, importance-
-sampled means, single-hemisphere cameras, padded grid, no L1 scale/opacity
-regularization, Langevin noise `init 50 / decay 0.75`. Measured on `wdas8`:
-~48.7 dB in ~1 h GPU (900 iters → ~49.6 dB); it transfers to the other assets
-with no retuning.
+pyramid level 3 → Gabor residual at level 0, 240 + 1200 iterations, importance-
+sampled means, single-hemisphere cameras, padded grid, no L1 opacity
+regularization (light L1 scale regularization), Langevin noise
+`init 50 / decay 0.75`. Measured on `wdas8`: ~48.7 dB in ~1 h GPU; it transfers
+to the other assets with no retuning.
 
-## Per-asset presets
+## Primitive counts and density
 
-Only genuinely asset-specific handling lives in the presets (`TRAIN_PRESETS`
-in `gfields/presets.py`): camera framing + **resolution**, primitive **counts**,
-reference **spp**, and any special base level. The **density (opacity) scale**
-and the geometric **`to_world` transform** (e.g. the Disney cloud's non-uniform
-box, the tornado) are picked from the volume path automatically by
-`gfields.training.configs`.
+The only knobs that meaningfully differ across volumes are primitive
+**counts** and the **density** (`--opacity_scale`), so the recipe bakes in a
+single default for both — `--gauss_count 512 --gabor_count 4096
+--opacity_scale 10.0` — rather than a per-asset preset table. Named assets
+(`TRAIN_ASSETS` in `gfields/presets.py`) are just a shorthand mapping a short
+name to its volume-grid path; tune counts/density per run from the CLI:
 
-| asset | cam res | cam_scale | y_offset | gauss | gabor | ref_spp | notes |
-|---|---|---|---|---|---|---|---|
-| wdas8 (cloud) | 512×512 | 0.95 | −0.25 | 1024 | 32768 | 8192 | champion reference |
-| embergen | 512×768 | 0.70 | 0.00 | 512 | 24064 | 8192 | |
-| explosion | 512×512 | 1.00 | 0.00 | 1024 | 23552 | 8192 | |
-| fire | 224×512 | 0.50 | −0.10 | 512 | 24064 | 16384 | |
-| smoke | 256×512 | 0.50 | 0.00 | 512 | 15872 | 16384 | |
-| smokev2 | 400×1000 | 0.35 | −0.12 | 512 | 24064 | 8192 | |
-| tornado | 512×768 | 0.55 | −0.25 | 512 | 11520 | 8192 | base at level 2 |
-| dust | 224×512 | 0.50 | −0.10 | 512 | 24064 | 16384 | Gabor count untuned |
+```bash
+./train.sh wdas8 --gauss_count 1024 --gabor_count 24576 --opacity_scale 20
+```
 
-Quality-verified with this recipe: `wdas8`, `embergen`, `explosion`, `fire`.
-The rest inherit the same recipe for consistency (framing/capacity preserved) —
-re-verify if you depend on exact numbers.
+Other known-good `(gauss, gabor)` combos, roughly increasing quality/cost:
+`512 + 8192`, `1024 + 24576`, `2048 + 32768`. `--opacity_scale 10.0` is a
+reasonable middle-of-the-road default; paper assets individually used values
+from 7.5 to 70 (see `gfields.training.configs`) — nudge it down if a render
+looks washed out, or up if it looks too opaque.
+
+The geometric **`to_world` transform** (e.g. the Disney cloud's non-uniform
+box) is still picked from the volume path automatically by
+`gfields.training.configs`; `--opacity_scale` always overrides that config's
+default density.
 
 ## Training your own volume
 
@@ -116,15 +122,14 @@ re-verify if you depend on exact numbers.
    directory is git-ignored; see
    [`data/volumes/asset_sources.md`](../data/volumes/asset_sources.md) for the
    paper volumes and how to convert `.vdb` grids.
-2. Run the launcher on the file path and give it a density scale:
+2. Run the launcher on the file path (the recipe's default `--opacity_scale
+   10.0` and generic isotropic 2-unit-cube transform apply automatically):
 
    ```bash
    ./train.sh data/volumes/grids/mine.npy --opacity_scale 15 \
        --cam_res_x 512 --cam_res_y 512 --output results/checkpoints/mine
    ```
 
-`--opacity_scale` is **required** for a volume with no named config; it selects
-the generic isotropic 2-unit-cube transform. If your volume is non-cubic and
-needs a specific `to_world`, add a `VolumeConfig` subclass in
-`gfields/training/configs.py` (match on a substring of the filename) —
-then the launcher picks it up with no `--opacity_scale` needed.
+If your volume is non-cubic and needs a specific `to_world`, add a
+`VolumeConfig` subclass in `gfields/training/configs.py` (match on a substring
+of the filename) — then the launcher picks it up automatically.

@@ -6,10 +6,11 @@
 
 """Baked-in presets for the example workflows (train / render).
 
-This is the single source of truth for the paper's winning training recipe,
-the per-asset training presets, and the render-mode presets (tomography /
-multiple scattering). It also handles volume-file resolution (converting
-Mitsuba ``.vol`` / OpenVDB ``.vdb`` grids to cached ``.npy``).
+This is the single source of truth for the paper's winning training recipe
+(default primitive counts + density baked in), the named-asset volume lookup,
+and the render-mode presets (tomography / multiple scattering). It also
+handles volume-file resolution (converting Mitsuba ``.vol`` / OpenVDB ``.vdb``
+grids to cached ``.npy``).
 
 The ``examples/train.{sh,ps1}`` and ``examples/render.{sh,ps1}`` shims only
 locate a python interpreter and run ``python -m gfields.train`` /
@@ -107,7 +108,7 @@ def resolve_volume(volume: str | Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Training: the winning ("champion") recipe + per-asset presets
+# Training: the winning ("champion") recipe + named-asset volume lookup
 # ---------------------------------------------------------------------------
 # Three non-obvious, critical settings baked in:
 #   * per-parameter LRs are set EXPLICITLY (the CLI default of 1.0 x global_lr
@@ -121,12 +122,23 @@ def resolve_volume(volume: str | Path) -> Path:
 #     up to a fixed budget yields FATTER primitives — 73% slower renders and
 #     slightly lower PSNR than starting at the budget — so densification stays
 #     off; slower MCMC noise decay and gentler LRs bring no gain.)
+#
+# Primitive counts and density (--opacity_scale) are basically the only knobs
+# that differ across volumes in practice, so a single default recipe covers
+# most assets; override --gauss_count/--gabor_count/--opacity_scale from the
+# CLI for anything unusual (they win over the injected defaults below). Other
+# known-good (gauss, gabor) combos, roughly increasing in quality/cost:
+#   512 + 8192, 1024 + 24576, 2048 + 32768.
+# --opacity_scale 10.0 is a reasonable middle-of-the-road density for most
+# volumes; if a render looks too washed out or too opaque, nudge it down/up
+# (values 7.5-70 have been used for individual paper assets, see
+# gfields.training.configs).
 TRAIN_RECIPE = """
     --cam_count 32 --sample_single_hemisphere
     --cam_res_x 512 --cam_res_y 512 --cam_scale 0.95 --cam_y_offset -0.25
     --importance_sample_means --pad_grid
     --gauss_target_level 3 --gabor_target_level 0
-    --gauss_count 1024 --gabor_count 32768
+    --gauss_count 512 --gabor_count 4096
     --iterations_gaussian 240 --iterations_gabor 1200
     --opt_spp 2 --ref_spp 8192 --ref_kernel_spp 64
     --init_opacity 0.00008 --init_omega 1.5 --init_scale 0.0175
@@ -139,41 +151,29 @@ TRAIN_RECIPE = """
     --densify_every 30 --densify_count 1024 --densify_until 0
     --start_pruning_from 200000000000000 --prune_every 30 --opacity_decay 0.0
     --checkpoint_every 50
+    --opacity_scale 10.0
 """.split()
 
 # Gaussian-only mode: fit full-detail level-0 Gaussians, skip the Gabor phase.
 GAUSSIAN_MODE = "--gauss_target_level 0 --gauss_count 24576 --skip_gabor_optim".split()
 
-# Per-asset presets: only asset-specific handling lives here (camera framing +
-# resolution, primitive counts, reference spp, special training level). Density
-# (opacity) scale and the geometric to_world transform are picked automatically
-# from the volume path by gfields.training.configs.
-TRAIN_PRESETS = {
-    "wdas8": ("data/volumes/grids/wdas8.npy",
-              "--cam_res_x 512 --cam_res_y 512 --cam_scale 0.95 --cam_y_offset -0.25 "
-              "--gauss_count 1024 --gabor_count 32768 --ref_spp 8192"),
-    "embergen": ("data/volumes/grids/embergen.npy",
-                 "--cam_res_x 512 --cam_res_y 768 --cam_scale 0.70 --cam_y_offset 0.00 "
-                 "--gauss_count 512 --gabor_count 24064 --ref_spp 8192"),
-    "explosion": ("data/volumes/grids/explosion.npy",
-                  "--cam_res_x 512 --cam_res_y 512 --cam_scale 1.00 --cam_y_offset 0.00 "
-                  "--gauss_count 1024 --gabor_count 23552 --ref_spp 8192"),
-    "fire": ("data/volumes/grids/fire.npy",
-             "--cam_res_x 224 --cam_res_y 512 --cam_scale 0.50 --cam_y_offset -0.10 "
-             "--gauss_count 512 --gabor_count 24064 --ref_spp 16384"),
-    "smoke": ("data/volumes/smoke.vol",
-              "--cam_res_x 256 --cam_res_y 512 --cam_scale 0.50 --cam_y_offset 0.00 "
-              "--gauss_count 512 --gabor_count 15872 --ref_spp 16384"),
-    "smokev2": ("data/volumes/grids/smokev2.npy",
-                "--cam_res_x 400 --cam_res_y 1000 --cam_scale 0.35 --cam_y_offset -0.12 "
-                "--gauss_count 512 --gabor_count 24064 --ref_spp 8192"),
-    "tornado": ("data/volumes/grids/tornado.npy",
-                "--cam_res_x 512 --cam_res_y 768 --cam_scale 0.55 --cam_y_offset -0.25 "
-                "--gauss_count 512 --gabor_count 11520 --ref_spp 8192 --gauss_target_level 2"),
-    # dust: gabor count untuned; a Gaussian asset in the paper
-    "dust": ("data/volumes/grids/dust.npy",
-             "--cam_res_x 224 --cam_res_y 512 --cam_scale 0.50 --cam_y_offset -0.10 "
-             "--gauss_count 512 --gabor_count 24064 --ref_spp 16384"),
+# Default asset used when the training scripts are invoked without a target
+# (only "smoke" ships in the repo; the others require external volume data).
+DEFAULT_ASSET = "smoke"
+
+# Named assets -> volume-grid path. This is just a shorthand for known volume
+# files; per-asset training flags aren't baked in here anymore (see
+# TRAIN_RECIPE above) — pass --gauss_count/--gabor_count/--opacity_scale etc.
+# on the CLI to tune an individual asset.
+TRAIN_ASSETS = {
+    "wdas8": "data/volumes/grids/wdas8.npy",
+    "embergen": "data/volumes/grids/embergen.npy",
+    "explosion": "data/volumes/grids/explosion.npy",
+    "fire": "data/volumes/grids/fire.npy",
+    "smoke": "data/volumes/smoke.vol",
+    "smokev2": "data/volumes/grids/smokev2.npy",
+    "tornado": "data/volumes/grids/tornado.npy",
+    "dust": "data/volumes/grids/dust.npy",
 }
 
 
@@ -189,8 +189,10 @@ def build_train_argv(raw: list[str]) -> list[str]:
     A recognized *target* injects the champion recipe (+ per-asset preset, +
     Gaussian-mode flags), a resolved ``--volume_grid`` and a default
     ``--output``, followed verbatim by every remaining user flag (which wins on
-    conflict). With no target the argv is returned unchanged, so the raw
-    ``--volume_grid ... --output ...`` interface still works.
+    conflict). With no target and no explicit ``--volume_grid``, the target
+    defaults to ``DEFAULT_ASSET`` (``smoke``, the only asset shipped with the
+    repo). The raw ``--volume_grid ... --output ...`` interface still works
+    when ``--volume_grid`` is passed explicitly.
     """
     raw = list(raw)
 
@@ -206,22 +208,24 @@ def build_train_argv(raw: list[str]) -> list[str]:
     target = None
     if raw and not raw[0].startswith("-"):
         target = raw.pop(0)
+    elif not raw or "--volume_grid" not in raw:
+        # No positional target and no explicit --volume_grid: fall back to the
+        # only asset shipped with the repo instead of erroring out.
+        target = DEFAULT_ASSET
     if target is None:
         return raw  # legacy direct mode (user supplies --volume_grid/--output)
 
-    if target in TRAIN_PRESETS:
-        name = target
-        volume, preset = TRAIN_PRESETS[target]
-        preset_flags = preset.split()
+    if target in TRAIN_ASSETS:
+        name, volume = target, TRAIN_ASSETS[target]
     else:
-        name, volume, preset_flags = Path(target).stem, target, []
+        name, volume = Path(target).stem, target
 
     resolved = str(resolve_volume(volume))
     mode_flags = GAUSSIAN_MODE if gaussian else []
     suffix = "_gaussian" if gaussian else ""
     default_output = str(REPO / "results" / "checkpoints" / f"{name}{suffix}")
 
-    injected = [*TRAIN_RECIPE, *mode_flags, *preset_flags,
+    injected = [*TRAIN_RECIPE, *mode_flags,
                 "--volume_grid", resolved, "--output", default_output]
     return [*injected, *raw]
 

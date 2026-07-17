@@ -22,7 +22,31 @@ $Venv  = Join-Path $PSScriptRoot ".venv"
 function Need($name, $hint) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "ERROR: '$name' not found. $hint" }
 }
-Need uv    "Install it: https://docs.astral.sh/uv/getting-started/installation/  (irm https://astral.sh/uv/install.ps1 | iex)"
+
+# Ensure uv (the Python package/venv manager this script drives) is available.
+# The official installer drops the binary in %USERPROFILE%\.local\bin, which is
+# not on PATH in a fresh shell, so first try to pick up an existing install from
+# there before downloading — avoids clobbering (and locking) a working uv.exe.
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    $UvBin = Join-Path $env:USERPROFILE ".local\bin"
+    if (-not (Test-Path (Join-Path $UvBin "uv.exe"))) {
+        Write-Host "'uv' not found; installing via https://astral.sh/uv/install.ps1 ..."
+        Invoke-RestMethod https://astral.sh/uv/install.ps1 | Invoke-Expression
+    }
+    if (Test-Path (Join-Path $UvBin "uv.exe")) {
+        # Add to this session's PATH, and persist to the User PATH so future
+        # shells (and other tools) find uv without re-running this. The persist
+        # is idempotent — skip if .local\bin is already on the stored User PATH.
+        $env:Path = "$UvBin;$env:Path"
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if (($UserPath -split ';') -notcontains $UvBin) {
+            Write-Host "Adding $UvBin to your User PATH (permanent)."
+            $NewPath = if ($UserPath) { "$UvBin;$UserPath" } else { $UvBin }
+            [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+        }
+    }
+    Need uv "Install it manually: https://docs.astral.sh/uv/getting-started/installation/  (irm https://astral.sh/uv/install.ps1 | iex), then reopen your shell."
+}
 Need cmake "Required to compile the Mitsuba fork."
 Need git   ""
 if (-not (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
