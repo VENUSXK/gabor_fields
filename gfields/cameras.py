@@ -41,6 +41,8 @@ def create_cameras(
     use_perspective: bool = False,
     fov: float = 40.0,
     distance: float = 24.0,
+    elevation: Optional[float] = None,
+    azimuth_span: float = 180.0,
 ) -> List:
     """Turntable arc of cameras around the origin.
 
@@ -55,10 +57,19 @@ def create_cameras(
     cameras: List = []
 
     for i in range(cam_count):
-        angle = 180.0 / cam_count * i - 90.0
-        elevation = 90.0 * np.random.rand() - 45.0
+        angle = azimuth_span / cam_count * i - azimuth_span / 2.0
+        # The legacy camera starts on +Z. With Mitsuba's X-axis rotation,
+        # positive rotation moves that position toward -Y. Keep the legacy
+        # random path unchanged, but expose the conventional CLI meaning for
+        # an explicit elevation: positive values place the camera above (+Y)
+        # the target, so the internal rotation angle must be negated.
+        camera_elevation = (
+            90.0 * np.random.rand() - 45.0
+            if elevation is None
+            else -float(elevation)
+        )
         sensor_rotation_y = T().rotate([0, 1, 0], angle)
-        sensor_rotation_x = T().rotate([1, 0, 0], elevation)
+        sensor_rotation_x = T().rotate([1, 0, 0], camera_elevation)
         base_to_world = T().look_at(target=[0, 0, 0], origin=[0, 0, distance], up=[0, 1, 0])
         base_to_world = sensor_rotation_y @ sensor_rotation_x @ base_to_world
         if use_perspective:

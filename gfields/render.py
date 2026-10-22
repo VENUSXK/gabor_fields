@@ -230,6 +230,10 @@ def parse_args():
                         help='Camera distance from origin (asset / steerable modes; single-kernel uses a fixed closer distance)')
     parser.add_argument('--cam_fov', type=float, default=25.0,
                         help='Perspective only: horizontal field of view in degrees (default ~normal lens; was 12.5 which is very telephoto)')
+    parser.add_argument('--cam_elevation', type=float, default=None,
+                        help='Fixed camera elevation in degrees: positive looks down from above (+Y), negative looks up from below. If omitted, each camera uses the original random elevation in [-45, 45].')
+    parser.add_argument('--cam_azimuth_span', type=float, default=180.0,
+                        help='Total azimuth span in degrees for generated cameras (default: 180; use 360 for a full orbit)')
     parser.add_argument('--use_perspective_cam', action='store_true',
                         help='Use perspective camera instead of default orthographic (see --cam_fov)')
 
@@ -649,6 +653,8 @@ def main():
         use_perspective=args.use_perspective_cam,
         fov=args.cam_fov,
         distance=args.cam_distance,
+        elevation=args.cam_elevation,
+        azimuth_span=args.cam_azimuth_span,
     )
     
     # Render based on mode
@@ -887,6 +893,8 @@ def render_steerable_asset(args):
         use_perspective=args.use_perspective_cam,
         fov=args.cam_fov,
         distance=args.cam_distance,
+        elevation=args.cam_elevation,
+        azimuth_span=args.cam_azimuth_span,
     )
     
     # Build scene dict

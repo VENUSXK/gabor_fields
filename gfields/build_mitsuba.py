@@ -125,7 +125,7 @@ def main() -> None:
     ap.add_argument("--skip-wire", action="store_true")
     args = ap.parse_args()
 
-    python = Path(args.python).resolve()
+    python = Path(args.python).absolute()
     build_dir = Path(args.build_dir).resolve()
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     generator, multi_config = detect_generator()
