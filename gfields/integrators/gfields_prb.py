@@ -222,18 +222,19 @@ class GfieldsPRBIntegrator(RBIntegrator):
             # Sample volumetric interaction
             # ------------------------------------------------------------------
 
-            primitives, si, weight, _, _, _, tr_β, sampled_t = primitive_tracing(
-                scene, sampler, ray, primitives, depth,
-                callback=self.sample_segment,
-                payload=(self, scene, sampler.next_1d(), mi.Float(1.0), mi.Float(dr.inf)),
-                active=active,
-                max_depth_primitive=self.max_depth_primitive,
-                rr_depth_primitive=self.rr_depth_primitive,
-                stochastic_selection_criteria=self.lod.criteria,
-                orientation_selection=self.lod.orientation_selection,
-                select_mask=lambda pyrs, ori_s, ray_d, lanes, _criteria:
-                    self.lod.select_mask(pyrs, ori_s, ray_d, lanes)
-            )
+            with dr.profile_range("primitive_tracing"):
+                primitives, si, weight, _, _, _, tr_β, sampled_t = primitive_tracing(
+                    scene, sampler, ray, primitives, depth,
+                    callback=self.sample_segment,
+                    payload=(self, scene, sampler.next_1d(), mi.Float(1.0), mi.Float(dr.inf)),
+                    active=active,
+                    max_depth_primitive=self.max_depth_primitive,
+                    rr_depth_primitive=self.rr_depth_primitive,
+                    stochastic_selection_criteria=self.lod.criteria,
+                    orientation_selection=self.lod.orientation_selection,
+                    select_mask=lambda pyrs, ori_s, ray_d, lanes, _criteria:
+                        self.lod.select_mask(pyrs, ori_s, ray_d, lanes)
+                )
 
             # Kill this path if it reached the maximum number of primitive
             # ray-intersection before sampling a medium interaction
@@ -380,7 +381,8 @@ class GfieldsPRBIntegrator(RBIntegrator):
                                    if (not primal and self.grad_nee_transmittance)
                                    else sampler)
 
-                    transmittance = self.eval_transmittance_nee(scene, sampler, ray2, primitives, L, δL, dr.ADMode.Primal, active_nee)
+                    with dr.profile_range("nee"):
+                        transmittance = self.eval_transmittance_nee(scene, sampler, ray2, primitives, L, δL, dr.ADMode.Primal, active_nee)
 
                     # Query the BSDF for that emitter-sampled direction
                     bsdf_val, bsdf_pdf = bsdf.eval_pdf(bsdf_ctx, si, si.to_local(ds.d), active_surface_nee)
@@ -424,14 +426,15 @@ class GfieldsPRBIntegrator(RBIntegrator):
             # `prbvolpath`): the sampled direction/weight must not carry the phase
             # function's parameter gradient. That goes through the detach-then-
             # reattach block below.
-            with dr.suspend_grad():
-                wo, phase_weight, phase_pdf_sampled = self.phase.sample(phase_ctx, mei,
-                                                                        sampler.next_1d(),
-                                                                        sampler.next_2d(),
-                                                                        active_medium)
-                # Normalize to prevent numerical drift accumulating over bounces
-                wo = dr.normalize(wo)
-                phase_val_unused, phase_pdf = self.phase.eval_pdf(phase_ctx, mei, wo, active_medium)
+            with dr.profile_range("phase_sampling"):
+                with dr.suspend_grad():
+                    wo, phase_weight, phase_pdf_sampled = self.phase.sample(phase_ctx, mei,
+                                                                            sampler.next_1d(),
+                                                                            sampler.next_2d(),
+                                                                            active_medium)
+                    # Normalize to prevent numerical drift accumulating over bounces
+                    wo = dr.normalize(wo)
+                    phase_val_unused, phase_pdf = self.phase.eval_pdf(phase_ctx, mei, wo, active_medium)
 
             active_medium &= (phase_pdf > 0.0) & dr.all(dr.isfinite(phase_weight))
 
@@ -462,11 +465,12 @@ class GfieldsPRBIntegrator(RBIntegrator):
             # BSDF sampling
             # ------------------------------------------------------------------
 
-            bs, bsdf_weight = bsdf.sample(bsdf_ctx, si,
-                                          sampler.next_1d(active_surface),
-                                          sampler.next_2d(active_surface),
-                                          active_surface)
-            active_surface &= bs.pdf > 0
+            with dr.profile_range("bsdf_sampling"):
+                bs, bsdf_weight = bsdf.sample(bsdf_ctx, si,
+                                            sampler.next_1d(active_surface),
+                                            sampler.next_2d(active_surface),
+                                            active_surface)
+                active_surface &= bs.pdf > 0
 
             if not primal:
                 with dr.resume_grad():
@@ -908,31 +912,32 @@ class GfieldsPRBIntegrator(RBIntegrator):
         # Fetch integrator state from payload
         self, scene, sample, β, sampled_t = payload
         
-        seg_tau = mi.Float(0.0)
-        # Microflake (SGGX) extinction scaling for this segment's ray direction.
-        pa = self._projected_area(ray, active) if self.phase_is_microflake else None
-        it  = mi.UInt32(0)
-        active1 = mi.Bool(active) & ~primitives.is_empty()
-        while active1:
-            density = mi.Float(0.0)
-            prim_id = primitives.value(it, active1)
-            ellipsoid = Ellipsoid.gather(prim_id.shape, prim_id.index, active1)
-            density += self.kernel.density_integral(ray, ellipsoid, seg_t0, seg_t1, active1)
-            weight = mi.Float(1.0)
-            if self.lod.main_is_deterministic() and not self.enable_continuous_lod:
-                pass
-            else:
-                weight = self._shape_weight(prim_id.shape, ellipsoid, ray.d, active1)
-            density *= weight
-            sigma_t = ellipsoid.opacity
-            if self.phase_is_microflake:
-                sigma_t = sigma_t * pa
-            seg_tau[active1] += density * sigma_t
-            it += 1
-            active1 &= (it < primitives.size())
-        
-        seg_tr = dr.exp(-seg_tau)
-        
+        with dr.profile_range("segment_optical_depth"):
+            seg_tau = mi.Float(0.0)
+            # Microflake (SGGX) extinction scaling for this segment's ray direction.
+            pa = self._projected_area(ray, active) if self.phase_is_microflake else None
+            it  = mi.UInt32(0)
+            active1 = mi.Bool(active) & ~primitives.is_empty()
+            while active1:
+                density = mi.Float(0.0)
+                prim_id = primitives.value(it, active1)
+                ellipsoid = Ellipsoid.gather(prim_id.shape, prim_id.index, active1)
+                density += self.kernel.density_integral(ray, ellipsoid, seg_t0, seg_t1, active1)
+                weight = mi.Float(1.0)
+                if self.lod.main_is_deterministic() and not self.enable_continuous_lod:
+                    pass
+                else:
+                    weight = self._shape_weight(prim_id.shape, ellipsoid, ray.d, active1)
+                density *= weight
+                sigma_t = ellipsoid.opacity
+                if self.phase_is_microflake:
+                    sigma_t = sigma_t * pa
+                seg_tau[active1] += density * sigma_t
+                it += 1
+                active1 &= (it < primitives.size())
+            
+            seg_tr = dr.exp(-seg_tau)
+            
         # ----------------------------------------------------------------------
         # Test segment sampling condition
         # ----------------------------------------------------------------------
@@ -940,16 +945,17 @@ class GfieldsPRBIntegrator(RBIntegrator):
         chi_i = β * seg_tr
         success = active & (chi_i < sample) & ~primitives.is_empty()
 
-        if self.solver_type == 'disabled':
-            # Sample uniformly within the segment (slightly biased but much faster)
-            t_s = seg_t0 + sample * (seg_t1 - seg_t0)
-        else:
-            large_enough_segment = success & ((seg_t1 - seg_t0) > 8e-2)
-            t_s = dr.select(
-                large_enough_segment,
-                self.primitives_sample_interaction_segment(scene, ray, primitives, seg_t0, seg_t1, sample, β, large_enough_segment),
-                seg_t0 + sample * (seg_t1 - seg_t0)
-            )
+        with dr.profile_range("segment_distance_solver"):
+            if self.solver_type == 'disabled':
+                # Sample uniformly within the segment (slightly biased but much faster)
+                t_s = seg_t0 + sample * (seg_t1 - seg_t0)
+            else:
+                large_enough_segment = success & ((seg_t1 - seg_t0) > 8e-2)
+                t_s = dr.select(
+                    large_enough_segment,
+                    self.primitives_sample_interaction_segment(scene, ray, primitives, seg_t0, seg_t1, sample, β, large_enough_segment),
+                    seg_t0 + sample * (seg_t1 - seg_t0)
+                )
 
         sampled_t[success] = t_s + accum_t
 

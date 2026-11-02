@@ -179,6 +179,8 @@ def parse_args():
                         help='Render Laplacian pyramid of the asset')
     parser.add_argument('--multiple_scattering', action='store_true',
                         help='Enable multiple scattering rendering')
+    parser.add_argument('--no_nee', action='store_true',
+                        help='Disable next-event estimation in multiple-scattering rendering')
     parser.add_argument('--stochastic_sampling', action='store_true',
                         help='Use the gfields_prb_stochastic integrator '
                              '(decomposition-tracking distance sampling; '
@@ -411,6 +413,8 @@ def _video_parse_args() -> argparse.Namespace:
     p.add_argument('--distance_scale', type=float, default=1.3,
                    help='Margin multiplier for the auto-framed orbit radius')
     p.add_argument('--max_depth', type=int, default=None)
+    p.add_argument('--no_nee', action='store_true',
+                   help='Disable next-event estimation')
     p.add_argument('--stochastic_sampling', action='store_true',
                    help='Use the gfields_prb_stochastic integrator '
                         '(decomposition-tracking distance sampling)')
@@ -446,6 +450,7 @@ def _video_build_scene_dict(args, asset_dir) -> dict:
         'type': 'scene',
         'integrator': create_integrator_config(
             multiple_scattering=True, max_depth=args.max_depth,
+            use_nee=not args.no_nee,
             stochastic_sampling=args.stochastic_sampling,
             nee_transmittance=args.nee_transmittance,
             use_anyhit_sampling=(True if args.use_anyhit_sampling else None),
@@ -680,6 +685,7 @@ def render_pyramid_mode(args, asset_info: AssetInfo, cameras: List, output_confi
             'type': 'scene',
             'integrator': create_integrator_config(
                 multiple_scattering=args.multiple_scattering,
+                use_nee=not args.no_nee,
                 kernel_type=args.kernel,
                 max_depth=args.max_depth,
                 pyramid_level_count=max_level,
@@ -772,6 +778,7 @@ def render_full_asset(args, asset_info: AssetInfo, cameras: List, output_config:
         'type': 'scene',
         'integrator': create_integrator_config(
             multiple_scattering=args.multiple_scattering,
+            use_nee=not args.no_nee,
             kernel_type=args.kernel,
             max_depth=args.max_depth,
             pyramid_level_count=max_level,
@@ -922,7 +929,7 @@ def render_steerable_asset(args):
             'max_overlaps': args.max_overlaps,
             'rr_depth_primitive': args.rr_depth_primitive,
             'max_depth_primitive': args.max_depth_primitive,
-            'use_nee': True,
+            'use_nee': not args.no_nee,
         }
         if args.stochastic_sampling:
             integrator_dict['nee_transmittance'] = args.nee_transmittance

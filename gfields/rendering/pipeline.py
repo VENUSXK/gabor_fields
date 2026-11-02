@@ -396,6 +396,7 @@ def apply_asset_render_defaults(args) -> None:
 def create_integrator_config(
     *,
     multiple_scattering: bool,
+    use_nee: bool = True,
     kernel_type: str = "gabor_gaussian_mixture",
     max_depth: Optional[int] = None,
     pyramid_level_count: int = 1,
@@ -474,7 +475,7 @@ def create_integrator_config(
             "max_overlaps": max_overlaps,
             "rr_depth_primitive": rr_depth_primitive,
             "max_depth_primitive": max_depth_primitive,
-            "use_nee": True,
+            "use_nee": use_nee,
             "num_orientations": num_orientations,
             "orientation_selection": orientation_selection,
             "orientation_selection_nee": orientation_selection_nee,
