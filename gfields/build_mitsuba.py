@@ -123,6 +123,9 @@ def main() -> None:
     ap.add_argument("--skip-config", action="store_true")
     ap.add_argument("--skip-build", action="store_true")
     ap.add_argument("--skip-wire", action="store_true")
+    ap.add_argument("--cmake-arg", action="append", default=[], metavar="ARG",
+                    help="Extra CMake configure argument; repeat as needed "
+                         "(e.g. --cmake-arg=-DCMAKE_POLICY_VERSION_MINIMUM=3.5)")
     args = ap.parse_args()
 
     python = Path(args.python).absolute()
@@ -140,9 +143,13 @@ def main() -> None:
     if not args.skip_config:
         write_variants(build_dir, variants)
         cfg = ["cmake", "-S", str(MITSUBA_SRC), "-B", str(build_dir), "-G", generator,
-               f"-DPython_EXECUTABLE={python}"]
+               f"-DPython_EXECUTABLE={python}",
+               # Vendored dependencies still request pre-3.5 CMake policies.
+               # CMake 4 removed those policies; allow configuration to proceed.
+               "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
         if not multi_config:
             cfg.append("-DCMAKE_BUILD_TYPE=Release")
+        cfg.extend(args.cmake_arg)
         run(cfg)
 
     if not args.skip_build:

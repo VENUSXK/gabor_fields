@@ -7,6 +7,7 @@
 #   .\install.ps1                 # default: scalar_rgb + cuda_ad_rgb variants
 #   .\install.ps1 -Extras         # + torch / lpips / wandb / scikit-image / flip
 #   .\install.ps1 --variants scalar_rgb,cuda_ad_rgb,llvm_ad_rgb   # add CPU fallback
+#   .\install.ps1 '--cmake-arg=-DCMAKE_POLICY_VERSION_MINIMUM=3.5'
 # Extra flags are forwarded to gfields/build_mitsuba.py (--jobs, ...).
 [CmdletBinding()]
 param(
@@ -89,6 +90,7 @@ if ($LASTEXITCODE -ne 0) { throw "Mitsuba build failed (exit $LASTEXITCODE)." }
 
 Write-Host "== 4/4  validate =="
 & $Py -c "import mitsuba as mi; mi.set_variant('cuda_ad_rgb'); import gfields, gfields.cli; print('OK: mitsuba', mi.__version__, '| gfields import OK')"
+if ($LASTEXITCODE -ne 0) { throw "Environment validation failed (exit $LASTEXITCODE)." }
 
 Write-Host ""
 Write-Host "Environment ready in .venv ."
