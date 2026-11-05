@@ -72,9 +72,9 @@ Thumbs.db
 !data/**/*.vol
 
 # ---------------------------------------------------------------------------
-# results/  — everything written by the scripts.  Never tracked.
+# Any directory whose name ends in results, at any depth.
 # ---------------------------------------------------------------------------
-/results/
+*results/
 
 # ---------------------------------------------------------------------------
 # Local data stores (hundreds of GB) — never tracked

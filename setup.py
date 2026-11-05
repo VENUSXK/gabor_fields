@@ -58,6 +58,7 @@ setup(
         "colorist>=0.4",     # coloured terminal output in the training loop
     ],
     extras_require={
+        "svd": ["torch>=2.8"],  # local batched SVD; reuse the root .venv
         "test": ["pytest>=7.0"],
         "metrics": ["scikit-image>=0.19", "torch>=1.13", "lpips>=0.1.4", "flip-evaluator>=1.0"],
         "training": ["torch>=1.13", "wandb>=0.15"],

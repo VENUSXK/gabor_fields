@@ -59,6 +59,25 @@ python -m pytest gfields/tests/test_gfields.py -q
 python -c "import mitsuba as mi; mi.set_variant('cuda_ad_rgb'); import gfields; print('OK')"
 ```
 
+The local SVD tools share this root `.venv`. Add their PyTorch dependency
+without rebuilding Mitsuba:
+
+```bash
+uv pip install --python .venv/Scripts/python.exe -e ".[svd]"  # Windows
+# Linux/macOS: use --python .venv/bin/python
+```
+
+For RTX 50-series GPUs, a reproducible CUDA 12.8 setup is:
+
+```bash
+uv pip install --python .venv/Scripts/python.exe torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv/Scripts/python.exe -e ".[svd]"
+```
+
+The CUDA wheel command follows the [official PyTorch 2.8 instructions](https://pytorch.org/get-started/previous-versions/#v280).
+Activate `.venv` before using bare `python`, or call its interpreter explicitly
+to avoid using a different Conda/system PyTorch installation.
+
 ---
 
 ## Train
@@ -144,6 +163,18 @@ before that or see `No module named 'polyscope'`, install it with
 ---
 
 ## Extra tools
+
+Local axial SVD diagnostics for slice volumes live in [`svd/`](svd/README.md).
+They compare XY block sizes and axial slab depths using batched PyTorch
+decomposition; Gaussian/Gabor fitting is not part of this diagnostic.
+
+```powershell
+.\.venv\Scripts\python.exe svd/local_svd_analysis.py --input D:\SVD
+.\.venv\Scripts\python.exe svd/local_svd_analysis.py --input D:\SVD --resolution 64 --slab 8 --device auto
+```
+
+Output -> `svd/local_svd_results/`. All directories with names ending in
+`results` are ignored by Git, including nested experiment outputs.
 
 ```bash
 # Convert an OpenVDB grid to the cached .npy format used for training
