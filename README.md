@@ -171,10 +171,14 @@ decomposition; Gaussian/Gabor fitting is not part of this diagnostic.
 ```powershell
 .\.venv\Scripts\python.exe svd/local_svd_analysis.py --input D:\SVD
 .\.venv\Scripts\python.exe svd/local_svd_analysis.py --input D:\SVD --resolution 64 --slab 8 --device auto
+# Presentation exports: parameter CSVs, native reconstructed slices, fixed-scale
+# error images, spatial templates and global SVD; PNGs drawn with Pillow.
+.\.venv\Scripts\python.exe svd/svd_presentation.py --input D:\SVD --device cpu
 ```
 
 Output -> `svd/local_svd_results/`. All directories with names ending in
 `results` are ignored by Git, including nested experiment outputs.
+The presentation entry point writes to `svd/presentation_results/` by default.
 
 ```bash
 # Convert an OpenVDB grid to the cached .npy format used for training

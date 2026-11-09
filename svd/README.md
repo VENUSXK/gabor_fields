@@ -26,6 +26,50 @@ Linux/macOS 使用 `.venv/bin/python`，激活命令为 `source .venv/bin/activa
 
 ## Analyze
 
+### 汇报素材：局部与全局统一输出
+
+```powershell
+.\.venv\Scripts\python.exe svd/svd_presentation.py --input D:\SVD --device cpu
+```
+
+默认扫描 128/64/32/16 横向块 × 4/8/16/30 层，并增加整幅 XY 图像 ×
+相同四种 slab 的全局对照，共20组配置。slab=30且横向为整图时为完整全局 SVD。
+两种分析 raw/axial_centered、rank=1/2/4/8/12/16 中不超过 slab 深度的组合均输出，
+centered 另外输出 rank=0 的平均图基线。
+
+输出 -> `svd/presentation_results/`。图片用 **Pillow直接生成PNG**，此入口不导入或使用Matplotlib。
+默认导出全部30张切片的原始尺寸重建与绝对误差图，体量较大。
+仅需要几个切片的汇报预览时可指定：
+
+```powershell
+.\.venv\Scripts\python.exe svd/svd_presentation.py --input D:\SVD --slices 0 7 14 21 29 --output svd/preview_results
+.\.venv\Scripts\python.exe svd/svd_presentation.py --input D:\SVD --resolution 32 16 --slab 8 16 --ranks 1 2 4 --device auto
+```
+
+- `cross_comparison.csv`：blocksize/slab/rank/analysis/PSNR/RMSE/容量的完整参数对照。
+- `per_slice_metrics.csv`：每张切片的 PSNR/RMSE，即使只导出指定切片也评估全部原体。
+- `tables/`：以不同 rank 为列的 PSNR、标量比、uint8/fp32 理论字节比 CSV。
+- `overview/`：可直接放入汇报的 PNG 数值表。
+- `overview/*reconstructions_contact.png` 与 `*errors_contact.png`：固定同一切片/slab/rank，横向比较不同blocksize与整图SVD。
+- `overview/*psnr_vs_rank_all_blocks.png`：Pillow绘制的不同blocksize精度—rank曲线。
+- `overview/*templates_contact.png`：不同blocksize的典型块模板对照；位置可能不同，图中标明坐标。
+- `configurations/.../rank.../`：逐切片的原尺寸重建图、统一色标误差图、原图/重建/误差拼图。
+- `configurations/.../templates/`：典型/P90/最困难块的二维模板、轴向曲线和系数CSV。
+- `00_error_color_scale.png`：全部误差图共用的色标，默认0到0.1；`--error-vmax`可修改。
+- `READ_FIRST.md`：输出解释和阅读顺序。
+- `image_index.csv`：全部PNG的相对路径、尺寸与文件大小，便于快速定位。
+
+命名示例：`block016x016__slab008__axial_centered__rank002__z014__reconstruction_native.png`。
+模板额外标明block编号、真实xy/z范围、mode编号，保留原始尺寸并提供256像素放大图。
+每个模板独立归一化，强度应结合sigma和轴向系数解释。
+
+这是**同一输入体上的参数交叉对照**，不是留出测试集的交叉验证。
+PSNR按未裁剪浮点重建计算；PNG是量化后的预览。误差图显示绝对误差，而非逐像素PSNR。
+`scalar_compression_ratio`只比较标量数；`uint8_source_to_float32_factor_ratio`将8-bit原体与
+float32因子做理论字节对照，不含元数据、索引和熵编码。不要与Gaussian模型实际压缩率混用。
+
+### 原有统计图入口
+
 ```powershell
 python svd/local_svd_analysis.py --input D:\SVD
 ```
