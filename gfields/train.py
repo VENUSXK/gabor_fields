@@ -19,6 +19,8 @@ except ImportError:  # optional training/analysis dependency
 import time
 import random
 import shutil
+import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -38,11 +40,30 @@ from gfields.training.callbacks import (
     PlotCallback,
 )
 from gfields.training.configs import get_volume_config
+from gfields.training.columns import InitializeColumns, ColumnPrimitives, SaveColumns, LoadColumns, ColumnParameterStats, SaveColumnSlices
 from tqdm import tqdm
 from colorist import blue, yellow, green, effect_dim, Effect
 
 GAUSS_LVL: Final[int] = 0
 GABOR_LVL: Final[int] = 1
+
+
+class ColumnMetricsCallback(CallbackABC):
+    def on_suspend_grad(self, epoch, opt, metrics):
+        metrics_path = self.args.output / 'column_training_metrics.csv'
+        is_new = not metrics_path.exists()
+        with metrics_path.open('a', newline='') as metrics_file:
+            writer = csv.DictWriter(metrics_file, fieldnames=['iteration', *metrics.keys()])
+            if is_new:
+                writer.writeheader()
+            writer.writerow({'iteration': epoch + 1, **metrics})
+
+
+def ColumnRenderMetrics(reference_image, image):
+    with dr.suspend_grad():
+        image = dr.clip(image, 0.0, 1.0)
+        mse = float(dr.mean(dr.square(reference_image - image), axis=None).array[0])
+        return {'mse': mse, 'psnr_db': float(-10.0 * np.log10(mse)) if mse > 0 else None, 'ssim': 1.0 - float(ssim_loss_fn(reference_image, image, args.cam_count).array[0]), 'l1': float(gfields.losses.l1(reference_image, image).array[0])}
 
 
 def _integrator_scene_kwargs() -> Dict[str, Any]:
@@ -146,7 +167,17 @@ effect_dim(f'Volume sum: {np.sum(ref_volume) * volume_config.opacity_scale * ( 8
 # Gaussian Optimization ----------------------------------------------------
 
 gaussian_prims_ckpt: Optional[Dict[str, Union[np.ndarray, mi.TensorXf]]] = None
-if args.from_gaussian_checkpoint:
+gaussian_columns = None
+column_start = 0
+if args.gaussian_columns:
+    if args.from_gaussian_checkpoint:
+        gaussian_columns, column_lr_dict, column_start = LoadColumns(Path(args.from_gaussian_checkpoint), args)
+        green(f'Loaded shared Gaussian column checkpoint at iteration {column_start}.')
+    else:
+        gaussian_columns, column_lr_dict = InitializeColumns(args, gauss_ref_volume, volume_config)
+    gaussian_prims_ckpt = ColumnPrimitives(gaussian_columns)
+    print(f'Column parameter budget: {ColumnParameterStats(gaussian_columns)}')
+elif args.from_gaussian_checkpoint:
     ckpt_path = Path(args.from_gaussian_checkpoint)
     if ckpt_path.exists():
         gaussian_prims_ckpt = load_single_level(ckpt_path, level=0)
@@ -179,6 +210,9 @@ if not args.skip_gaussian_optim:
 
     scene: mi.Scene = mi.load_dict(scene_dict)
     scene_params: mi.SceneParameters = mi.traverse(scene)
+    if gaussian_columns is not None:
+        gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+        SaveColumnSlices(gaussian_columns, gauss_ref_volume, volume_config, args.output, label='initial')
 
 
     # Create reference images (shared content-addressed cache: loaded from disk
@@ -199,6 +233,8 @@ if not args.skip_gaussian_optim:
 
     # render initial scene
     init_image = mi.render(scene, sensor=camera_array, spp=args.ref_kernel_spp)
+    if gaussian_columns is not None:
+        initial_render_metrics = ColumnRenderMetrics(ref_image, init_image)
 
     effect_dim(f"- Saving initial images...")
     mi.util.write_bitmap(str(args.output / 'initial_pyr0.exr'), init_image)
@@ -208,20 +244,21 @@ if not args.skip_gaussian_optim:
 
     # Setup Optimizer
 
-    opt = gfields.optimizers.BoundedAdam()
-
-    write_scene_params_to_optimizer(scene_params, opt, level=GAUSS_LVL)
-
-    lr_dict = create_lr_dict(args, args.global_lr_gaussian, level=GAUSS_LVL)
-    opt.set_learning_rate(lr_dict)
-
-    opt.set_bounds('scales_0', lower=1e-08, upper=1.0) # if done correctly, this should cover roughly the Gaussian low pass region
-    opt.set_bounds('omega_0', lower=0.0, upper=0.0) # base is a TRUE Gaussian: omega==0. The mixture kernel oscillates for ANY nonzero omega (that is the sole thing marking a primitive as Gabor), so a free base omega would render the base as Gabors.
-    opt.set_bounds('opacities_0', lower=1e-8, upper=1.0) # 1.0 for gabor, 1e-2 for gaussian
-    opt.set_bounds('albedo_0', lower=1e-9, upper=1.0)
-    opt.set_bounds('centers_0', lower=-1.0, upper=1.0)
-
-    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL)
+    if gaussian_columns is not None:
+        opt = gaussian_columns.column_optimizer
+        lr_dict = column_lr_dict
+        gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+    else:
+        opt = gfields.optimizers.BoundedAdam()
+        write_scene_params_to_optimizer(scene_params, opt, level=GAUSS_LVL)
+        lr_dict = create_lr_dict(args, args.global_lr_gaussian, level=GAUSS_LVL)
+        opt.set_learning_rate(lr_dict)
+        opt.set_bounds('scales_0', lower=1e-08, upper=1.0)
+        opt.set_bounds('omega_0', lower=0.0, upper=0.0)
+        opt.set_bounds('opacities_0', lower=1e-8, upper=1.0)
+        opt.set_bounds('albedo_0', lower=1e-9, upper=1.0)
+        opt.set_bounds('centers_0', lower=-1.0, upper=1.0)
+        write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL)
 
     # Optimization Loop
 
@@ -231,12 +268,14 @@ if not args.skip_gaussian_optim:
     fine_tune_period = args.iterations_gaussian - args.densify_until
     
     lr_scheduler = LRScheduler(
-        opt, args.global_lr_gaussian, args.iterations_gaussian,
+        opt, args.column_lr if gaussian_columns is not None else args.global_lr_gaussian, args.iterations_gaussian,
         base_lr_dict=lr_dict, warmup_ratio=args.warmup_ratio, min_lr_ratio=args.min_lr_ratio
     )
+    if gaussian_columns is not None:
+        lr_scheduler.current_step = column_start
 
     callbacks = Callbacks(args, GAUSS_LVL)
-    callbacks.register_callbacks([
+    callbacks.register_callbacks([ColumnMetricsCallback()] if gaussian_columns is not None else [
         GradientTrackerCallback(),
         PlotCallback(),
         MetricsAccumulatorCallback()
@@ -249,8 +288,11 @@ if not args.skip_gaussian_optim:
     # Initialize benchmark timer
     timer = gfields.benchmark.OptimizationTimer(log_every=9999, log_level=1)
     try:
-        pbar = tqdm(range(args.epoch_start, args.epoch_start + args.iterations_gaussian), desc='Gaussian Optimization', unit='step')
-        for it in range(args.iterations_gaussian):
+        first_iteration = column_start if gaussian_columns is not None else 0
+        completed_iterations = first_iteration
+        progress_iterations = range(first_iteration, args.iterations_gaussian) if gaussian_columns is not None else range(args.epoch_start, args.epoch_start + args.iterations_gaussian)
+        pbar = tqdm(progress_iterations, desc='Gaussian Optimization', unit='step')
+        for it in range(first_iteration, args.iterations_gaussian):
             timer.start_iteration()
 
             # reset gradients
@@ -263,6 +305,8 @@ if not args.skip_gaussian_optim:
                 args.opt_spp = 2
 
             with timer.track('forward'):
+                if gaussian_columns is not None:
+                    gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
                 image, img_loss, l1, ssim, img_mse = _batched_render_loss(
                     scene, scene_params, ref_image, opt_cam_batches,
                     spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
@@ -273,9 +317,12 @@ if not args.skip_gaussian_optim:
                 loss = img_loss
 
                 regularization = frequency_regularization(opt, ref_volume, volume_config, GAUSS_LVL, weight=args.lambda_frequency)
-
-                opacity_penalty = dr.sum(dr.abs(opt[f'opacities_{GAUSS_LVL}'])) * args.lambda_opacity
-                scale_penalty = dr.sum(dr.abs(opt[f'scales_{GAUSS_LVL}'])) * args.lambda_scale
+                if gaussian_columns is not None:
+                    opacity_penalty = dr.sum(dr.abs(opt['density_weights'])) * args.lambda_opacity
+                    scale_penalty = (dr.sum(opt['scale_x']) + dr.sum(opt['scale_y']) + dr.sum(opt['axial_scales'])) * args.lambda_scale
+                else:
+                    opacity_penalty = dr.sum(dr.abs(opt[f'opacities_{GAUSS_LVL}'])) * args.lambda_opacity
+                    scale_penalty = dr.sum(dr.abs(opt[f'scales_{GAUSS_LVL}'])) * args.lambda_scale
 
                 loss = loss + regularization + opacity_penalty + scale_penalty
 
@@ -286,7 +333,11 @@ if not args.skip_gaussian_optim:
             callbacks.on_before_opt_step(it, opt)
             with timer.track('opt_step'):
                 opt.step()
-                write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL)
+                if gaussian_columns is not None:
+                    gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+                else:
+                    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL)
+                completed_iterations = it + 1
 
             # Metrics force a device->host sync; only pay for them on the
             # configured cadence (plus the image-inspection iterations).
@@ -294,10 +345,11 @@ if not args.skip_gaussian_optim:
             do_log = ((it + 1) % args.log_every == 0
                       or (it + 1) == args.iterations_gaussian
                       or (it + 1) in inspect_iters)
-            relocate_now = (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
+            relocate_now = gaussian_columns is None and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
             deletable = 0
             if do_log or relocate_now:
-                deletable = (dr.abs(opt[f'opacities_{GAUSS_LVL}']).numpy() < 1e-6).sum()
+                opacity_key = 'density_weights' if gaussian_columns is not None else f'opacities_{GAUSS_LVL}'
+                deletable = (dr.abs(opt[opacity_key]).numpy() < 1e-6).sum()
             if relocate_now:
                 print(f"Relocating dead primitives at it={it}...")
                 relocate_dead_primitives(opt, scene_params, GAUSS_LVL)
@@ -328,6 +380,8 @@ if not args.skip_gaussian_optim:
                 # Frequent checkpoint (resumable via --from_gaussian_checkpoint).
                 if (it + 1) % args.checkpoint_every == 0:
                     save_model(args.output, scene, level=GAUSS_LVL)
+                    if gaussian_columns is not None:
+                        SaveColumns(gaussian_columns, args.output, iteration=completed_iterations)
 
             pbar.update(1)
             if do_log:
@@ -344,12 +398,14 @@ if not args.skip_gaussian_optim:
     # Final degenerate cleanup (see the Gabor-phase counterpart): recycle
     # loops handle collapse during optimization; any scale-collapsed
     # survivor is dropped here so it never reaches the saved asset.
-    n_collapsed = prune(opt, scene_params, GAUSS_LVL, rule='opacity', custom_th=0.0)
+    n_collapsed = prune(opt, scene_params, GAUSS_LVL, rule='opacity', custom_th=0.0) if gaussian_columns is None else 0
     if n_collapsed > 0:
         yellow(f'Removed {n_collapsed} scale-collapsed primitives from level {GAUSS_LVL}.')
 
     # Save Results
 
+    if gaussian_columns is not None:
+        gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
     optimized = mi.render(scene, sensor=camera_array, spp=args.ref_kernel_spp)
     green("- Saving optimized images...")
     # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -357,6 +413,11 @@ if not args.skip_gaussian_optim:
 
     green("- Saving optimized model...")
     save_model(args.output, scene, level=GAUSS_LVL)
+    if gaussian_columns is not None:
+        SaveColumns(gaussian_columns, args.output, iteration=completed_iterations)
+        SaveColumnSlices(gaussian_columns, gauss_ref_volume, volume_config, args.output, label='final')
+        render_metrics = {'initial': initial_render_metrics, 'final': ColumnRenderMetrics(ref_image, optimized), 'render_spp': args.ref_kernel_spp, 'render_seed': 0, 'completed_iterations': completed_iterations, 'parameters': ColumnParameterStats(gaussian_columns)}
+        (args.output / 'column_render_metrics.json').write_text(json.dumps(render_metrics, indent=2), encoding='utf-8')
 
     print(f'\nFinal PSNR: {gfields.losses.psnr(ref_image, dr.clip(optimized, 0.0, 1.0)).array[0]}')
     print(f'Final SSIM: {ssim_loss_fn(ref_image, dr.clip(optimized, 0.0, 1.0), args.cam_count).array[0]}')

@@ -102,6 +102,66 @@ the presets and assets used in the paper, and are kept just as a reference.
 
 Output -> `results/checkpoints/<asset>/`.
 
+### Shared-footprint Gaussian columns (experimental)
+
+Code changes and the reading guide (Chinese):
+[`COLUMN_CHANGES.md`](COLUMN_CHANGES.md), with separate representation,
+training-flow, and validation notes containing code examples.
+
+`--gaussian_columns` enables shared XY centers, scales and in-plane rotation
+in the original Gaussian training stage. Each footprint owns
+`--components_per_column` axial centers, scales and positive weights.
+`--column_count` is the total footprint count across all initialization slabs;
+`--column_slab_depth` is measured in input Z voxels, starting at the first
+occupied slice. A value of 0 uses the full occupied Z range. Slabs initialize
+parameters only: Gaussian tails contribute across slab boundaries throughout
+training and export. The input array uses `(Z, Y, X)` order; use isotropic
+voxel spacing and zero padding when the physical thickness must be preserved.
+
+Prepare a small real LS volume using all 30 native slices (no Z interpolation),
+then run a Gaussian-only rendering-supervised fit:
+
+```powershell
+.\.venv\Scripts\python.exe -m gfields.tests.test_column_training --prepare-real-data
+.\.venv\Scripts\python.exe -m gfields.train --volume_grid results/gaussian_column_training_results/ls_native30_crop64_cube.npy --output results/gaussian_column_training_results/slab08_voxel_bound --opacity_scale 1 --gaussian_columns --column_count 64 --components_per_column 4 --column_slab_depth 8 --column_lr 0.003 --init_opacity 0.003 --gauss_target_level 0 --gabor_target_level 0 --iterations_gaussian 200 --cam_count 16 --cam_res_x 32 --cam_res_y 32 --ref_spp 64 --ref_spp_chunk 64 --ref_kernel_spp 16 --opt_spp 2 --grad_spp 2 --checkpoint_every 100 --write_image_every 100 --log_every 20 --warmup_ratio 0.05
+```
+
+The preparation command selects a textured 64×64 window by the maximum variance
+of the mean Z projection, retains all 30 native layers, and centers them in a
+64³ zero cube. Its source coordinates are recorded in `crop_metadata.json`.
+Use `--column_slab_depth 16` and a different output folder to test 16-layer
+initialization. `--column_lr` replaces the Gaussian global learning rate for
+this mode and uses the existing center/scale/rotation/opacity LR multipliers.
+Scale lower bounds are half the world-space voxel spacing on each axis, which
+prevents subvoxel density spikes; checkpoints retain these bounds.
+
+Column mode skips Gabor training and disables independent-primitive relocation,
+pruning and densification. It writes training metrics to
+`column_training_metrics.csv`, matched-SPP initial/final render metrics to
+`column_render_metrics.json`, native density slices and fixed-scale error PNGs
+to `column_slices/`, and a regular expanded renderable asset to
+`optimized_asset_pyr0/`. Density slice PSNR measures the analytic Gaussian field;
+render PSNR measures transmittance images and is a different metric.
+
+The shared parameters, Adam moments and completed iteration count are saved in
+`optimized_asset_pyr0/npy_data/columns.npz`. Resume with
+`--from_gaussian_checkpoint <run>/optimized_asset_pyr0/npy_data` and the same
+volume, camera and training settings; `--iterations_gaussian` is the total
+target iteration count, including completed iterations. The checkpoint restores
+the column count and component count. Changing the total iteration count also
+changes the learning-rate schedule. An expanded asset alone cannot restore
+sharing. For `M` columns with `K` components the trainable float32 parameters
+occupy `4 * M * (5 + 3*K)` bytes, excluding Adam state, metadata and the expanded
+render asset.
+
+Rendering currently expands columns into `M*K` ordinary Gaussian primitives.
+This validates representation and training; it does not reduce BVH primitive
+count. Focused renderer-gradient and checkpoint tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m gfields.tests.test_column_training
+```
+
 The optional **`--post_refine`** flag (off by default; **experimental** refines
 the asset once optimization finishes: it prunes very shallow primitives
 (with a PSNR loss budget, `--post_prune_budget`, default 0.1 dB) then adaptively

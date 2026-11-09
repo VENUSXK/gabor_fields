@@ -99,6 +99,47 @@ class Ellipsoid:
     
 #-------------------------------------------------------------------------------
 
+class GaussianColumn:
+    def __init__(self, column_optimizer, components_per_column):
+        if components_per_column <= 0:
+            raise ValueError("components_per_column must be positive")
+        self.column_optimizer = column_optimizer
+        self.components_per_column = components_per_column
+
+    def Expand(self):
+        column_optimizer = self.column_optimizer
+        component_count = dr.width(column_optimizer["axial_centers"])
+        column_count = dr.width(column_optimizer["center_x"])
+
+        if component_count != column_count * self.components_per_column:
+            raise ValueError("Axial component count does not match column count")
+        
+        component_indices = dr.arange(mi.UInt32, component_count)
+        column_indices = component_indices // self.components_per_column
+
+        center_x = dr.gather(mi.Float, column_optimizer["center_x"], column_indices)
+        center_y = dr.gather(mi.Float, column_optimizer["center_y"], column_indices)
+        scale_x = dr.gather(mi.Float, column_optimizer["scale_x"], column_indices)
+        scale_y = dr.gather(mi.Float, column_optimizer["scale_y"], column_indices)
+        rotation_angle = dr.gather(mi.Float, column_optimizer["rotation_angle"], column_indices)
+
+        centers = mi.Point3f(center_x, center_y, column_optimizer["axial_centers"])
+        scales = mi.Vector3f(scale_x, scale_y, column_optimizer["axial_scales"])
+        quaternions = dr.euler_to_quat(mi.Point3f(0.0, 0.0, rotation_angle))
+        density_weights = column_optimizer["density_weights"]
+
+        return centers, scales, quaternions, density_weights
+    
+    def WriteToScene(self, scene_params, level=0):
+        centers, scales, quaternions, density_weights = self.Expand()
+        primitive_name = f"primitives_pyr{level}"
+
+        scene_params[f"{primitive_name}.data"] = Ellipsoid.ravel(centers, scales, quaternions)
+        scene_params[f"{primitive_name}.opacities"] = density_weights
+        scene_params[f"{primitive_name}.omega"] = dr.zeros(mi.Float, dr.width(density_weights))
+
+        scene_params.update()
+
 class Kernel:
     @staticmethod
     def factory(props: mi.Properties):
@@ -200,10 +241,11 @@ class GaussianKernel(Kernel):
         # satisfies sigmat * density_integral(ray, 0, t) == chi
         K = sigmat * dr.rcp(w_norm) * dr.exp(-0.5 * (C - B * B)) * dr.rcp(2.0 * dr.pi * dr.prod(s))
         erfinv_arg = dr.erf(B / dr.sqrt(2.0)) + 2.0 * chi / K
-        t_s = dr.sqrt(2.0) * dr.erfinv(erfinv_arg) - B
+        erfinv_value = dr.select(erfinv_arg <= -1.0, -dr.inf,
+                                 dr.select(erfinv_arg >= 1.0, dr.inf, dr.erfinv(erfinv_arg)))
+        t_s = dr.sqrt(2.0) * erfinv_value - B
         t_s *= dr.rcp(w_norm)  # whitened arc length -> world-space distance
         t_s = dr.select(dr.isnan(t_s), dr.inf, t_s)  # Handle NaNs arising from intersection points in the infinite (dr.abs(erfinv_arg)>1)
-        # TODO: would be interesting that erfinv returns -inf or inf instead of nans, could we change this behavior
 
         return dr.select(active, t_s, 0.0)
 

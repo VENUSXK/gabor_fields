@@ -129,6 +129,11 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--iterations_gabor',    type=int,   default=4096,    help='Number of iterations for the gradient descent optimization')
     parser.add_argument('--regen_pyramid',       action="store_true",         help='Re-generate the pyramid even if it already exists')
     parser.add_argument('--gauss_count',         type=int,   default=12**3,   help='Resolution of the 3D grid of volumetric primitives') # 16 for gabor
+    parser.add_argument('--gaussian_columns', action='store_true', help='Fit shared-XY Gaussian columns (Gaussian stage only; expanded for rendering)')
+    parser.add_argument('--column_count', type=int, default=64, help='Total number of shared XY footprints, distributed among initialization slabs')
+    parser.add_argument('--components_per_column', type=int, default=4, help='Number of axial Gaussian components per column')
+    parser.add_argument('--column_slab_depth', type=int, default=0, help='Initialization slab depth in z voxels; 0 uses the complete z range; tails remain unrestricted')
+    parser.add_argument('--column_lr', type=float, default=0.01, help='Base learning rate for Gaussian column parameters, multiplied by existing parameter LR multipliers')
     parser.add_argument('--gabor_count',         type=int,   default=12**3,   help='Resolution of the 3D grid of volumetric primitives') # 16 for gabor
     parser.add_argument('--init_albedo',         type=float, default=0.0,     help='Initial value for the volumetric primitive albedo')
     parser.add_argument('--init_omega',          type=float, default=np.pi/2, help='Initial value for the volumetric primitive frequency weights')
@@ -177,6 +182,16 @@ def setup() -> argparse.Namespace:
     from gfields.presets import build_train_argv
     args = parser.parse_args(build_train_argv(sys.argv[1:]))
 
+    if args.gaussian_columns:
+        if args.column_count <= 0 or args.components_per_column <= 0 or args.column_slab_depth < 0 or args.column_lr <= 0:
+            parser.error('Column counts and learning rate must be positive; column_slab_depth must be non-negative')
+        if args.skip_gaussian_optim or args.from_gabor_checkpoint or args.post_refine or args.post_prune or args.post_clamp:
+            parser.error('Gaussian columns require Gaussian training without independent-primitive post-refinement or a Gabor checkpoint')
+        args.skip_gabor_optim = True
+        args.gauss_count = args.column_count * args.components_per_column
+        args.densify_until = 0
+        args.relocate_until = 0
+
     if args.volume_grid is None:
         parser.error("no volume: pass a preset/volume target (e.g. `wdas8` or "
                      "`data/volumes/grids/mine.npy`) or --volume_grid PATH")
@@ -212,7 +227,7 @@ def setup() -> argparse.Namespace:
             raise ValueError("If you want to skip Gaussian optimization, you must provide a checkpoint path with --from_gaussian_checkpoint")
 
     if args.from_gaussian_checkpoint and not os.path.exists(args.from_gaussian_checkpoint):
-        if args.skip_gaussian_optim:
+        if args.skip_gaussian_optim or args.gaussian_columns:
             raise FileNotFoundError(f"Checkpoint file {args.from_gaussian_checkpoint} does not exist.")
         yellow(f"Gaussian checkpoint {args.from_gaussian_checkpoint} not found; will optimize from scratch.")
         args.from_gaussian_checkpoint = ""
