@@ -60,6 +60,20 @@ def setup_column_optimizer(columns, learning_rates, checkpoint_path=None):
 
 
 class ColumnTrainingTests(unittest.TestCase):
+    def test_checkpoint_statistics_with_suspended_gradients(self):
+        from gfields.training.columns import save_columns
+        expected_count = self.arguments.column_count * (5 + 3 * self.arguments.primitives_per_column)
+        with tempfile.TemporaryDirectory() as directory:
+            # Training saves checkpoints inside a suspended-gradient scope.
+            with dr.suspend_grad():
+                stats = self.columns.parameter_stats()
+                save_columns(self.columns, directory, iteration=2)
+            self.assertEqual(stats['trainable_parameter_count'], expected_count)
+            path = Path(directory) / 'optimized_asset_pyr0' / 'npy_data' / 'columns.npz'
+            with np.load(path, allow_pickle=False) as archive:
+                metadata = json.loads(str(archive['metadata']))
+                self.assertEqual(metadata['trainable_parameter_bytes'], 4 * expected_count)
+
     def test_y_padding_initializes_columns_along_the_100_active_layers(self):
         from gfields.training.regression import generate_random_columns
         from gfields.training.configs import GenericConfig

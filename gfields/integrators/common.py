@@ -11,6 +11,7 @@ including Gaussian, Epanechnikov and Gabor kernels.
 
 from __future__ import annotations # Delayed parsing of type annotations
 from dataclasses import dataclass
+from math import prod
 
 import drjit as dr
 import mitsuba as mi
@@ -124,7 +125,8 @@ class GaussianColumn:
         optimizer = self.parameters
         column_count = dr.width(optimizer['column_center_xz'])
         primitive_count = dr.width(optimizer['primitive_center_y'])
-        parameter_count = sum(dr.width(dr.ravel(optimizer[name])) for name in self.parameter_names)
+        # Count scalars from shapes without touching AD values during checkpointing.
+        parameter_count = sum(prod(dr.shape(optimizer[name])) for name in self.parameter_names)
 
         return {
             'column_count': column_count,
