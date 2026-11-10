@@ -98,7 +98,7 @@ class BoundedAdam(dr.opt.Adam):
         Set bounds for a parameter
         '''
         # Equal bounds are allowed: they freeze the parameter at that value.
-        assert lower is None or upper is None or lower <= upper, 'Upper bound should be higher than lower bound! Did you mix the argument order?'
+        assert lower is None or upper is None or dr.all(lower <= upper, axis=None), 'Upper bound should be higher than lower bound! Did you mix the argument order?'
         self.bounds[key] = (upper, lower)
 
     @property

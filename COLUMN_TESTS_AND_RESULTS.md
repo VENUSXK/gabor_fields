@@ -16,13 +16,13 @@
 
 ## 2. 最小共享梯度测试
 
-源文件：[test_gaussian_column.py](gfields/tests/test_gaussian_column.py)。只存一个 `center_x`，轴向却有两个中心：
+源文件：[test_gaussian_column.py](gfields/tests/test_gaussian_column.py)。只存一个 `column_center_x`，轴向却有两个中心：
 
 ```python
-column_optimizer["center_x"] = mi.Float([0.0])
-column_optimizer["axial_centers"] = mi.Float([-0.4, 0.4])
-gaussian_columns = GaussianColumn(column_optimizer, components_per_column=2)
-centers, scales, quaternions, density_weights = gaussian_columns.Expand()
+column_optimizer["column_center_x"] = mi.Float([0.0])
+column_optimizer["primitive_center_z"] = mi.Float([-0.4, 0.4])
+gaussian_columns = GaussianColumn(column_optimizer, primitives_per_column=2)
+centers, scales, quaternions, primitive_opacity = gaussian_columns.expand()
 ```
 
 展开后两个高斯的 X 都为 0，Z 分别为 -0.4 和 0.4。测试还断言了 Y、横向尺度和旋转相同。随后故意给两个分量设置不同的 X 目标：
@@ -31,13 +31,13 @@ centers, scales, quaternions, density_weights = gaussian_columns.Expand()
 target_centers_x = mi.Float([0.5, 1.0])
 loss = dr.sum(dr.square(centers.x - target_centers_x))
 dr.backward(loss)
-shared_gradient = dr.grad(column_optimizer["center_x"]).numpy()
+shared_gradient = dr.grad(column_optimizer["column_center_x"]).numpy()
 np.testing.assert_allclose(shared_gradient, [-3.0])
 ```
 
 两个误差项对公共 X 的导数分别为 -1 和 -2，最后应累加为 -3。一次 Adam 更新后，公共 X 约为 0.1，重新展开的两个 X 都约为 0.1。测试检查 Z、尺度、旋转和权重没有被这个仅依赖 X 的损失改变。
 
-这说明 `Expand()` 的参数复制仍在自动微分图中。它不只是复制数值，而是能把多个展开分量的梯度送回同一个原始参数。
+这说明 `expand()` 的参数复制仍在自动微分图中。它不只是复制数值，而是能把多个展开分量的梯度送回同一个原始参数。
 
 ```powershell
 .\.venv\Scripts\python.exe -m gfields.tests.test_gaussian_column
@@ -45,10 +45,10 @@ np.testing.assert_allclose(shared_gradient, [-3.0])
 
 ## 3. 已知目标的密度拟合测试
 
-源文件：[test_gaussian_column_fit.py](gfields/tests/test_gaussian_column_fit.py)。目标与待拟合对象都是一根包含两个轴向高斯的柱，但初始中心、尺度、旋转和权重均有偏差。`EvaluateDensity()` 复用现有 `GaussianKernel.pdf()`，将各分量的密度相加：
+源文件：[test_gaussian_column_fit.py](gfields/tests/test_gaussian_column_fit.py)。目标与待拟合对象都是一根包含两个轴向高斯的柱，但初始中心、尺度、旋转和权重均有偏差。`evaluate_density()` 复用现有 `GaussianKernel.pdf()`，将各分量的密度相加：
 
 ```python
-centers, scales, quaternions, density_weights = gaussian_columns.Expand()
+centers, scales, quaternions, primitive_opacity = gaussian_columns.expand()
 density = mi.Float(0.0)
 ```
 
@@ -56,7 +56,7 @@ density = mi.Float(0.0)
 
 ```python
 dr.clear_grad(column_optimizer.variables)
-predicted_density = EvaluateDensity(fitted_columns, training_points, gaussian_kernel)
+predicted_density = evaluate_density(fitted_columns, training_points, gaussian_kernel)
 loss = dr.mean(dr.square(predicted_density - target_training_density))
 dr.backward(loss)
 column_optimizer.step()
@@ -98,8 +98,13 @@ column_optimizer.step()
 
 ```python
 anisotropic_volume = np.ones((8, 12, 16), dtype=np.float32)
-columns, _ = InitializeColumns(self.arguments, anisotropic_volume, GenericConfig())
-for name, half_voxel in zip(("scale_x", "scale_y", "axial_scales"), (1.0 / 16, 1.0 / 12, 1.0 / 8)):
+columns = generate_random_columns(
+    self.arguments.column_count, self.arguments.primitives_per_column, self.arguments.init_opacity,
+    self.arguments.init_scale, self.arguments.init_albedo,
+    volume=anisotropic_volume, volume_config=GenericConfig(),
+    column_slab_depth=self.arguments.column_slab_depth
+)
+for name, half_voxel in zip(("column_scale_x", "column_scale_y", "primitive_scale_z"), (1.0 / 16, 1.0 / 12, 1.0 / 8)):
     self.assertAlmostEqual(columns.column_optimizer.bounds[name][1], half_voxel)
     self.assertTrue(np.all(columns.column_optimizer[name].numpy() >= half_voxel))
 ```
@@ -108,24 +113,24 @@ for name, half_voxel in zip(("scale_x", "scale_y", "axial_scales"), (1.0 / 16, 1
 
 ### 4.2 渲染梯度与检查点恢复
 
-`test_render_gradient_and_raw_checkpoint_round_trip` 从 `ColumnPrimitives()` 创建现有场景，将原始柱参数写入场景后实际渲染：
+`test_render_gradient_and_raw_checkpoint_round_trip` 从 `create_scene_dict_from_primitives(..., use_columns_representation=True, gaussian_columns=gaussian_columns)` 创建现有场景，将原始柱参数写入场景后实际渲染：
 
 ```python
-self.columns.WriteToScene(scene_params)
+self.write_optimizer_params_to_scene(columns.column_optimizer, scene_params, level=0, gaussian_columns=columns)
 image = mi.render(scene, scene_params, spp=2, seed=17)
 weighted_pixels = 1.0 + mi.Float(np.linspace(0.0, 1.0, dr.width(image.array), dtype=np.float32))
 loss = dr.mean(dr.square(image.array) * weighted_pixels)
 dr.backward(loss)
 ```
 
-像素权重用于构造有空间差异的诊断损失。测试断言共享 `center_x` 和各分量 `density_weights` 的梯度有限且非零，并检查优化器更新后权重确实变化。
+像素权重用于构造有空间差异的诊断损失。测试断言共享 `column_center_x` 和各分量 `primitive_opacity` 的梯度有限且非零，并检查优化器更新后权重确实变化。
 
 同一个测试保存并加载原始柱检查点，断言参数、展开结果、分量数量、迭代号和约束全部一致。随后让保存前和恢复后的两个优化器执行相同的一次更新：
 
 ```python
 for current_optimizer in (optimizer, restored.column_optimizer):
     dr.clear_grad(current_optimizer.variables)
-    dr.backward(dr.sum(dr.square(current_optimizer["density_weights"])))
+    dr.backward(dr.sum(dr.square(current_optimizer["primitive_opacity"])))
     current_optimizer.step()
 ```
 
@@ -133,7 +138,7 @@ for current_optimizer in (optimizer, restored.column_optimizer):
 
 ### 4.3 缺少共享参数时拒绝恢复
 
-`test_expanded_asset_without_column_sidecar_is_rejected` 创建只有展开高斯文件、没有 `columns.npz` 的目录，要求 `LoadColumns()` 抛出 `FileNotFoundError`。展开高斯虽然可以渲染，却不足以唯一说明哪些分量原本共享一个 footprint，不能悄悄作为柱检查点继续训练。
+`test_expanded_asset_without_column_sidecar_is_rejected` 创建只有展开高斯文件、没有 `columns.npz` 的目录，要求 `load_columns()` 抛出 `FileNotFoundError`。展开高斯虽然可以渲染，却不足以唯一说明哪些分量原本共享一个 footprint，不能悄悄作为柱检查点继续训练。
 
 上述三个集成测试已经通过。测试临时目录放在项目 `results/column_test_results/` 下，避免依赖系统临时目录的写入权限。
 
@@ -180,7 +185,7 @@ volume = np.pad(native_volume, ((padding, block_size - len(slices) - padding), (
 | 项目 | 配置 |
 |---|---|
 | 训练入口 | 原有 `python -m gfields.train` |
-| 模式 | `--gaussian_columns`，Gaussian 阶段，不训练 Gabor |
+| 模式 | `--use_columns_representation`，Gaussian 阶段，不训练 Gabor |
 | 总柱数 | 64，分配到初始化 slabs，而非每个 slab 各 64 根 |
 | 每柱分量 | 4，总共展开 256 个 Gaussian |
 | 迭代数 | 200 |
@@ -209,8 +214,8 @@ volume = np.pad(native_volume, ((padding, block_size - len(slices) - padding), (
 64 根柱、每柱 4 个轴向分量共有：
 
 ```text
-每柱共享参数：center_x, center_y, scale_x, scale_y, rotation_angle → 5
-每个轴向分量：axial_centers, axial_scales, density_weights          → 3
+每柱共享参数：column_center_x, column_center_y, column_scale_x, column_scale_y, column_quaternions → 5
+每个轴向分量：primitive_center_z, primitive_scale_z, primitive_opacity          → 3
 标量总数：64 * (5 + 3 * 4) = 1088
 float32 参数字节数：1088 * 4 = 4352 bytes = 4.25 KiB
 ```

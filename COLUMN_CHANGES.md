@@ -1,3 +1,5 @@
+> Current setup: generate or load column parameters, create the scene, read scene parameters into a new optimizer, set bounds and learning rates, then restore checkpoint Adam state through load_columns(..., opt=opt). Column generation and checkpoint loading do not create an optimizer.
+
 # Gaussian 柱状表示：本次修改说明
 
 本文对应当前工作区的实现，记录日期为 2026-11-09。建议先读本文，再按下面的顺序阅读三个专题文档。文档中的代码片段用于解释现有实现；省略处不代表可以单独复制运行。
@@ -17,13 +19,13 @@
 ```text
 原生体素 / Gaussian 目标体
         ↓
-InitializeColumns：初始化共享 footprint 和轴向分量
+generate_random_columns：初始化共享 footprint 和轴向分量
         ↓
 BoundedAdam：持有原始共享参数
         ↓
-GaussianColumn.Expand：为渲染临时展开参数
+GaussianColumn.expand：为渲染临时展开参数
         ↓
-WriteToScene：写入现有 ellipsoidsmesh 场景
+write_to_scene：写入现有 ellipsoidsmesh 场景
         ↓
 原有可微透射渲染 → 图像损失 → 反向传播
         ↓
@@ -36,7 +38,7 @@ WriteToScene：写入现有 ellipsoidsmesh 场景
 
 | 文件 | 本次柱模式的作用 |
 |---|---|
-| [common.py](gfields/integrators/common.py) | 前期新增 `GaussianColumn`，提供 `Expand()` 与 `WriteToScene()`；本次训练接入复用此类 |
+| [common.py](gfields/integrators/common.py) | 前期新增 `GaussianColumn`，提供 `expand()` 与 `write_optimizer_params_to_scene()`；本次训练接入复用此类 |
 | [columns.py](gfields/training/columns.py) | 新增柱初始化、优化器配置、场景初始参数转换、参数统计、原始柱检查点和密度切片诊断 |
 | [regression.py](gfields/training/regression.py) | 新增命令行参数、柱模式校验及 Gaussian-only 配置 |
 | [train.py](gfields/train.py) | 在原训练流程中选择柱初始化/加载、共享参数优化、渲染前更新和柱检查点保存 |
@@ -52,9 +54,9 @@ WriteToScene：写入现有 ellipsoidsmesh 场景
 原模式优化的是每个高斯独立的中心、尺度和旋转。柱模式让优化器只保存一份横向参数，展开后多个高斯引用同一个来源：
 
 ```python
-component_indices = dr.arange(mi.UInt32, component_count)
-column_indices = component_indices // self.components_per_column
-center_x = dr.gather(mi.Float, column_optimizer["center_x"], column_indices)
+primitive_indices = dr.arange(mi.UInt32, primitive_count)
+column_indices = primitive_indices // self.primitives_per_column
+column_center_x = dr.gather(mi.Float, column_optimizer["column_center_x"], column_indices)
 ```
 
 例如每柱 4 个分量，`column_indices` 就是 `[0, 0, 0, 0, 1, 1, 1, 1, ...]`。这使一根柱内部四个高斯的 x 坐标来自同一个可训练变量，反向传播时梯度也累加回同一个变量。
@@ -63,7 +65,7 @@ center_x = dr.gather(mi.Float, column_optimizer["center_x"], column_indices)
 
 ```python
 opt = gaussian_columns.column_optimizer
-gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, gaussian_columns=gaussian_columns)
 ```
 
 场景只是接收展开结果，优化器仍更新原始柱参数。这是保持共享关系的关键。

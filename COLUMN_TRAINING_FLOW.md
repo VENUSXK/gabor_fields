@@ -1,6 +1,8 @@
+> Current setup: generate or load column parameters, create the scene, read scene parameters into a new optimizer, set bounds and learning rates, then restore checkpoint Adam state through load_columns(..., opt=opt). Column generation and checkpoint loading do not create an optimizer.
+
 # Gaussian 柱模式如何接入原训练流程
 
-本文对应 `gfields/train.py` 和 `gfields/training/regression.py` 中新增的柱模式分支。现在仍从 `python -m gfields.train` 启动训练；开启 `--gaussian_columns` 后，优化器保存共享的 XY 参数，渲染前再展开成现有高斯。
+本文对应 `gfields/train.py` 和 `gfields/training/regression.py` 中新增的柱模式分支。现在仍从 `python -m gfields.train` 启动训练；开启 `--use_columns_representation` 后，优化器保存共享的 XY 参数，渲染前再展开成现有高斯。
 
 这里共享的是 **XY footprint，轴向是 Z**。本次接入的是 Gaussian 阶段；不是新的 Gabor 柱渲染器，也还没有实现“一根柱只进入 BVH 一次”。
 
@@ -13,7 +15,7 @@ flowchart TD
     C -->|否| D[原有独立高斯初始化与优化器]
     C -->|是| E[初始化柱或加载 columns.npz]
     E --> F[共享参数交给 BoundedAdam]
-    F --> G[Expand + WriteToScene]
+    F --> G[expand + write_to_scene]
     D --> H[原有渲染器生成图像]
     G --> H
     B --> I[计算图像损失]
@@ -27,13 +29,13 @@ flowchart TD
 
 ## 2. 参数入口：`regression.py`
 
-新增入口集中在 [gfields/training/regression.py](gfields/training/regression.py) 的 `setup()`，可搜索 `--gaussian_columns`。
+新增入口集中在 [gfields/training/regression.py](gfields/training/regression.py) 的 `setup()`，可搜索 `--use_columns_representation`。
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
-| `--gaussian_columns` | 关闭 | 开启共享 XY 的 Gaussian 柱模式 |
+| `--use_columns_representation` | 关闭 | 开启共享 XY 的 Gaussian 柱模式 |
 | `--column_count` | 64 | 所有初始化 slab 合计的柱数，不是每个 slab 的柱数 |
-| `--components_per_column` | 4 | 每根柱内部的轴向高斯数量 |
+| `--primitives_per_column` | 4 | 每根柱内部的轴向高斯数量 |
 | `--column_slab_depth` | 0 | 初始化 slab 的深度，单位是输入数组的 Z 体素；0 表示整个占据 Z 区间 |
 | `--column_lr` | 0.01 | 柱参数基础学习率，继续乘现有中心、尺度、旋转、权重学习率系数 |
 
@@ -41,7 +43,7 @@ flowchart TD
 
 ```python
 args.skip_gabor_optim = True
-args.gauss_count = args.column_count * args.components_per_column
+args.gauss_count = args.column_count * args.primitives_per_column
 args.densify_until = 0
 args.relocate_until = 0
 ```
@@ -55,19 +57,23 @@ args.relocate_until = 0
 在 Gaussian 阶段之前，新增以下分支：
 
 ```python
-if args.gaussian_columns:
+if args.use_columns_representation:
     if args.from_gaussian_checkpoint:
-        gaussian_columns, column_lr_dict, column_start = LoadColumns(Path(args.from_gaussian_checkpoint), args)
+        gaussian_columns, column_start_iteration = load_columns(Path(args.from_gaussian_checkpoint), args)
     else:
-        gaussian_columns, column_lr_dict = InitializeColumns(args, gauss_ref_volume, volume_config)
-    gaussian_prims_ckpt = ColumnPrimitives(gaussian_columns)
+        gaussian_columns = generate_random_columns(
+            args.column_count, args.primitives_per_column, args.init_opacity, args.init_scale, args.init_albedo,
+            volume=gauss_ref_volume, volume_config=volume_config,
+            column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset
+        )
+    scene_dict = create_scene_dict_from_primitives(args.max_depth, GAUSS_LVL, use_columns_representation=args.use_columns_representation, gaussian_columns=gaussian_columns)
 ```
 
-- `InitializeColumns()` 创建共享横向参数和独立轴向参数，并创建优化器。
-- `LoadColumns()` 恢复原始共享参数、Adam 状态、尺度约束、固定 albedo 和已完成迭代数。
-- `ColumnPrimitives()` 生成原有场景创建函数需要的 `centers/scales/quaternions/opacities/omega/albedo`。
+- `generate_random_columns()` 创建共享横向参数和独立轴向参数，并创建优化器。
+- `load_columns()` 恢复原始共享参数、Adam 状态、尺度约束、固定 albedo 和已完成迭代数。
+- `create_scene_dict_from_primitives(..., use_columns_representation=True, gaussian_columns=gaussian_columns)` 生成原有场景创建函数需要的 `centers/scales/quaternions/opacities/omega/albedo`。
 
-`ColumnPrimitives()` 用于搭建场景所需的初始数值；之后调用可微的 `WriteToScene()`，才把渲染参数接回共享优化器中的变量。初始化、展开和检查点的内部实现位于 [gfields/training/columns.py](gfields/training/columns.py)。
+`create_scene_dict_from_primitives(..., use_columns_representation=True, gaussian_columns=gaussian_columns)` 用于搭建场景所需的初始数值；之后调用可微的 `write_optimizer_params_to_scene()`，才把渲染参数接回共享优化器中的变量。初始化、展开和检查点的内部实现位于 [gfields/training/columns.py](gfields/training/columns.py)。
 
 不开启柱模式时，原来的 `generate_random_kernels()` 和独立高斯检查点分支继续使用。
 
@@ -77,12 +83,16 @@ if args.gaussian_columns:
 
 ```python
 if gaussian_columns is not None:
-    opt = gaussian_columns.column_optimizer
-    lr_dict = column_lr_dict
-    gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+    opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
+    write_scene_params_to_optimizer(scene_params, opt, level=GAUSS_LVL, args=args, gaussian_columns=gaussian_columns)
+    lr_dict = create_lr_dict(args, args.column_lr, level=GAUSS_LVL)
+    configure_optimizer(opt, args, lr_dict, level=GAUSS_LVL, gaussian_columns=gaussian_columns)
+    if args.from_gaussian_checkpoint:
+        gaussian_columns, column_start_iteration = load_columns(Path(args.from_gaussian_checkpoint), args, opt=opt)
+    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, gaussian_columns=gaussian_columns)
 ```
 
-例如同一根柱的 4 个展开高斯，共享同一个 `center_x`。反向传播时，4 个高斯对横向中心的梯度会累加回这一个变量。优化之后，这 4 个高斯仍然共享同一中心。
+例如同一根柱的 4 个展开高斯，共享同一个 `column_center_x`。反向传播时，4 个高斯对横向中心的梯度会累加回这一个变量。优化之后，这 4 个高斯仍然共享同一中心。
 
 柱优化器复用现有 `BoundedAdam`，但把旧的基元中心噪声关闭：`noise_init=0.0`。旧噪声逻辑按 `centers_0/scales_0/quaternions_0` 等独立高斯键名工作，不能直接套用到柱参数。
 
@@ -95,7 +105,7 @@ if gaussian_columns is not None:
 ```python
 with timer.track('forward'):
     if gaussian_columns is not None:
-        gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+        write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, gaussian_columns=gaussian_columns)
     image, img_loss, l1, ssim, img_mse = _batched_render_loss(
         scene, scene_params, ref_image, opt_cam_batches,
         spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
@@ -111,8 +121,8 @@ with timer.track('forward'):
 
 ```python
 if gaussian_columns is not None:
-    opacity_penalty = dr.sum(dr.abs(opt['density_weights'])) * args.lambda_opacity
-    scale_penalty = (dr.sum(opt['scale_x']) + dr.sum(opt['scale_y']) + dr.sum(opt['axial_scales'])) * args.lambda_scale
+    opacity_penalty = dr.sum(dr.abs(opt['primitive_opacity'])) * args.lambda_opacity
+    scale_penalty = (dr.sum(opt['column_scale_x']) + dr.sum(opt['column_scale_y']) + dr.sum(opt['primitive_scale_z'])) * args.lambda_scale
 ```
 
 共享横向尺度在这个正则里按柱计数一次，轴向尺度按分量计数；不是把展开后重复的尺度再累加。默认这两个正则系数均为 0。原来的频率正则函数仍然被调用，但 Gaussian 第 0 层没有 Gabor 频率项，结果为 0。
@@ -123,7 +133,7 @@ if gaussian_columns is not None:
 dr.backward(loss)
 opt.step()
 if gaussian_columns is not None:
-    gaussian_columns.WriteToScene(scene_params, level=GAUSS_LVL)
+    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, gaussian_columns=gaussian_columns)
 else:
     write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL)
 ```
@@ -132,14 +142,14 @@ else:
 
 ## 6. 学习率调度和恢复训练
 
-继续复用原有 `LRScheduler`，柱模式使用 `column_lr_dict` 和 `args.column_lr`，不使用默认值较大的 `global_lr_gaussian`。
+继续复用原有 `LRScheduler`，柱模式使用 `create_lr_dict()` 和 `args.column_lr`，不使用默认值较大的 `global_lr_gaussian`。
 
 ```python
 if gaussian_columns is not None:
-    lr_scheduler.current_step = column_start
+    lr_scheduler.current_step = column_start_iteration
 ```
 
-循环从检查点的 `column_start` 开始。柱模式中，`--iterations_gaussian` 是**累计目标步数**：检查点完成 200 步，设为 201 就再训练 1 步，不是再训练 201 步。
+循环从检查点的 `column_start_iteration` 开始。柱模式中，`--iterations_gaussian` 是**累计目标步数**：检查点完成 200 步，设为 201 就再训练 1 步，不是再训练 201 步。
 
 恢复时应保持体数据、相机、图像分辨率和损失配置一致；代码不会自动把检查点原来的所有命令行配置覆盖回来。改变累计目标步数，也会改变按总步数计算的学习率曲线。
 
@@ -163,10 +173,10 @@ if gaussian_columns is not None:
 ```python
 save_model(args.output, scene, level=GAUSS_LVL)
 if gaussian_columns is not None:
-    SaveColumns(gaussian_columns, args.output, iteration=completed_iterations)
+    save_columns(gaussian_columns, args.output, iteration=completed_iterations)
 ```
 
-最终保存时还会调用 `SaveColumnSlices()`，生成目标密度、重建密度和固定显示范围误差图。
+最终保存时还会调用 `save_column_slices()`，生成目标密度、重建密度和固定显示范围误差图。
 
 | 输出 | 用途 |
 |---|---|
@@ -185,11 +195,11 @@ if gaussian_columns is not None:
 
 建议按以下顺序阅读：
 
-1. `regression.py` 搜索 `--gaussian_columns`：看模式开关和参数。
+1. `regression.py` 搜索 `--use_columns_representation`：看模式开关和参数。
 2. `train.py` 搜索 `gaussian_columns = None`：看初始化与检查点分支。
 3. `train.py` 搜索 `opt = gaussian_columns.column_optimizer`：看优化变量的来源。
-4. `train.py` 搜索 `WriteToScene`：看共享参数与场景之间的连接。
-5. `columns.py` 看 `InitializeColumns/CreateColumnOptimizer/SaveColumns/LoadColumns`。
+4. `train.py` 搜索 `write_to_scene`：看共享参数与场景之间的连接。
+5. `columns.py` 看 `generate_random_columns/write_scene_params_to_optimizer/configure_optimizer/save_columns/load_columns`。
 
 先准备这次使用的真实小体数据：
 
@@ -200,7 +210,7 @@ if gaussian_columns is not None:
 最小模式示例（其余训练配置使用默认值，正式小实验的完整命令见根 [README.md](README.md)）：
 
 ```powershell
-.\.venv\Scripts\python.exe -m gfields.train --volume_grid results/gaussian_column_training_results/ls_native30_crop64_cube.npy --output results/column_demo --opacity_scale 1 --gaussian_columns --column_count 64 --components_per_column 4 --column_slab_depth 8 --column_lr 0.003 --gauss_target_level 0 --gabor_target_level 0 --iterations_gaussian 200 --cam_count 16 --cam_res_x 32 --cam_res_y 32 --ref_spp 64 --ref_kernel_spp 16
+.\.venv\Scripts\python.exe -m gfields.train --volume_grid results/gaussian_column_training_results/ls_native30_crop64_cube.npy --output results/column_demo --opacity_scale 1 --use_columns_representation --column_count 64 --primitives_per_column 4 --column_slab_depth 8 --column_lr 0.003 --gauss_target_level 0 --gabor_target_level 0 --iterations_gaussian 200 --cam_count 16 --cam_res_x 32 --cam_res_y 32 --ref_spp 64 --ref_kernel_spp 16
 ```
 
-原生柱 BVH 的实现不在本文这些新增训练分支中。当前每轮 `WriteToScene()` 仍把柱展开成普通高斯，随后使用现有 `ellipsoidsmesh` 求交路径。
+原生柱 BVH 的实现不在本文这些新增训练分支中。当前每轮 `write_optimizer_params_to_scene()` 仍把柱展开成普通高斯，随后使用现有 `ellipsoidsmesh` 求交路径。

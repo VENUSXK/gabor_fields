@@ -100,45 +100,74 @@ class Ellipsoid:
 #-------------------------------------------------------------------------------
 
 class GaussianColumn:
-    def __init__(self, column_optimizer, components_per_column):
-        if components_per_column <= 0:
-            raise ValueError("components_per_column must be positive")
-        self.column_optimizer = column_optimizer
-        self.components_per_column = components_per_column
+    parameter_names = ('column_center_xy', 'column_scale_xy', 'column_quaternions', 'primitive_center_z', 'primitive_scale_z', 'primitive_opacity')
 
-    def Expand(self):
-        column_optimizer = self.column_optimizer
-        component_count = dr.width(column_optimizer["axial_centers"])
-        column_count = dr.width(column_optimizer["center_x"])
+    def __init__(self, parameters, primitives_per_column, scale_lower_bounds=None):
+        # Validate the number of primitives in each column.
+        if primitives_per_column <= 0:
+            raise ValueError("primitives_per_column must be positive")
 
-        if component_count != column_count * self.components_per_column:
-            raise ValueError("Axial component count does not match column count")
+        # Keep generated parameters until the scene and optimizer are ready.
+        self.column_optimizer = parameters if hasattr(parameters, 'state') else None
+        self._parameters = parameters
+        self.primitives_per_column = primitives_per_column
+        self.scale_lower_bounds = scale_lower_bounds or {
+            'column_scale_xy': [1e-5, 1e-5], 'primitive_scale_z': 1e-5
+        }
+
+    @property
+    def parameters(self):
+        # Read live optimizer values after binding, otherwise initial parameters.
+        return self.column_optimizer if self.column_optimizer is not None else self._parameters
+
+    def parameter_stats(self):
+        optimizer = self.parameters
+        column_count = dr.width(optimizer['column_center_xy'])
+        primitive_count = dr.width(optimizer['primitive_center_z'])
+        parameter_count = sum(dr.width(dr.ravel(optimizer[name])) for name in self.parameter_names)
+
+        return {
+            'column_count': column_count,
+            'primitives_per_column': self.primitives_per_column,
+            'expanded_gaussian_count': primitive_count,
+            'trainable_parameter_count': parameter_count,
+            'trainable_parameter_bytes': 4 * parameter_count,
+            'independent_axis_aligned_xy_gaussian_parameter_count': 8 * primitive_count,
+            'independent_full_3d_gaussian_parameter_count': 11 * primitive_count,
+            'rendering_uses_expanded_gaussians': True
+        }
+
+    def expand(self):
+        # Read the primitive and column counts from the current parameters.
+        column_optimizer = self.parameters
+        primitive_count = dr.width(column_optimizer["primitive_center_z"])
+        column_count = dr.width(column_optimizer["column_center_xy"])
+
+        # Check that all columns contain the expected number of primitives.
+        if primitive_count != column_count * self.primitives_per_column:
+            raise ValueError("Axial primitive count does not match column count")
         
-        component_indices = dr.arange(mi.UInt32, component_count)
-        column_indices = component_indices // self.components_per_column
+        # Map each primitive to its parent column.
+        primitive_indices = dr.arange(mi.UInt32, primitive_count)
+        column_indices = primitive_indices // self.primitives_per_column
 
-        center_x = dr.gather(mi.Float, column_optimizer["center_x"], column_indices)
-        center_y = dr.gather(mi.Float, column_optimizer["center_y"], column_indices)
-        scale_x = dr.gather(mi.Float, column_optimizer["scale_x"], column_indices)
-        scale_y = dr.gather(mi.Float, column_optimizer["scale_y"], column_indices)
-        rotation_angle = dr.gather(mi.Float, column_optimizer["rotation_angle"], column_indices)
+        # Expand shared XY positions, scales, and rotations to each primitive.
+        column_center_xy = dr.gather(mi.Point2f, column_optimizer["column_center_xy"], column_indices)
+        column_scale_xy = dr.gather(mi.Vector2f, column_optimizer["column_scale_xy"], column_indices)
+        column_quaternions = dr.gather(mi.Float, column_optimizer["column_quaternions"], column_indices)
 
-        centers = mi.Point3f(center_x, center_y, column_optimizer["axial_centers"])
-        scales = mi.Vector3f(scale_x, scale_y, column_optimizer["axial_scales"])
-        quaternions = dr.euler_to_quat(mi.Point3f(0.0, 0.0, rotation_angle))
-        density_weights = column_optimizer["density_weights"]
+        # Combine shared XY parameters with independent axial parameters.
+        centers = mi.Point3f(column_center_xy.x, column_center_xy.y, column_optimizer["primitive_center_z"])
+        scales = mi.Vector3f(column_scale_xy.x, column_scale_xy.y, column_optimizer["primitive_scale_z"])
 
-        return centers, scales, quaternions, density_weights
-    
-    def WriteToScene(self, scene_params, level=0):
-        centers, scales, quaternions, density_weights = self.Expand()
-        primitive_name = f"primitives_pyr{level}"
+        # Convert column rotations about Z to primitive quaternions.
+        quaternions = dr.euler_to_quat(mi.Point3f(0.0, 0.0, column_quaternions))
 
-        scene_params[f"{primitive_name}.data"] = Ellipsoid.ravel(centers, scales, quaternions)
-        scene_params[f"{primitive_name}.opacities"] = density_weights
-        scene_params[f"{primitive_name}.omega"] = dr.zeros(mi.Float, dr.width(density_weights))
+        # Use each primitive's independent density weight.
+        primitive_opacity = column_optimizer["primitive_opacity"]
 
-        scene_params.update()
+        return centers, scales, quaternions, primitive_opacity
+
 
 class Kernel:
     @staticmethod
