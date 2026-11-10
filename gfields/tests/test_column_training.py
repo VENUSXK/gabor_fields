@@ -60,6 +60,24 @@ def setup_column_optimizer(columns, learning_rates, checkpoint_path=None):
 
 
 class ColumnTrainingTests(unittest.TestCase):
+    def test_y_padding_initializes_columns_along_the_100_active_layers(self):
+        from gfields.training.regression import generate_random_columns
+        from gfields.training.configs import GenericConfig
+        volume = np.zeros((1024, 128, 8), dtype=np.float32)
+        volume[:, 14:114, :] = 1.0
+        columns = generate_random_columns(64, 4, 0.003, 1.0, 0.0,
+                                          volume=volume, volume_config=GenericConfig(), column_slab_depth=8)
+        centers, scales, quaternions, _ = columns.expand()
+        self.assertTrue(np.all(centers.y.numpy() >= 2.0 * 14 / 128 - 1.0))
+        self.assertTrue(np.all(centers.y.numpy() < 2.0 * 114 / 128 - 1.0))
+        for values in (centers.x, centers.z, scales.x, scales.z):
+            groups = values.numpy().reshape(64, 4)
+            np.testing.assert_array_equal(groups, np.repeat(groups[:, :1], 4, axis=1))
+        np.testing.assert_allclose(quaternions.x.numpy(), 0.0, atol=1e-7)
+        np.testing.assert_allclose(quaternions.z.numpy(), 0.0, atol=1e-7)
+        np.testing.assert_allclose(columns.scale_lower_bounds['column_scale_xz'], [1 / 8, 1 / 1024])
+        self.assertAlmostEqual(columns.scale_lower_bounds['primitive_scale_y'], 1 / 128)
+
     def setUp(self):
         from gfields.training.regression import generate_random_columns
         from gfields.training.configs import GenericConfig
@@ -106,7 +124,7 @@ class ColumnTrainingTests(unittest.TestCase):
         write_scene_params_to_optimizer(params, opt, level=0, args=args)
         configure_optimizer(opt, args, {'centers_0': 0.02}, level=0)
         self.assertIn('centers_0', opt)
-        self.assertNotIn('column_center_xy', opt)
+        self.assertNotIn('column_center_xz', opt)
         self.assertEqual(opt.bounds['scales_0'], (1.0, 1e-8))
         self.assertEqual(opt.bounds['omega_0'], (0.0, 0.0))
         write_optimizer_params_to_scene(opt, params, level=0)
@@ -146,8 +164,8 @@ class ColumnTrainingTests(unittest.TestCase):
 
         def step(current):
             dr.clear_grad(current.variables)
-            dr.backward(dr.sum(dr.square(current['column_center_xy']), axis=None)
-                        + dr.sum(dr.square(current['column_scale_xy']), axis=None)
+            dr.backward(dr.sum(dr.square(current['column_center_xz']), axis=None)
+                        + dr.sum(dr.square(current['column_scale_xz']), axis=None)
                         + dr.sum(dr.square(current['primitive_opacity'])))
             current.step()
 
@@ -162,16 +180,16 @@ class ColumnTrainingTests(unittest.TestCase):
 
             # Recreate the former scalar XY parameters, bounds, and Adam arrays.
             for grouped, x_name, y_name in (
-                ('column_center_xy', 'column_center_x', 'column_center_y'),
-                ('column_scale_xy', 'column_scale_x', 'column_scale_y'),
+                ('column_center_xz', 'column_center_x', 'column_center_z'),
+                ('column_scale_xz', 'column_scale_x', 'column_scale_z'),
             ):
                 for suffix in ('', '__first_moment', '__second_moment'):
                     x_values, y_values = arrays.pop(grouped + suffix)
                     arrays[x_name + suffix], arrays[y_name + suffix] = x_values, y_values
                 steps = metadata['adam_steps']
                 steps[x_name] = steps[y_name] = steps.pop(grouped)
-            lower_x, lower_y = metadata['scale_lower_bounds'].pop('column_scale_xy')
-            metadata['scale_lower_bounds'].update(column_scale_x=lower_x, column_scale_y=lower_y)
+            lower_x, lower_y = metadata['scale_lower_bounds'].pop('column_scale_xz')
+            metadata['scale_lower_bounds'].update(column_scale_x=lower_x, column_scale_z=lower_y)
             for suffix in ('', '__first_moment', '__second_moment'):
                 arrays['density_weights' + suffix] = arrays.pop('primitive_opacity' + suffix)
             metadata['adam_steps']['density_weights'] = metadata['adam_steps'].pop('primitive_opacity')
@@ -189,12 +207,12 @@ class ColumnTrainingTests(unittest.TestCase):
     def test_shared_footprint_and_positive_initialization(self):
         centers, scales, quaternions, weights = self.columns.expand()
         self.assertEqual(dr.width(centers), self.arguments.column_count * self.arguments.primitives_per_column)
-        for values in (centers.x, centers.y, scales.x, scales.y):
+        for values in (centers.x, centers.z, scales.x, scales.z):
             groups = values.numpy().reshape(-1, self.arguments.primitives_per_column)
             np.testing.assert_array_equal(groups, np.repeat(groups[:, :1], self.arguments.primitives_per_column, axis=1))
         self.assertTrue(np.all(scales.numpy() > 0.0))
         self.assertTrue(np.all(weights.numpy() > 0.0))
-        self.assertEqual(dr.width(self.columns.column_optimizer["column_center_xy"]), self.arguments.column_count)
+        self.assertEqual(dr.width(self.columns.column_optimizer["column_center_xz"]), self.arguments.column_count)
         from gfields.training.regression import generate_random_columns
         from gfields.training.configs import GenericConfig
         anisotropic_volume = np.ones((8, 12, 16), dtype=np.float32)
@@ -205,7 +223,7 @@ class ColumnTrainingTests(unittest.TestCase):
         )
         self.assertIsNone(columns.column_optimizer)
         setup_column_optimizer(columns, self.learning_rates)
-        expected_bounds = {'column_scale_xy': [1.0 / 16, 1.0 / 12], 'primitive_scale_z': 1.0 / 8}
+        expected_bounds = {'column_scale_xz': [1.0 / 16, 1.0 / 8], 'primitive_scale_y': 1.0 / 12}
         for name, half_voxel in expected_bounds.items():
             lower = np.asarray(columns.column_optimizer.bounds[name][1])
             np.testing.assert_allclose(lower.reshape(-1), np.asarray(half_voxel).reshape(-1))
@@ -228,7 +246,7 @@ class ColumnTrainingTests(unittest.TestCase):
             weighted_pixels = 1.0 + mi.Float(np.linspace(0.0, 1.0, dr.width(image.array), dtype=np.float32))
             loss = dr.mean(dr.square(image.array) * weighted_pixels)
             dr.backward(loss)
-            for parameter in (optimizer['primitive_opacity'], optimizer['column_center_xy'].x):
+            for parameter in (optimizer['primitive_opacity'], optimizer['column_center_xz'].x):
                 gradient = dr.grad(parameter).numpy()
                 self.assertTrue(np.isfinite(gradient).all())
                 self.assertGreater(float(np.abs(gradient).sum()), 0.0)

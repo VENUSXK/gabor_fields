@@ -100,7 +100,7 @@ class Ellipsoid:
 #-------------------------------------------------------------------------------
 
 class GaussianColumn:
-    parameter_names = ('column_center_xy', 'column_scale_xy', 'column_quaternions', 'primitive_center_z', 'primitive_scale_z', 'primitive_opacity')
+    parameter_names = ('column_center_xz', 'column_scale_xz', 'column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'primitive_opacity')
 
     def __init__(self, parameters, primitives_per_column, scale_lower_bounds=None):
         # Validate the number of primitives in each column.
@@ -112,7 +112,7 @@ class GaussianColumn:
         self._parameters = parameters
         self.primitives_per_column = primitives_per_column
         self.scale_lower_bounds = scale_lower_bounds or {
-            'column_scale_xy': [1e-5, 1e-5], 'primitive_scale_z': 1e-5
+            'column_scale_xz': [1e-5, 1e-5], 'primitive_scale_y': 1e-5
         }
 
     @property
@@ -122,8 +122,8 @@ class GaussianColumn:
 
     def parameter_stats(self):
         optimizer = self.parameters
-        column_count = dr.width(optimizer['column_center_xy'])
-        primitive_count = dr.width(optimizer['primitive_center_z'])
+        column_count = dr.width(optimizer['column_center_xz'])
+        primitive_count = dr.width(optimizer['primitive_center_y'])
         parameter_count = sum(dr.width(dr.ravel(optimizer[name])) for name in self.parameter_names)
 
         return {
@@ -140,8 +140,8 @@ class GaussianColumn:
     def expand(self):
         # Read the primitive and column counts from the current parameters.
         column_optimizer = self.parameters
-        primitive_count = dr.width(column_optimizer["primitive_center_z"])
-        column_count = dr.width(column_optimizer["column_center_xy"])
+        primitive_count = dr.width(column_optimizer["primitive_center_y"])
+        column_count = dr.width(column_optimizer["column_center_xz"])
 
         # Check that all columns contain the expected number of primitives.
         if primitive_count != column_count * self.primitives_per_column:
@@ -151,17 +151,17 @@ class GaussianColumn:
         primitive_indices = dr.arange(mi.UInt32, primitive_count)
         column_indices = primitive_indices // self.primitives_per_column
 
-        # Expand shared XY positions, scales, and rotations to each primitive.
-        column_center_xy = dr.gather(mi.Point2f, column_optimizer["column_center_xy"], column_indices)
-        column_scale_xy = dr.gather(mi.Vector2f, column_optimizer["column_scale_xy"], column_indices)
+        # Expand shared XZ positions, scales, and rotations to each primitive.
+        column_center_xz = dr.gather(mi.Point2f, column_optimizer["column_center_xz"], column_indices)
+        column_scale_xz = dr.gather(mi.Vector2f, column_optimizer["column_scale_xz"], column_indices)
         column_quaternions = dr.gather(mi.Float, column_optimizer["column_quaternions"], column_indices)
 
-        # Combine shared XY parameters with independent axial parameters.
-        centers = mi.Point3f(column_center_xy.x, column_center_xy.y, column_optimizer["primitive_center_z"])
-        scales = mi.Vector3f(column_scale_xy.x, column_scale_xy.y, column_optimizer["primitive_scale_z"])
+        # Combine shared XZ parameters with independent axial parameters.
+        centers = mi.Point3f(column_center_xz[0], column_optimizer["primitive_center_y"], column_center_xz[1])
+        scales = mi.Vector3f(column_scale_xz[0], column_optimizer["primitive_scale_y"], column_scale_xz[1])
 
-        # Convert column rotations about Z to primitive quaternions.
-        quaternions = dr.euler_to_quat(mi.Point3f(0.0, 0.0, column_quaternions))
+        # Convert column rotations about Y to primitive quaternions.
+        quaternions = dr.euler_to_quat(mi.Point3f(0.0, column_quaternions, 0.0))
 
         # Use each primitive's independent density weight.
         primitive_opacity = column_optimizer["primitive_opacity"]

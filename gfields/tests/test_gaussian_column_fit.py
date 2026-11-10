@@ -30,12 +30,12 @@ def evaluate_density(gaussian_columns, query_points, gaussian_kernel):
 def create_optimizer(parameter_values):
     column_optimizer = gfields.optimizers.BoundedAdam(lr=0.01, noise_init=0.0)
     for parameter_name, values in parameter_values.items():
-        parameter_type = mi.Point2f if parameter_name == 'column_center_xy' else mi.Vector2f if parameter_name == 'column_scale_xy' else mi.Float
+        parameter_type = mi.Point2f if parameter_name == 'column_center_xz' else mi.Vector2f if parameter_name == 'column_scale_xz' else mi.Float
         column_optimizer[parameter_name] = parameter_type(values)
-    for parameter_name in ("column_center_xy", "primitive_center_z"):
+    for parameter_name in ("column_center_xz", "primitive_center_y"):
         column_optimizer.set_bounds(parameter_name, lower=-0.8, upper=0.8)
 
-    for parameter_name in ("column_scale_xy", "primitive_scale_z"):
+    for parameter_name in ("column_scale_xz", "primitive_scale_y"):
         column_optimizer.set_bounds(parameter_name, lower=0.04, upper=0.65)
         column_optimizer.set_learning_rate({parameter_name: 0.005})
     column_optimizer.set_bounds("primitive_opacity", lower=1e-5, upper=1.0)
@@ -110,8 +110,8 @@ def save_loss_curve(output_path, loss_history):
 
 def horizontal_covariance(parameters):
     column_quaternions = parameters["column_quaternions"][0]
-    rotation_matrix = np.array([[math.cos(column_quaternions), -math.sin(column_quaternions)], [math.sin(column_quaternions), math.cos(column_quaternions)]])
-    return rotation_matrix @ np.diag([parameters["column_scale_xy"][0][0] ** 2, parameters["column_scale_xy"][1][0] ** 2]) @ rotation_matrix.T
+    rotation_matrix = np.array([[math.cos(column_quaternions), math.sin(column_quaternions)], [-math.sin(column_quaternions), math.cos(column_quaternions)]])
+    return rotation_matrix @ np.diag([parameters["column_scale_xz"][0][0] ** 2, parameters["column_scale_xz"][1][0] ** 2]) @ rotation_matrix.T
 
 
 def main():
@@ -123,11 +123,11 @@ def main():
     if arguments.iterations <= 0 or arguments.sample_count < 1024:
         parser.error("iterations must be positive and sample_count must be at least 1024")
 
-    target_parameters = {"column_center_xy": [[0.12], [-0.08]], "column_scale_xy": [[0.32], [0.18]], "column_quaternions": [0.5],
-                         "primitive_center_z": [-0.38, 0.36], "primitive_scale_z": [0.13, 0.17], "primitive_opacity": [0.08, 0.12]}
-    initial_parameters = {"column_center_xy": [[-0.16], [0.12]], "column_scale_xy": [[0.4], [0.24]], "column_quaternions": [-0.15],
-                          "primitive_center_z": [-0.22, 0.19], "primitive_scale_z": [0.21, 0.24], "primitive_opacity": [0.07, 0.09]}
-    parameter_types = {'column_center_xy': mi.Point2f, 'column_scale_xy': mi.Vector2f}
+    target_parameters = {"column_center_xz": [[0.12], [-0.08]], "column_scale_xz": [[0.32], [0.18]], "column_quaternions": [0.5],
+                         "primitive_center_y": [-0.38, 0.36], "primitive_scale_y": [0.13, 0.17], "primitive_opacity": [0.08, 0.12]}
+    initial_parameters = {"column_center_xz": [[-0.16], [0.12]], "column_scale_xz": [[0.4], [0.24]], "column_quaternions": [-0.15],
+                          "primitive_center_y": [-0.22, 0.19], "primitive_scale_y": [0.21, 0.24], "primitive_opacity": [0.07, 0.09]}
+    parameter_types = {'column_center_xz': mi.Point2f, 'column_scale_xz': mi.Vector2f}
     target_arrays = {name: parameter_types.get(name, mi.Float)(values) for name, values in target_parameters.items()}
     target_columns = GaussianColumn(target_arrays, primitives_per_column=2)
     column_optimizer = create_optimizer(initial_parameters)
@@ -179,16 +179,16 @@ def main():
                "mse_reduction_factor": initial_mse / final_mse if final_mse > 0 else None, "horizontal_covariance_relative_error": float(covariance_error),
                "psnr_peak": 1.0, "grid_axis_order": "z,y,x", "grid_shape": grid_shape, "seed": 20261109, "first_step_gradient_l1": first_gradients}
 
-    center_error = float(np.max(np.abs(np.asarray(final_parameters["column_center_xy"]) - target_parameters["column_center_xy"])))
-    primitive_order = np.argsort(final_parameters["primitive_center_z"])
-    axial_center_error = float(np.max(abs(np.asarray(final_parameters["primitive_center_z"])[primitive_order] - target_parameters["primitive_center_z"])))
-    axial_scale_error = float(np.max(abs(np.asarray(final_parameters["primitive_scale_z"])[primitive_order] / target_parameters["primitive_scale_z"] - 1)))
+    center_error = float(np.max(np.abs(np.asarray(final_parameters["column_center_xz"]) - target_parameters["column_center_xz"])))
+    primitive_order = np.argsort(final_parameters["primitive_center_y"])
+    axial_center_error = float(np.max(abs(np.asarray(final_parameters["primitive_center_y"])[primitive_order] - target_parameters["primitive_center_y"])))
+    axial_scale_error = float(np.max(abs(np.asarray(final_parameters["primitive_scale_y"])[primitive_order] / target_parameters["primitive_scale_y"] - 1)))
     weight_error = float(np.max(abs(np.asarray(final_parameters["primitive_opacity"])[primitive_order] / target_parameters["primitive_opacity"] - 1)))
     metrics.update(horizontal_center_max_error=center_error, axial_center_max_error=axial_center_error, axial_scale_max_relative_error=axial_scale_error, weight_max_relative_error=weight_error)
 
     expanded_centers, expanded_scales, expanded_quaternions, expanded_weights = fitted_columns.expand()
-    np.testing.assert_allclose(expanded_centers.numpy()[:2, 0], expanded_centers.numpy()[:2, 1])
-    np.testing.assert_allclose(expanded_scales.numpy()[:2, 0], expanded_scales.numpy()[:2, 1])
+    np.testing.assert_allclose(expanded_centers.numpy()[[0, 2], 0], expanded_centers.numpy()[[0, 2], 1])
+    np.testing.assert_allclose(expanded_scales.numpy()[[0, 2], 0], expanded_scales.numpy()[[0, 2], 1])
     np.testing.assert_allclose(expanded_quaternions.numpy()[:, 0], expanded_quaternions.numpy()[:, 1])
     passed = all(value > 1e-12 for value in first_gradients.values()) and final_mse < initial_mse / 100 and validation_rmse < 0.002
     passed = passed and center_error < 0.02 and covariance_error < 0.05 and axial_center_error < 0.02 and axial_scale_error < 0.05 and weight_error < 0.05
@@ -210,7 +210,7 @@ def main():
     print(f"Validation RMSE: {validation_rmse:.8g}; covariance relative error: {covariance_error:.8g}")
     print(f"Outputs: {output_path}")
     assert passed, "Density fit did not meet convergence/parameter-recovery checks; inspect metrics.json"
-    print("PASS: shared XY footprint and independent axial Gaussians recover the known target density.")
+    print("PASS: shared XZ footprint and independent axial Gaussians recover the known target density.")
 
 
 if __name__ == "__main__":

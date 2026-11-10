@@ -20,8 +20,8 @@ def save_columns(columns, output_path, iteration=0):
     optimizer = columns.column_optimizer
     arrays = {name: np.asarray(optimizer[name], dtype=np.float32) for name in parameter_names}
     scale_lower_bounds = {
-        'column_scale_xy': np.asarray(optimizer.bounds['column_scale_xy'][1]).reshape(2).tolist(),
-        'primitive_scale_z': float(optimizer.bounds['primitive_scale_z'][1]),
+        'column_scale_xz': np.asarray(optimizer.bounds['column_scale_xz'][1]).reshape(2).tolist(),
+        'primitive_scale_y': float(optimizer.bounds['primitive_scale_y'][1]),
     }
 
     metadata = {
@@ -58,8 +58,11 @@ def save_column_slices(columns, volume, volume_config, output_path, label='final
 
     parameters = {name: np.asarray(columns.parameters[name], dtype=np.float64) for name in parameter_names}
     matrix = np.asarray(volume_config.to_world.matrix, dtype=np.float64)
-    occupied_z = np.flatnonzero(np.any(np.abs(volume) > 1e-6, axis=(1, 2)))
-    lower, upper = (int(occupied_z[0]), int(occupied_z[-1])) if occupied_z.size else (0, volume.shape[0] - 1)
+    # Compare slices perpendicular to Y, preserving the original world transform.
+    volume = np.swapaxes(volume, 0, 1)
+    matrix = matrix[np.ix_([0, 2, 1, 3], [0, 2, 1, 3])]
+    occupied_y = np.flatnonzero(np.any(np.abs(volume) > 1e-6, axis=(1, 2)))
+    lower, upper = (int(occupied_y[0]), int(occupied_y[-1])) if occupied_y.size else (0, volume.shape[0] - 1)
     slice_indices = np.unique(np.linspace(lower, upper, 3).round().astype(int))
 
     pixel_y, pixel_x = np.meshgrid(np.arange(volume.shape[1]), np.arange(volume.shape[2]), indexing='ij')
@@ -71,21 +74,21 @@ def save_column_slices(columns, volume, volume_config, output_path, label='final
     evaluate_full_volume = volume.size <= 2_000_000
 
     footprints = []
-    for column_index in range(parameters['column_center_xy'].shape[1]):
-        offset_x, offset_y = world_x - parameters['column_center_xy'][0, column_index], world_y - parameters['column_center_xy'][1, column_index]
-        cosine, sine = np.cos(parameters['column_quaternions'][column_index]), np.sin(parameters['column_quaternions'][column_index])
-        column_scale_x, column_scale_y = parameters['column_scale_xy'][0, column_index], parameters['column_scale_xy'][1, column_index]
+    for column_index in range(parameters['column_center_xz'].shape[1]):
+        offset_x, offset_y = world_x - parameters['column_center_xz'][0, column_index], world_y - parameters['column_center_xz'][1, column_index]
+        cosine, sine = np.cos(parameters['column_quaternions'][column_index]), -np.sin(parameters['column_quaternions'][column_index])
+        column_scale_x, column_scale_y = parameters['column_scale_xz'][0, column_index], parameters['column_scale_xz'][1, column_index]
         footprints.append(np.exp(-0.5 * (((cosine * offset_x + sine * offset_y) / column_scale_x) ** 2 + ((-sine * offset_x + cosine * offset_y) / column_scale_y) ** 2)) / (2.0 * np.pi * column_scale_x * column_scale_y))
 
     evaluated_slices = range(volume.shape[0]) if evaluate_full_volume else slice_indices
     for slice_index in evaluated_slices:
-        world_z = matrix[2, 2] * ((slice_index + 0.5) / volume.shape[0]) + matrix[2, 3]
+        world_axis_y = matrix[2, 2] * ((slice_index + 0.5) / volume.shape[0]) + matrix[2, 3]
         reconstructed = np.zeros_like(world_x)
 
-        for column_index in range(parameters['column_center_xy'].shape[1]):
+        for column_index in range(parameters['column_center_xz'].shape[1]):
             start = column_index * columns.primitives_per_column
             indices = slice(start, start + columns.primitives_per_column)
-            profile = np.sum(parameters['primitive_opacity'][indices] * np.exp(-0.5 * ((world_z - parameters['primitive_center_z'][indices]) / parameters['primitive_scale_z'][indices]) ** 2) / (np.sqrt(2.0 * np.pi) * parameters['primitive_scale_z'][indices]))
+            profile = np.sum(parameters['primitive_opacity'][indices] * np.exp(-0.5 * ((world_axis_y - parameters['primitive_center_y'][indices]) / parameters['primitive_scale_y'][indices]) ** 2) / (np.sqrt(2.0 * np.pi) * parameters['primitive_scale_y'][indices]))
             reconstructed += footprints[column_index] * profile / volume_config.opacity_scale
 
         target = np.asarray(volume[slice_index], dtype=np.float64)
@@ -94,14 +97,14 @@ def save_column_slices(columns, volume, volume_config, output_path, label='final
         squared_error_sum += mse
         if lower <= slice_index <= upper:
             occupied_squared_error_sum += mse
-        metrics.append({'z_index': int(slice_index), 'mse': mse, 'psnr_db': float(-10.0 * np.log10(mse / intensity_peak ** 2)) if mse > 0.0 else None})
+        metrics.append({'y_index': int(slice_index), 'mse': mse, 'psnr_db': float(-10.0 * np.log10(mse / intensity_peak ** 2)) if mse > 0.0 else None})
 
         if slice_index not in slice_indices:
             continue
         for name, pixels, maximum in (('target', target, intensity_peak), ('reconstructed', reconstructed, intensity_peak), ('absolute_error', error, intensity_peak)):
             image = Image.fromarray(np.uint8(np.clip(pixels / maximum, 0.0, 1.0) * 255.0))
-            image.save(output_dir / f'{label}__z{slice_index:04d}__{name}.png')
-            panels.append((f'z={slice_index}: {name}', image))
+            image.save(output_dir / f'{label}__y{slice_index:04d}__{name}.png')
+            panels.append((f'y={slice_index}: {name}', image))
 
     panel_size = 256
     contact = Image.new('RGB', (3 * panel_size, len(slice_indices) * (panel_size + 25)), 'white')
@@ -114,7 +117,7 @@ def save_column_slices(columns, volume, volume_config, output_path, label='final
     contact.save(output_dir / f'{label}__slice_comparison.png')
 
     overall_mse = squared_error_sum / volume.shape[0] if evaluate_full_volume else None
-    occupied_z_mse = occupied_squared_error_sum / (upper - lower + 1) if evaluate_full_volume else None
+    occupied_y_mse = occupied_squared_error_sum / (upper - lower + 1) if evaluate_full_volume else None
 
     summary = {
         'label': label,
@@ -122,9 +125,9 @@ def save_column_slices(columns, volume, volume_config, output_path, label='final
         'full_volume_metrics_skip_reason': None if evaluate_full_volume else 'Volume exceeds 2,000,000 voxels; only three representative slices evaluated.',
         'overall_mse': overall_mse,
         'overall_psnr_db': float(-10.0 * np.log10(overall_mse / intensity_peak ** 2)) if overall_mse is not None and overall_mse > 0.0 else None,
-        'occupied_z_mse': occupied_z_mse,
-        'occupied_z_psnr_db': float(-10.0 * np.log10(occupied_z_mse / intensity_peak ** 2)) if occupied_z_mse is not None and occupied_z_mse > 0.0 else None,
-        'occupied_z_range': [lower, upper + 1],
+        'occupied_y_mse': occupied_y_mse,
+        'occupied_y_psnr_db': float(-10.0 * np.log10(occupied_y_mse / intensity_peak ** 2)) if occupied_y_mse is not None and occupied_y_mse > 0.0 else None,
+        'occupied_y_range': [lower, upper + 1],
         'slice_metrics': metrics,
         'density_convention': 'sum(weight * normalized Gaussian pdf) / volume opacity_scale',
         'support_convention': 'Analytic Gaussian tails are included in full; renderer uses finite ellipsoid AABBs and may differ near support boundaries.',
