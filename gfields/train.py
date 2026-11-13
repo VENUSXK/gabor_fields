@@ -205,6 +205,7 @@ if not args.skip_gaussian_optim:
     scene_dict = create_scene_dict_from_primitives(
         args.max_depth, GAUSS_LVL,
         use_columns_representation=args.use_columns_representation, columns=gaussian_columns,
+        use_column_bvh=args.use_column_bvh,
         **_integrator_scene_kwargs(), **gaussian_prims)
 
     for i, cam in enumerate(cameras):
@@ -212,6 +213,11 @@ if not args.skip_gaussian_optim:
 
     scene: mi.Scene = mi.load_dict(scene_dict)
     scene_params: mi.SceneParameters = mi.traverse(scene)
+
+    # report the actual acceleration primitive count for grouped geometry.
+    if args.use_column_bvh:
+        bvh_primitive_count = sum(shape.primitive_count() for shape in scene.shapes())
+        print(f'Column BVH: {bvh_primitive_count} bounds for {args.gauss_count} Gaussian primitives')
 
 
     # Create reference images (shared content-addressed cache: loaded from disk
