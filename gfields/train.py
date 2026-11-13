@@ -36,9 +36,9 @@ from gfields.training.callbacks import (
     GradientTrackerCallback,
     MetricsAccumulatorCallback,
     PlotCallback,
+    ColumnSlicesCallback,
 )
 from gfields.training.configs import get_volume_config
-from gfields.training.columns import save_column_slices
 from tqdm import tqdm
 from colorist import blue, yellow, green, effect_dim, Effect
 
@@ -273,6 +273,10 @@ if not args.skip_gaussian_optim:
         PlotCallback(columns=gaussian_columns),
         MetricsAccumulatorCallback()
     ])
+    if args.use_columns_representation:
+        callbacks.register_callbacks([
+            ColumnSlicesCallback(gaussian_columns, gauss_ref_volume, volume_config)
+        ])
     callbacks.setup()
 
 
@@ -392,7 +396,6 @@ if not args.skip_gaussian_optim:
     green("- Saving optimized model...")
     save_model(args.output, scene, level=GAUSS_LVL)
     if args.use_columns_representation:
-        save_column_slices(gaussian_columns, gauss_ref_volume, volume_config, args.output, label='final')
         render_metrics = {'initial': initial_render_metrics, 'final': column_render_metrics(ref_image, optimized), 'render_spp': args.ref_kernel_spp, 'render_seed': 0, 'parameters': gaussian_columns.parameter_stats()}
         (args.output / 'column_render_metrics.json').write_text(json.dumps(render_metrics, indent=2), encoding='utf-8')
 
