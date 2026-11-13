@@ -173,7 +173,8 @@ if not args.use_columns_representation and args.from_gaussian_checkpoint:
         yellow(f'Gaussian checkpoint not found at {ckpt_path}; optimizing Gaussian level from scratch.')
 
 if not args.skip_gaussian_optim:
-    blue(f'\n{Effect.BOLD}Starting Gaussian Level Regression{Effect.BOLD_OFF}')  # for better readability in the console
+    representation_name = 'Gaussian Column' if args.use_columns_representation else 'Gaussian'
+    blue(f'\n{Effect.BOLD}Starting {representation_name} Level Regression{Effect.BOLD_OFF}')  # for better readability in the console
     # Scene Creation
 
     # initialize volumetric primitive scene ----------------------------------------
@@ -196,7 +197,9 @@ if not args.skip_gaussian_optim:
         else:
             gaussian_prims = generate_random_kernels(
                 args.gauss_count, args.init_opacity, args.init_omega, args.init_scale, args.init_albedo,
-                level=GAUSS_LVL, target_level=args.gauss_target_level, importance_sample_means=args.importance_sample_means, volume=ref_volume, volume_config=volume_config, opacity_sampling_grid=gauss_ref_volume
+                level=GAUSS_LVL, target_level=args.gauss_target_level, importance_sample_means=args.importance_sample_means, volume=ref_volume, volume_config=volume_config, opacity_sampling_grid=gauss_ref_volume,
+                init_from_columns=args.init_from_columns, primitives_per_column=args.primitives_per_column,
+                column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset,
             )
 
     scene_dict = create_scene_dict_from_primitives(

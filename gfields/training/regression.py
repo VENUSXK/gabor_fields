@@ -130,6 +130,7 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--regen_pyramid',       action="store_true",         help='Re-generate the pyramid even if it already exists')
     parser.add_argument('--gauss_count',         type=int,   default=12**3,   help='Resolution of the 3D grid of volumetric primitives') # 16 for gabor
     parser.add_argument('--use_columns_representation', '--gaussian_columns', dest='use_columns_representation', action='store_true', help='Fit shared-XZ Gaussian columns (Gaussian stage only; expanded for rendering)')
+    parser.add_argument('--init_from_columns', action='store_true', help='Initialize independent Gaussians from expanded columns without sharing their optimization parameters')
     parser.add_argument('--column_count', type=int, default=64, help='Total number of shared XZ footprints, distributed among initialization slabs')
     parser.add_argument('--primitives_per_column', type=int, default=4, help='Number of axial Gaussian primitives per column')
     parser.add_argument('--column_slab_depth', type=int, default=0, help='Initialization slab depth in y voxels; 0 uses the complete occupied y range; tails remain unrestricted')
@@ -181,6 +182,15 @@ def setup() -> argparse.Namespace:
     # no-op and the raw --volume_grid/--output interface is used unchanged.
     from gfields.presets import build_train_argv
     args = parser.parse_args(build_train_argv(sys.argv[1:]))
+
+    if args.init_from_columns:
+        if args.use_columns_representation:
+            parser.error('--init_from_columns requires independent Gaussian optimization; omit --use_columns_representation')
+        if args.from_gaussian_checkpoint or args.skip_gaussian_optim:
+            parser.error('--init_from_columns requires fresh Gaussian initialization')
+        if args.column_count <= 0 or args.primitives_per_column <= 0 or args.column_slab_depth < 0:
+            parser.error('Column counts must be positive; column_slab_depth must be non-negative')
+        args.gauss_count = args.column_count * args.primitives_per_column
 
     if args.use_columns_representation:
         if args.from_gaussian_checkpoint:
@@ -597,51 +607,67 @@ def generate_random_columns(
     return columns
 
 
-def generate_random_kernels(num_kernels: int, init_opacities: float, init_omega: float, init_scale: float,
+def generate_random_kernels(
+    num_kernels: int, init_opacities: float, init_omega: float, init_scale: float,
+    init_albedo: float, level: int, importance_sample_means: bool = False,
+    volume: Optional[np.ndarray] = None, volume_config: Optional[VolumeConfig] = None,
+    opacity_sampling_grid: Optional[np.ndarray] = None, target_level: int = 0,
+    *, init_from_columns: bool = False, primitives_per_column: int = 4,
+    column_slab_depth: int = 0, seed_offset: int = 0,
+) -> Dict[str, mi.TensorXf]:
+    if init_from_columns:
+        if level != 0:
+            raise ValueError('Column initialization is supported only for Gaussian level 0')
+        if num_kernels <= 0 or primitives_per_column <= 0 or num_kernels % primitives_per_column:
+            raise ValueError('num_kernels must be positive and divisible by primitives_per_column')
+        column_volume = opacity_sampling_grid if opacity_sampling_grid is not None else volume
+        if column_volume is None or volume_config is None:
+            raise ValueError('Volume and volume_config must be provided for column initialization')
+        # Generate the shared layout using the existing column initializer.
+        initial_columns = generate_random_columns(
+            num_kernels // primitives_per_column, primitives_per_column, init_opacities, init_scale, init_albedo,
+            volume=column_volume, volume_config=volume_config,
+            column_slab_depth=column_slab_depth, seed_offset=seed_offset,
+        )
 
-                            init_albedo: float, level: int, importance_sample_means: bool = False,
-                            volume: Optional[np.ndarray] = None, volume_config: Optional[VolumeConfig] = None, opacity_sampling_grid: Optional[np.ndarray] = None, target_level: int = 0) -> Dict[str, mi.TensorXf]:
-    if importance_sample_means:
-        if volume is None or volume_config is None:
-            raise ValueError("Volume and volume_config must be provided for importance sampling.")
-        centers = importance_sample_positions(volume, volume_config, n_gmm=num_kernels, threshold=1e-6)
-        centers = np.ascontiguousarray(centers[:, ::-1])
+        # Expand the layout before copying it into independent scene arrays.
+        centers, scales, quaternions, opacities = initial_columns.expand()
+        centers = centers.numpy().T
+        scales = scales.numpy().T
+        quaternions = quaternions.numpy().T
+        opacities = opacities.numpy().reshape(num_kernels, 1)
+        omega = np.zeros((num_kernels, 1), dtype=np.float32)
     else:
-        centers = np.random.rand(num_kernels, 3) * 2.0 - 1.0
+        # Generate independent random geometry and opacity values.
+        if importance_sample_means:
+            if volume is None or volume_config is None:
+                raise ValueError("Volume and volume_config must be provided for importance sampling.")
+            centers = importance_sample_positions(volume, volume_config, n_gmm=num_kernels, threshold=1e-6)
+            centers = np.ascontiguousarray(centers[:, ::-1])
+        else:
+            centers = np.random.rand(num_kernels, 3) * 2.0 - 1.0
 
-    quaternions = mi.Point3f(np.random.rand(3, num_kernels) * 2 * np.pi)
-    quaternions = np.ascontiguousarray(dr.euler_to_quat(quaternions).numpy().T)
+        quaternions = mi.Point3f(np.random.rand(3, num_kernels) * 2 * np.pi)
+        quaternions = np.ascontiguousarray(dr.euler_to_quat(quaternions).numpy().T)
 
-    # omega = np.abs(np.random.randn(num_kernels, 1)) * 0.4 + init_omega
-    # scales = np.abs(np.random.randn(num_kernels, 3)) * 0.05 + init_scale
 
-    # uniform between nyquist of different levels
-    # scales = np.random.rand(num_kernels, 3) * (upper_scale_bound - nyquist_scale) + nyquist_scale
-    omega = np.random.rand(num_kernels, 1) * (1.5 - 0.7) + 0.7
+        omega = np.random.rand(num_kernels, 1) * (1.5 - 0.7) + 0.7
 
-    if target_level == 0:
-        nyquist_scale = gaussian_nyquist_spatial_scale(-1, 1, volume.shape, eps=0.25) * 1.5 * 4
-    else:
-        nyquist_scale = gaussian_min_spatial_scale(2, -1, 1)
-    upper_scale_bound = gaussian_min_spatial_scale(3, -1, 1)
+        if target_level == 0:
+            nyquist_scale = gaussian_nyquist_spatial_scale(-1, 1, volume.shape, eps=0.25) * 1.5 * 4
+        else:
+            nyquist_scale = gaussian_min_spatial_scale(2, -1, 1)
+        upper_scale_bound = gaussian_min_spatial_scale(3, -1, 1)
 
-    scales = reflect_bounds(
-        np.random.randn(num_kernels, 3) / 3 * (upper_scale_bound - nyquist_scale) + nyquist_scale,
-        min_val=nyquist_scale, max_val=upper_scale_bound
-    )
-    # L = np.array([[0.30909814, 0., 0., 0.],
-    #               [0.06358993, 0.30143564, 0., 0.],
-    #               [0.06638153, 0.05370173, 0.29809306, 0.],
-    #               [-0.05714649, -0.04542464, -0.04118995, 0.2398241]])
-    # mu = np.array([-3.4845378, -3.4861038, -3.4865131, 0.40290555])
+        scales = reflect_bounds(
+            np.random.randn(num_kernels, 3) / 3 * (upper_scale_bound - nyquist_scale) + nyquist_scale,
+            min_val=nyquist_scale, max_val=upper_scale_bound
+        )
 
-    # scales, omega = sample_joint_lognormal(mu, L, num_kernels)
+        opacities = (np.random.randn(num_kernels, 1) * 0.25 + 1) * init_opacities
 
+    # Build the same scene arrays for either initialization method.
     albedo = np.ones((num_kernels, 3)) * init_albedo
-    # omega = np.ones_like(omega) * init_omega
-
-    opacities = (np.random.randn(num_kernels, 1) * 0.25 + 1) * init_opacities
-
     return {
         'centers': mi.TensorXf(centers), 'scales': mi.TensorXf(scales), 'quaternions': mi.TensorXf(quaternions),
         'opacities': mi.TensorXf(opacities), 'albedo': mi.TensorXf(albedo), 'omega': mi.TensorXf(omega)

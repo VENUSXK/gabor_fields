@@ -127,6 +127,43 @@ class ColumnTrainingTests(unittest.TestCase):
         write_optimizer_params_to_scene(opt, params, level=0)
         np.testing.assert_allclose(params['primitives_pyr0.data'].numpy(), original_geometry, atol=1e-6)
 
+    def test_column_initialization_without_shared_gaussian_updates(self):
+        from gfields.training.regression import (
+            generate_random_columns, generate_random_kernels, create_scene_dict_from_primitives,
+            write_scene_params_to_optimizer,
+        )
+        from gfields.training.configs import GenericConfig
+
+        arrays = generate_random_kernels(
+            8, self.arguments.init_opacity, 0.0, self.arguments.init_scale,
+            self.arguments.init_albedo, level=0, volume=self.volume,
+            volume_config=GenericConfig(), init_from_columns=True,
+            primitives_per_column=2, column_slab_depth=4,
+        )
+        expected = generate_random_columns(
+            4, 2, self.arguments.init_opacity, self.arguments.init_scale,
+            self.arguments.init_albedo, volume=self.volume,
+            volume_config=GenericConfig(), column_slab_depth=4,
+        ).expand()
+        for key, value in zip(('centers', 'scales', 'quaternions'), expected[:3]):
+            np.testing.assert_array_equal(arrays[key].numpy(), value.numpy().T)
+        np.testing.assert_array_equal(arrays['opacities'].numpy().reshape(-1), expected[3].numpy())
+        np.testing.assert_array_equal(arrays['omega'].numpy(), np.zeros((8, 1)))
+        scene = mi.load_dict(create_scene_dict_from_primitives(-1, 0, **arrays))
+        opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
+        write_scene_params_to_optimizer(mi.traverse(scene), opt, level=0)
+        self.assertNotIn('column_center_xz', opt)
+
+        # Equal initial X positions can receive different independent updates.
+        before = opt['centers_0'][0].numpy().copy()
+        np.testing.assert_allclose(before[0], before[1])
+        weights = mi.Float([1, 0, 0, 0, 0, 0, 0, 0])
+        dr.backward(dr.sum(opt['centers_0'][0] * weights))
+        opt.step()
+        after = opt['centers_0'][0].numpy()
+        self.assertNotEqual(float(after[0]), float(before[0]))
+        self.assertEqual(float(after[1]), float(before[1]))
+
     def test_regularization_preserves_scalar_loss_and_image_gradient(self):
         from gfields.training.regression import opacity_scale_regularization
         for level, use_columns in ((0, False), (1, True)):
