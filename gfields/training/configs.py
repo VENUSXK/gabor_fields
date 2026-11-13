@@ -38,8 +38,14 @@ def get_volume_config(path: str, opacity_scale: float | None = None) -> VolumeCo
     typos rather than silently mis-scaling a known asset.
     """
     p = path.lower()
-    if "bunny" in p:
-        cfg: VolumeConfig = BunnyConfig()
+    if "thin_layer" in p:
+        # Read NPY dimensions without loading the full volume into memory.
+        volume = np.load(path, mmap_mode="r", allow_pickle=False)
+        shape = volume.shape
+        del volume
+        cfg: VolumeConfig = ThinLayerConfig(shape)
+    elif "bunny" in p:
+        cfg = BunnyConfig()
     elif "wdas" in p:
         cfg = DisneyConfig()
     elif "cloudy" in p:
@@ -164,6 +170,24 @@ class FireConfig(VolumeConfig):
     opacity_scale = 15.0
 
 
+class ThinLayerConfig(VolumeConfig):
+    """Unpadded Y-thin volume with equal voxel spacing on all axes."""
+
+    name = "thin_layer"
+    opacity_scale = 10.0
+
+    def __init__(self, shape: tuple[int, int, int]) -> None:
+        # Use the actual NPY dimensions in Z, Y, X order.
+        if len(shape) != 3 or any(size <= 0 for size in shape):
+            raise ValueError(f'Thin-layer volumes require a non-empty 3D array in (Z,Y,X) order; got {shape}')
+        self.shape = tuple(shape)
+        self.max_dim = max(self.shape)
+
+        # Preserve equal voxel spacing and center the volume at the origin.
+        self.volume_scale = 2.0 * np.array(self.shape[::-1]) / self.max_dim
+        self.to_world = Transform().scale(self.volume_scale.tolist()).translate(-0.5)
+
+
 class GenericConfig(VolumeConfig):
     """Fallback for volumes without a named config: isotropic 2-unit cube.
 
@@ -180,6 +204,7 @@ __all__ = [
     "VolumeConfig",
     "get_volume_config",
     "GenericConfig",
+    "ThinLayerConfig",
     "BunnyConfig",
     "CloudConfig",
     "CloudyConfig",
