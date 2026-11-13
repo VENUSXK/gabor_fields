@@ -183,6 +183,8 @@ def setup() -> argparse.Namespace:
     args = parser.parse_args(build_train_argv(sys.argv[1:]))
 
     if args.use_columns_representation:
+        if args.from_gaussian_checkpoint:
+            parser.error('Column training starts from generated parameters; checkpoint loading is disabled')
         if args.column_count <= 0 or args.primitives_per_column <= 0 or args.column_slab_depth < 0 or args.column_lr <= 0:
             parser.error('Column counts and learning rate must be positive; column_slab_depth must be non-negative')
         if args.skip_gaussian_optim or args.from_gabor_checkpoint or args.post_refine or args.post_prune or args.post_clamp:
@@ -901,7 +903,7 @@ def create_scene_dict_from_primitives(
     albedo: Optional[mi.TensorXf] = None,
     omega: Optional[mi.TensorXf] = None,
     use_columns_representation: bool = False,
-    gaussian_columns: Optional[GaussianColumn] = None,
+    columns: Optional[GaussianColumn] = None,
     extent: float = 3.0,
     integrator_type: str = 'gfields_tomography',
     use_kernel_freeze: bool = False,
@@ -914,7 +916,7 @@ def create_scene_dict_from_primitives(
         max_depth: Maximum integrator depth (-1 for unlimited)
         level: Pyramid level index
         use_columns_representation: Expand shared columns instead of independent arrays.
-        gaussian_columns: Shared column parameters to expand instead of supplying
+        columns: Shared column parameters to expand instead of supplying
             centers, scales, quaternions, opacities, albedo, and omega separately.
         centers: (N, 3) primitive center positions
         scales: (N, 3) primitive scale parameters
@@ -934,21 +936,21 @@ def create_scene_dict_from_primitives(
     """
     # Expand shared columns into primitive arrays before creating the scene.
     if use_columns_representation:
-        if gaussian_columns is None:
+        if columns is None:
             raise ValueError('Gaussian column parameters are required for column representation')
         if any(value is not None for value in (centers, scales, quaternions, opacities, albedo, omega)):
             raise ValueError('Provide either Gaussian columns or independent primitive arrays')
-        expanded_centers, expanded_scales, expanded_quaternions, primitive_opacity = gaussian_columns.expand()
+        expanded_centers, expanded_scales, expanded_quaternions, primitive_opacity = columns.expand()
         primitive_count = dr.width(primitive_opacity)
         centers = mi.TensorXf(expanded_centers.numpy().T)
         scales = mi.TensorXf(expanded_scales.numpy().T)
         quaternions = mi.TensorXf(expanded_quaternions.numpy().T)
         opacities = mi.TensorXf(primitive_opacity.numpy().reshape(primitive_count, 1))
-        albedo = mi.TensorXf(np.full((primitive_count, 3), getattr(gaussian_columns, 'init_albedo', 0.0)))
+        albedo = mi.TensorXf(np.full((primitive_count, 3), getattr(columns, 'init_albedo', 0.0)))
         omega = mi.TensorXf(np.zeros((primitive_count, 1), dtype=np.float32))
     else:
         # Independent primitives supply all scene arrays directly.
-        if gaussian_columns is not None:
+        if columns is not None:
             raise ValueError('Enable use_columns_representation to use Gaussian columns')
         if any(value is None for value in (centers, scales, quaternions, opacities, albedo, omega)):
             raise ValueError('All independent primitive arrays are required')
@@ -994,18 +996,18 @@ def create_scene_dict_from_primitives(
 
 
 def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optimizer, level: int,
-                                    args: Optional[argparse.Namespace] = None,
-                                    gaussian_columns: Optional[GaussianColumn] = None) -> None:
+                                    use_columns_representation: bool = False,
+                                    columns: Optional[GaussianColumn] = None) -> None:
     """Read shared column or independent primitive parameters from the scene."""
     primitive_name = f'primitives_pyr{level}'
     ellipsoids = Ellipsoid.unravel(params[f'{primitive_name}.data'])
-    if args is not None and args.use_columns_representation and level == 0:
-        if gaussian_columns is None:
+    if use_columns_representation and level == 0:
+        if columns is None:
             raise ValueError('Gaussian column layout is required for column optimization')
 
         # Select one representative primitive for each shared XZ footprint.
         primitive_count = dr.width(ellipsoids.center)
-        primitives_per_column = gaussian_columns.primitives_per_column
+        primitives_per_column = columns.primitives_per_column
         if primitive_count % primitives_per_column:
             raise ValueError('Scene primitive count does not match the column layout')
         indices = dr.arange(mi.UInt32, primitive_count // primitives_per_column) * primitives_per_column
@@ -1018,7 +1020,7 @@ def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optim
         opt['primitive_center_y'] = ellipsoids.center.y
         opt['primitive_scale_y'] = ellipsoids.scale.y
         opt['primitive_opacity'] = params[f'{primitive_name}.opacities']
-        gaussian_columns.column_optimizer = opt
+        columns.column_optimizer = opt
     else:
         # Copy independent primitive parameters to the optimizer.
         opt[f'centers_{level}'] = ellipsoids.center
@@ -1031,18 +1033,18 @@ def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optim
 
 def configure_optimizer(opt: mi.ad.Optimizer, args: argparse.Namespace,
                         lr_dict: Dict[str, float], level: int,
-                        gaussian_columns: Optional[GaussianColumn] = None) -> None:
+                        columns: Optional[GaussianColumn] = None) -> None:
     """Set learning rates and Gaussian parameter bounds for the selected mode."""
     opt.set_learning_rate(lr_dict)
     if args.use_columns_representation and level == 0:
-        if gaussian_columns is None:
+        if columns is None:
             raise ValueError('Gaussian column layout is required for column bounds')
 
         # Constrain shared XZ parameters and independent Y parameters.
         opt.set_bounds('column_center_xz', lower=-1.0, upper=1.0)
-        opt.set_bounds('column_scale_xz', lower=mi.Vector2f(*gaussian_columns.scale_lower_bounds['column_scale_xz']), upper=1.0)
+        opt.set_bounds('column_scale_xz', lower=mi.Vector2f(*columns.scale_lower_bounds['column_scale_xz']), upper=1.0)
         opt.set_bounds('primitive_center_y', lower=-1.0, upper=1.0)
-        opt.set_bounds('primitive_scale_y', lower=float(gaussian_columns.scale_lower_bounds['primitive_scale_y']), upper=1.0)
+        opt.set_bounds('primitive_scale_y', lower=float(columns.scale_lower_bounds['primitive_scale_y']), upper=1.0)
         opt.set_bounds('primitive_opacity', lower=1e-8, upper=1.0)
     else:
         # Constrain independent Gaussian geometry and freeze its frequency.
@@ -1054,15 +1056,19 @@ def configure_optimizer(opt: mi.ad.Optimizer, args: argparse.Namespace,
 
 
 def write_optimizer_params_to_scene(opt: mi.ad.Optimizer, params: mi.SceneParameters, level: int,
-                                    gaussian_columns: Optional[GaussianColumn] = None) -> None:
+                                    use_columns_representation: bool = False,
+                                    columns: Optional[GaussianColumn] = None) -> None:
     """
     Write the optimized parameters to the params dictionary for the given level.
     Expand column parameters or normalize independent primitive quaternions.
     """
     primitive_name = f'primitives_pyr{level}'
-    if gaussian_columns is not None:
+    if use_columns_representation and level == 0:
+        if columns is None:
+            raise ValueError('Gaussian column parameters are required for column representation')
+
         # Expand shared column parameters into scene primitives.
-        centers, scales, quaternions, primitive_opacity = gaussian_columns.expand()
+        centers, scales, quaternions, primitive_opacity = columns.expand()
         params[f'{primitive_name}.data'] = Ellipsoid.ravel(centers, scales, quaternions)
         params[f'{primitive_name}.opacities'] = primitive_opacity
         params[f'{primitive_name}.omega'] = dr.zeros(mi.Float, dr.width(primitive_opacity))
@@ -1155,102 +1161,6 @@ def load_optimizer_state(opt: 'gfields.optimizers.BoundedAdam', ckpt_path: Path,
         opt.state[key] = (val, b, lr, (type(t)(t_val), type(m)(m_np), type(v)(v_np), *rest))
         restored += 1
     return restored
-
-
-def load_columns(checkpoint_path, args, opt=None):
-    """Load column parameters and optionally restore an existing optimizer."""
-    parameter_names = GaussianColumn.parameter_names
-    path = Path(checkpoint_path)
-    candidates = (path, path / 'columns.npz', path / 'npy_data' / 'columns.npz', path / 'optimized_asset_pyr0' / 'npy_data' / 'columns.npz')
-    path = next((candidate for candidate in candidates if candidate.is_file() and candidate.suffix == '.npz'), None)
-    if path is None:
-        raise FileNotFoundError('Column checkpoint columns.npz is required; expanded Gaussian assets do not preserve sharing')
-
-    with np.load(path, allow_pickle=False) as archive:
-        # Normalize legacy parameter names, including Adam moment arrays.
-        legacy_names = {
-            'density_weights': 'primitive_opacity',
-            'center_x': 'column_center_x',
-            'center_y': 'column_center_z',
-            'scale_x': 'column_scale_x',
-            'scale_y': 'column_scale_z',
-            'rotation_angle': 'column_quaternions',
-            'column_rotation_angle': 'column_quaternions',
-            'axial_centers': 'primitive_center_y',
-            'axial_scales': 'primitive_scale_y',
-        }
-        archive = {
-            legacy_names.get(name.split('__', 1)[0], name.split('__', 1)[0])
-            + ('__' + name.split('__', 1)[1] if '__' in name else ''): archive[name].copy()
-            for name in archive.files
-        }
-        metadata = json.loads(str(archive['metadata']))
-        if metadata.get('format') not in ('gaussian_columns_v1', 'gaussian_columns_v2'):
-            raise ValueError('Unsupported column checkpoint format')
-
-        if 'column_center_xy' in archive or 'primitive_center_z' in archive:
-            raise ValueError('This checkpoint uses Z-axis columns; Y-axis training requires a new checkpoint')
-
-        # Older checkpoints stored this count under components_per_column.
-        if 'primitives_per_column' not in metadata:
-            metadata['primitives_per_column'] = metadata['components_per_column']
-
-        # Normalize legacy bounds and optimizer step metadata.
-        for field in ('scale_lower_bounds', 'adam_steps'):
-            if field in metadata:
-                metadata[field] = {legacy_names.get(name, name): value for name, value in metadata[field].items()}
-
-        # Merge legacy scalar XY parameters and their Adam moments.
-        for grouped, x_name, y_name in (
-            ('column_center_xz', 'column_center_x', 'column_center_z'),
-            ('column_scale_xz', 'column_scale_x', 'column_scale_z'),
-        ):
-            if grouped in archive:
-                continue
-            archive[grouped] = np.stack((archive[x_name], archive[y_name]))
-            for suffix in ('__first_moment', '__second_moment', '__maximum_moment'):
-                if x_name + suffix in archive and y_name + suffix in archive:
-                    archive[grouped + suffix] = np.stack((archive[x_name + suffix], archive[y_name + suffix]))
-            steps = metadata.get('adam_steps', {})
-            if x_name in steps and y_name in steps:
-                if steps[x_name] != steps[y_name]:
-                    raise ValueError('Legacy XY Adam step counts must match')
-                steps[grouped] = steps[x_name]
-            bounds = metadata.get('scale_lower_bounds', {})
-            if x_name in bounds and y_name in bounds:
-                bounds[grouped] = [bounds[x_name], bounds[y_name]]
-
-        parameters = {name: archive[name].copy() for name in parameter_names}
-        columns_count = parameters['column_center_xz'].shape[1]
-        axial_count = columns_count * metadata['primitives_per_column']
-        for name in parameter_names:
-            expected_count = axial_count if name in ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity') else columns_count
-            expected_shape = (2, expected_count) if name in ('column_center_xz', 'column_scale_xz') else (expected_count,)
-            if parameters[name].shape != expected_shape or not np.isfinite(parameters[name]).all():
-                raise ValueError(f'Invalid column checkpoint parameter {name}')
-
-    # Load parameters without creating an optimizer.
-    parameter_types = {'column_center_xz': mi.Point2f, 'column_scale_xz': mi.Vector2f}
-    parameters = {name: parameter_types.get(name, mi.Float)(values) for name, values in parameters.items()}
-    columns = GaussianColumn(parameters, metadata['primitives_per_column'], metadata.get('scale_lower_bounds'))
-    columns.init_albedo = float(metadata.get('init_albedo', 0.0))
-    # Restore exact parameters and Adam state when an optimizer is available.
-    if opt is not None:
-        for name in parameter_names:
-            opt[name] = type(opt[name])(archive[name])
-            value, promoted, learning_rate, extra = opt.state[name]
-            step, first_moment, second_moment, *rest = extra
-            if f'{name}__first_moment' not in archive:
-                continue
-            restored_rest = [type(rest[0])(archive[f'{name}__maximum_moment'])] if rest and rest[0] is not None and f'{name}__maximum_moment' in archive else rest
-            opt.state[name] = (value, promoted, learning_rate, (
-                type(step)(metadata['adam_steps'][name]),
-                type(first_moment)(archive[f'{name}__first_moment']),
-                type(second_moment)(archive[f'{name}__second_moment']), *restored_rest
-            ))
-        columns.column_optimizer = opt
-
-    return columns, int(metadata.get('iteration', 0))
 
 
 def load_single_level(path: Path, level: int) -> Dict[str, np.ndarray]:
@@ -1940,9 +1850,9 @@ def visualize_slices(original, gaussian, aggregated, mode = 'slice'):
     plt.show()
 
 
-def plot_loss(data: List[float], label: str, output_file: Path) -> None:
+def plot_loss(data: List[float], label: str, output_file: Path, iterations=None) -> None:
     fig, ax = plt.subplots(figsize=(4, 4))
-    ax.plot(data)
+    ax.plot(iterations if iterations is not None else np.arange(1, len(data) + 1), data)
     fig.canvas.toolbar_visible = 'fade-in-fade-out'
     fig.canvas.footer_visible = False
     fig.canvas.header_visible = False
@@ -1979,23 +1889,17 @@ class GradientTracker:
             if var_name not in self.statistics:
                 self.statistics[var_name] = defaultdict(list)
             stats = self.statistics[var_name]
-            # Collect statistics for the variable
-            varm = dr.select(dr.isnan(var), 0, var)
-            varm = dr.select(dr.isnan(var), dr.mean(varm), varm)
-            stats["min"].append(dr.min(var)[0])
-            stats["max"].append(dr.max(var)[0])
-            stats["mean"].append(dr.mean(var)[0])
-
-            # Collect statistics for the gradient of the variable
-            grad = dr.grad(var)
-            grad = dr.select(dr.isnan(grad), dr.mean(dr.mean(grad)), grad)
-            grad_norm = dr.norm(grad) if len(grad.shape) > 1 else dr.abs(grad)
-            norm_np = grad_norm.numpy()
-            grad_mean = np.mean(norm_np[norm_np < 5])
-            stats["grad_mean"].append(grad_mean)
-            stats["grad_variance"].append(np.mean(grad_norm ** 2) - grad_mean ** 2)
-            stats["grad_min"].append(dr.min(grad)[0])
-            stats["grad_max"].append(dr.max(grad)[0])
+            # Reduce every component of scalar and vector parameters on the CPU.
+            values = np.nan_to_num(var.numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+            gradients = np.nan_to_num(dr.grad(var).numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+            norms = np.linalg.norm(gradients, axis=0) if gradients.ndim > 1 else np.abs(gradients)
+            stats['min'].append(float(values.min()))
+            stats['max'].append(float(values.max()))
+            stats['mean'].append(float(values.mean()))
+            stats['grad_mean'].append(float(norms.mean()))
+            stats['grad_variance'].append(float(norms.var()))
+            stats['grad_min'].append(float(gradients.min()))
+            stats['grad_max'].append(float(gradients.max()))
 
     def plot_statistics(self, output_dir: Path) -> None:
         """
@@ -2005,6 +1909,9 @@ class GradientTracker:
             return
         output_dir.mkdir(parents=True, exist_ok=True)
         for var_name, stats in self.statistics.items():
+            # Persist scalar histories alongside the gradient plots.
+            for name, values in stats.items():
+                np.save(output_dir / f'{var_name}_{name}.npy', np.asarray(values))
             fig, ax_left  = plt.subplots(figsize=(10, 6))
             x = np.arange(len(stats["grad_mean"])) + 1
             m = np.array(stats["grad_mean"])

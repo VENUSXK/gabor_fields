@@ -1,6 +1,5 @@
 """Focused checks for shared-footprint training and a native LS smoke-test crop."""
 import argparse
-import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -44,35 +43,19 @@ def make_arguments():
     return SimpleNamespace(use_columns_representation=True, column_count=4, primitives_per_column=2, column_slab_depth=4, column_lr=0.01, centers_lr=1.0, scales_lr=1.0, quats_lr=1.0, opacity_lr=1.0, init_scale=1.0, init_opacity=0.01, init_albedo=0.0)
 
 
-def setup_column_optimizer(columns, learning_rates, checkpoint_path=None):
-    from gfields.training.regression import load_columns
+def setup_column_optimizer(columns, learning_rates):
     from gfields.training.regression import (
         create_scene_dict_from_primitives, write_scene_params_to_optimizer, configure_optimizer,
     )
-    scene = mi.load_dict(create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, gaussian_columns=columns))
+    scene = mi.load_dict(create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, columns=columns))
     opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
     args = make_arguments()
-    write_scene_params_to_optimizer(mi.traverse(scene), opt, level=0, args=args, gaussian_columns=columns)
-    configure_optimizer(opt, args, learning_rates, level=0, gaussian_columns=columns)
-    if checkpoint_path is not None:
-        load_columns(checkpoint_path, args, opt=opt)
+    write_scene_params_to_optimizer(mi.traverse(scene), opt, level=0, use_columns_representation=args.use_columns_representation, columns=columns)
+    configure_optimizer(opt, args, learning_rates, level=0, columns=columns)
     return opt
 
 
 class ColumnTrainingTests(unittest.TestCase):
-    def test_checkpoint_statistics_with_suspended_gradients(self):
-        from gfields.training.columns import save_columns
-        expected_count = self.arguments.column_count * (5 + 3 * self.arguments.primitives_per_column)
-        with tempfile.TemporaryDirectory() as directory:
-            # Training saves checkpoints inside a suspended-gradient scope.
-            with dr.suspend_grad():
-                stats = self.columns.parameter_stats()
-                save_columns(self.columns, directory, iteration=2)
-            self.assertEqual(stats['trainable_parameter_count'], expected_count)
-            path = Path(directory) / 'optimized_asset_pyr0' / 'npy_data' / 'columns.npz'
-            with np.load(path, allow_pickle=False) as archive:
-                metadata = json.loads(str(archive['metadata']))
-                self.assertEqual(metadata['trainable_parameter_bytes'], 4 * expected_count)
 
     def test_y_padding_initializes_columns_along_the_100_active_layers(self):
         from gfields.training.regression import generate_random_columns
@@ -127,7 +110,7 @@ class ColumnTrainingTests(unittest.TestCase):
             create_scene_dict_from_primitives, write_scene_params_to_optimizer,
             configure_optimizer, write_optimizer_params_to_scene,
         )
-        column_scene = create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, gaussian_columns=self.columns)
+        column_scene = create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, columns=self.columns)
         primitive_arrays = {name: column_scene['primitives_pyr0'][name]
                             for name in ('centers', 'scales', 'quaternions', 'opacities', 'albedo', 'omega')}
         scene = mi.load_dict(create_scene_dict_from_primitives(-1, 0, use_anyhit=True, **primitive_arrays))
@@ -135,7 +118,7 @@ class ColumnTrainingTests(unittest.TestCase):
         original_geometry = params['primitives_pyr0.data'].numpy().copy()
         opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
         args = SimpleNamespace(use_columns_representation=False)
-        write_scene_params_to_optimizer(params, opt, level=0, args=args)
+        write_scene_params_to_optimizer(params, opt, level=0, use_columns_representation=args.use_columns_representation)
         configure_optimizer(opt, args, {'centers_0': 0.02}, level=0)
         self.assertIn('centers_0', opt)
         self.assertNotIn('column_center_xz', opt)
@@ -171,52 +154,6 @@ class ColumnTrainingTests(unittest.TestCase):
                         np.testing.assert_allclose(dr.grad(opt[f'opacities_{level}']).numpy(), 0.1)
                         np.testing.assert_allclose(dr.grad(opt[f'scales_{level}']).numpy(), scale_weight)
 
-    def test_legacy_separate_xy_checkpoint_restores_adam_state(self):
-        from gfields.training.columns import save_columns
-        from gfields.training.regression import load_columns
-        opt = self.columns.column_optimizer
-
-        def step(current):
-            dr.clear_grad(current.variables)
-            dr.backward(dr.sum(dr.square(current['column_center_xz']), axis=None)
-                        + dr.sum(dr.square(current['column_scale_xz']), axis=None)
-                        + dr.sum(dr.square(current['primitive_opacity'])))
-            current.step()
-
-        step(opt)
-        with tempfile.TemporaryDirectory() as directory:
-            save_columns(self.columns, directory, iteration=1)
-            path = Path(directory) / 'optimized_asset_pyr0' / 'npy_data' / 'columns.npz'
-            with np.load(path, allow_pickle=False) as archive:
-                arrays = {name: archive[name].copy() for name in archive.files}
-            metadata = json.loads(str(arrays['metadata']))
-            metadata['format'] = 'gaussian_columns_v1'
-
-            # Recreate the former scalar XY parameters, bounds, and Adam arrays.
-            for grouped, x_name, y_name in (
-                ('column_center_xz', 'column_center_x', 'column_center_z'),
-                ('column_scale_xz', 'column_scale_x', 'column_scale_z'),
-            ):
-                for suffix in ('', '__first_moment', '__second_moment'):
-                    x_values, y_values = arrays.pop(grouped + suffix)
-                    arrays[x_name + suffix], arrays[y_name + suffix] = x_values, y_values
-                steps = metadata['adam_steps']
-                steps[x_name] = steps[y_name] = steps.pop(grouped)
-            lower_x, lower_y = metadata['scale_lower_bounds'].pop('column_scale_xz')
-            metadata['scale_lower_bounds'].update(column_scale_x=lower_x, column_scale_z=lower_y)
-            for suffix in ('', '__first_moment', '__second_moment'):
-                arrays['density_weights' + suffix] = arrays.pop('primitive_opacity' + suffix)
-            metadata['adam_steps']['density_weights'] = metadata['adam_steps'].pop('primitive_opacity')
-            arrays['metadata'] = np.asarray(json.dumps(metadata))
-            np.savez(path, **arrays)
-
-            restored, iteration = load_columns(path, self.arguments)
-            self.assertEqual(iteration, 1)
-            restored_opt = setup_column_optimizer(restored, self.learning_rates, checkpoint_path=path)
-            step(opt)
-            step(restored_opt)
-            for name in opt.keys():
-                np.testing.assert_array_equal(opt[name].numpy(), restored_opt[name].numpy())
 
     def test_shared_footprint_and_positive_initialization(self):
         centers, scales, quaternions, weights = self.columns.expand()
@@ -243,15 +180,13 @@ class ColumnTrainingTests(unittest.TestCase):
             np.testing.assert_allclose(lower.reshape(-1), np.asarray(half_voxel).reshape(-1))
             self.assertTrue(np.all(columns.column_optimizer[name].numpy() >= lower))
 
-    def test_render_gradient_and_raw_checkpoint_round_trip(self):
-        from gfields.training.columns import save_columns
-        from gfields.training.regression import load_columns
+    def test_render_gradient_after_each_optimizer_step(self):
         from gfields.training.regression import create_scene_dict_from_primitives, write_optimizer_params_to_scene
-        scene_dict = create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, gaussian_columns=self.columns)
+        scene_dict = create_scene_dict_from_primitives(-1, 0, use_anyhit=True, use_columns_representation=True, columns=self.columns)
         scene_dict["sensor"] = {"type": "orthographic", "to_world": mi.ScalarTransform4f.look_at(origin=[0, 0, -4], target=[0, 0, 0], up=[0, 1, 0]), "film": {"type": "hdrfilm", "width": 16, "height": 16, "rfilter": {"type": "box"}}, "sampler": {"type": "independent", "sample_count": 2}}
         scene = mi.load_dict(scene_dict)
         scene_params = mi.traverse(scene)
-        write_optimizer_params_to_scene(self.columns.column_optimizer, scene_params, level=0, gaussian_columns=self.columns)
+        write_optimizer_params_to_scene(self.columns.column_optimizer, scene_params, level=0, use_columns_representation=True, columns=self.columns)
         optimizer = self.columns.column_optimizer
         # Reuse the scene graph written after each step for the next render.
         for iteration in range(3):
@@ -266,41 +201,54 @@ class ColumnTrainingTests(unittest.TestCase):
                 self.assertGreater(float(np.abs(gradient).sum()), 0.0)
             original_opacity = optimizer['primitive_opacity'].numpy().copy()
             optimizer.step()
-            write_optimizer_params_to_scene(optimizer, scene_params, level=0, gaussian_columns=self.columns)
+            write_optimizer_params_to_scene(optimizer, scene_params, level=0, use_columns_representation=True, columns=self.columns)
             self.assertGreater(float(np.abs(optimizer['primitive_opacity'].numpy() - original_opacity).sum()), 0.0)
-        checkpoint_root = Path(__file__).resolve().parents[2] / "results" / "column_test_results"
-        checkpoint_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=checkpoint_root) as temporary_path:
-            save_columns(self.columns, Path(temporary_path), iteration=7)
-            restored, iteration = load_columns(Path(temporary_path), self.arguments)
-            self.assertIsNone(restored.column_optimizer)
-            setup_column_optimizer(restored, self.learning_rates, checkpoint_path=Path(temporary_path))
-            self.assertEqual(iteration, 7)
-            self.assertEqual(restored.primitives_per_column, self.columns.primitives_per_column)
-            for name in optimizer.bounds:
-                for restored_bound, original_bound in zip(restored.column_optimizer.bounds[name], optimizer.bounds[name]):
-                    np.testing.assert_array_equal(np.asarray(restored_bound), np.asarray(original_bound))
-            for name in optimizer.keys():
-                np.testing.assert_array_equal(restored.column_optimizer[name].numpy(), optimizer[name].numpy())
-            for original, loaded in zip(self.columns.expand(), restored.expand()):
-                np.testing.assert_array_equal(original.numpy(), loaded.numpy())
-            for current_optimizer in (optimizer, restored.column_optimizer):
-                dr.clear_grad(current_optimizer.variables)
-                dr.backward(dr.sum(dr.square(current_optimizer["primitive_opacity"])))
-                current_optimizer.step()
-            for name in optimizer.keys():
-                np.testing.assert_array_equal(restored.column_optimizer[name].numpy(), optimizer[name].numpy())
 
-    def test_expanded_asset_without_column_sidecar_is_rejected(self):
-        from gfields.training.regression import load_columns
-        checkpoint_root = Path(__file__).resolve().parents[2] / "results" / "column_test_results"
-        checkpoint_root.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=checkpoint_root) as temporary_path:
-            asset_path = Path(temporary_path) / "optimized_asset_pyr0" / "npy_data"
-            asset_path.mkdir(parents=True)
-            np.save(asset_path / "centers.npy", np.zeros((8, 3), dtype=np.float32))
-            with self.assertRaisesRegex(FileNotFoundError, "do not preserve sharing"):
-                load_columns(Path(temporary_path), self.arguments)
+    def test_column_diagnostics_and_metric_exports(self):
+        from gfields.training.callbacks import Callbacks, PlotCallback, MetricsAccumulatorCallback, GradientTrackerCallback
+        opt = self.columns.column_optimizer
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(output=Path(directory), use_columns_representation=True, track_grads=True)
+            plots = PlotCallback(columns=self.columns)
+            gradients = GradientTrackerCallback()
+            callbacks = Callbacks(args, 0)
+            callbacks.register_callbacks([gradients, plots, MetricsAccumulatorCallback()])
+            callbacks.setup()
+            dr.clear_grad(opt.variables)
+            dr.backward(dr.sum(dr.square(opt['column_center_xz']), axis=None)
+                        + dr.sum(dr.square(opt['primitive_opacity'])))
+            callbacks.on_before_opt_step(1, opt)
+            with dr.suspend_grad():
+                before, after = plots._column_histogram_data()
+                np.testing.assert_allclose(before['density'], after['density'], rtol=1e-6)
+                np.testing.assert_array_equal(before['opacities'], after['opacities'])
+                self.assertEqual(before['scales'].size, 2 * dr.width(opt['column_center_xz']) + dr.width(opt['primitive_scale_y']))
+                self.assertEqual(after['scales'].size, 3 * dr.width(opt['primitive_scale_y']))
+                callbacks.on_suspend_grad(9, opt, {'loss': 0.5, 'PSNR': 20.0})
+                callbacks.on_optim_end()
+            output = Path(directory)
+            for stage in ('before_expansion', 'after_expansion'):
+                for metric in ('density', 'scales', 'opacities'):
+                    self.assertTrue((output / 'stats_0' / stage / f'{metric}_histogram_pyr0_0010.png').is_file())
+            np.testing.assert_allclose(np.load(output / 'psnr_pyr0.npy'), [20.0])
+            np.testing.assert_allclose(np.loadtxt(output / 'npy_txt' / 'psnr_pyr0.txt'), 20.0)
+            self.assertTrue((output / 'psnr_pyr0.png').is_file())
+            history = output / 'stats_0' / 'column_center_xz_grad_mean.npy'
+            self.assertTrue(np.isfinite(np.load(history)).all())
+            self.assertTrue((output / 'npy_txt' / 'stats_0' / history.with_suffix('.txt').name).is_file())
+            self.assertFalse(list(output.rglob('*.npz')))
+
+    def test_gradient_tracking_disabled(self):
+        from gfields.training.callbacks import GradientTrackerCallback
+        with tempfile.TemporaryDirectory() as directory:
+            callback = GradientTrackerCallback()
+            callback.args = SimpleNamespace(output=Path(directory), track_grads=False)
+            callback.level = 0
+            callback.setup()
+            callback.on_before_opt_step(0, self.columns.column_optimizer)
+            callback.on_optim_end()
+            self.assertEqual(callback.gradient_tracker.statistics, {})
+            self.assertFalse((Path(directory) / 'stats_0').exists())
 
 
 if __name__ == "__main__":

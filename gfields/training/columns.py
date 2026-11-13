@@ -13,42 +13,6 @@ from gfields.integrators.common import GaussianColumn
 parameter_names = GaussianColumn.parameter_names
 
 
-def save_columns(columns, output_path, iteration=0):
-    checkpoint_dir = Path(output_path) / 'optimized_asset_pyr0' / 'npy_data'
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    optimizer = columns.column_optimizer
-    arrays = {name: np.asarray(optimizer[name], dtype=np.float32) for name in parameter_names}
-    scale_lower_bounds = {
-        'column_scale_xz': np.asarray(optimizer.bounds['column_scale_xz'][1]).reshape(2).tolist(),
-        'primitive_scale_y': float(optimizer.bounds['primitive_scale_y'][1]),
-    }
-
-    metadata = {
-        'format': 'gaussian_columns_v2',
-        'primitives_per_column': columns.primitives_per_column,
-        'iteration': int(iteration),
-        'init_albedo': getattr(columns, 'init_albedo', 0.0),
-        'scale_lower_bounds': scale_lower_bounds,
-        'adam_steps': {},
-        **columns.parameter_stats()
-    }
-
-    for name, (_, _, _, extra) in optimizer.state.items():
-        step, first_moment, second_moment, *rest = extra
-        metadata['adam_steps'][name] = int(np.asarray(step).reshape(-1)[0])
-        arrays[f'{name}__first_moment'] = np.asarray(first_moment)
-        arrays[f'{name}__second_moment'] = np.asarray(second_moment)
-        if rest and rest[0] is not None:
-            arrays[f'{name}__maximum_moment'] = np.asarray(rest[0])
-
-    arrays['metadata'] = np.asarray(json.dumps(metadata))
-    temporary_path = checkpoint_dir / 'columns.tmp.npz'
-    np.savez(temporary_path, **arrays)
-    temporary_path.replace(checkpoint_dir / 'columns.npz')
-    (checkpoint_dir / 'column_metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
-
-
 def save_column_slices(columns, volume, volume_config, output_path, label='final'):
     if volume_config.opacity_scale <= 0.0:
         raise ValueError('Column density diagnostics require a positive opacity_scale')

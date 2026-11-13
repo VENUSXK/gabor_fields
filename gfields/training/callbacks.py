@@ -87,16 +87,34 @@ class GradientTrackerCallback(CallbackABC):
         if (epoch + 1) % 10 == 0:
             self.gradient_tracker.plot_statistics(self.args.output / f"stats_{self.level}")
 
+    def on_optim_end(self) -> None:
+        self.gradient_tracker.plot_statistics(self.args.output / f"stats_{self.level}")
+
+
+def export_npy_to_txt(output_path: Path) -> None:
+    """Mirror numeric NPY files as text, preserving relative paths and shapes."""
+    import numpy as np
+
+    output_path = Path(output_path)
+    for path in output_path.rglob('*.npy'):
+        values = np.load(path, allow_pickle=False)
+        target = output_path / 'npy_txt' / path.relative_to(output_path).with_suffix('.txt')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rows = values.reshape(-1, values.shape[-1]) if values.ndim > 1 and values.shape[-1] else values.reshape(-1, 1)
+        np.savetxt(target, rows, fmt='%.18e', header=f'shape: {values.shape}')
+
 
 class MetricsAccumulatorCallback(CallbackABC):
     """Accumulates per-iteration scalar metrics and dumps plots + ``.npy`` files."""
 
     def __init__(self) -> None:
         self.metrics: Dict[str, List[float]] = defaultdict(list)
+        self.iterations: List[int] = []
 
     def on_suspend_grad(self, epoch: int, opt, metrics: Dict[str, float]) -> None:  # noqa: ANN001
         import numpy as np
 
+        self.iterations.append(epoch + 1)
         for key, value in metrics.items():
             if not isinstance(value, float):
                 raise TypeError(f"Expected float metric '{key}', got {type(value)}")
@@ -112,7 +130,7 @@ class MetricsAccumulatorCallback(CallbackABC):
 
         ref_path = Path(".") / "hierarchical_gabor_outputs" / "bunny_32x300"
         for metric, values in self.metrics.items():
-            plot_loss(values, label=metric, output_file=self.args.output / f"{metric.lower()}_pyr{self.level}.png")
+            plot_loss(values, label=metric, output_file=self.args.output / f"{metric.lower()}_pyr{self.level}.png", iterations=self.iterations)
             np.save(self.args.output / f"{metric.lower()}_pyr{self.level}.npy", np.array(values))
 
             if ref_path.exists() and (npy_file := ref_path / f"{metric.lower()}_pyr{self.level}.npy").exists():
@@ -124,9 +142,36 @@ class MetricsAccumulatorCallback(CallbackABC):
                 plt.savefig(self.args.output / f"{metric.lower()}_comparison_pyr{self.level}.png")
                 plt.close()
 
+        export_npy_to_txt(self.args.output)
+
 
 class PlotCallback(CallbackABC):
     """Periodic histogram plots of opacities / scales / density / Gabor frequency."""
+
+    def __init__(self, columns=None) -> None:
+        self.columns = columns
+
+    def _column_histogram_data(self):
+        import numpy as np
+
+        # Count shared footprint scales once before expansion.
+        parameters = self.columns.parameters
+        shared_scales = parameters['column_scale_xz'].numpy()
+        axial_scales = parameters['primitive_scale_y'].numpy()
+        opacity = parameters['primitive_opacity'].numpy()
+        area = np.repeat(np.prod(shared_scales, axis=0), self.columns.primitives_per_column)
+        density = opacity / ((2.0 * np.pi) ** 1.5 * area * axial_scales)
+        before = {'opacities': opacity, 'scales': np.concatenate((shared_scales.reshape(-1), axial_scales)),
+                  'column_scale_xz': shared_scales.reshape(-1), 'primitive_scale_y': axial_scales,
+                  'density': density}
+
+        # Use expanded primitive geometry for the matching Gaussian histograms.
+        _, scales, _, expanded_opacity = self.columns.expand()
+        expanded_scales = scales.numpy()
+        expanded_opacity = expanded_opacity.numpy()
+        after = {'opacities': expanded_opacity, 'scales': expanded_scales.reshape(-1),
+                 'density': expanded_opacity / ((2.0 * np.pi) ** 1.5 * np.prod(expanded_scales, axis=0))}
+        return before, after
 
     def on_suspend_grad(self, epoch: int, opt, metrics: Dict[str, float]) -> None:  # noqa: ANN001
         import drjit as dr
@@ -142,32 +187,45 @@ class PlotCallback(CallbackABC):
         if (epoch + 1) % 10 != 0 and epoch != 0:
             return
 
+        if getattr(self.args, 'use_columns_representation', False) and self.level == 0:
+            for stage, values in zip(('before_expansion', 'after_expansion'), self._column_histogram_data()):
+                for name, data in values.items():
+                    self._make_histogram(epoch + 1, name, data, stage=stage, bins=100)
+            return
+
         density: mi.Float = opt[f"opacities_{self.level}"] / (
             dr.sqrt(8.0 * dr.pi * dr.pi * dr.pi) * dr.prod(opt[f"scales_{self.level}"])
         )
-        self._make_histogram(epoch + 1, "Density", density.numpy(), bins=100, range=(-5, 5))
+        self._make_histogram(epoch + 1, "Density", density.numpy(), bins=100)
         self._make_histogram(
             epoch + 1,
             "opacities",
             opt[f"opacities_{self.level}"].numpy().reshape(-1),
             bins=100,
-            range=(-0.025, 0.025),
         )
         self._make_histogram(
             epoch + 1,
             "scales",
             opt[f"scales_{self.level}"].numpy().reshape(-1),
             bins=100,
-            range=(0, 0.4),
         )
 
-    def _make_histogram(self, epoch: int, name: str, data, **kwargs: Any) -> None:
+    def _make_histogram(self, epoch: int, name: str, data, stage=None, **kwargs: Any) -> None:
         import matplotlib.pyplot as plt
+        import numpy as np
 
+        data = np.asarray(data).reshape(-1)
+        data = data[np.isfinite(data)]
+        if not data.size:
+            return
+        plt.figure()
         plt.hist(data, **kwargs, density=True)
         plt.title(f"{name} Histogram it={epoch:04d}")
-        (self.args.output / f"stats_{self.level}").mkdir(exist_ok=True)
-        plt.savefig(self.args.output / f"stats_{self.level}" / f"{name}_histogram_pyr{self.level}_{epoch:04d}.png")
+        output = self.args.output / f"stats_{self.level}"
+        if stage is not None:
+            output /= stage
+        output.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output / f"{name}_histogram_pyr{self.level}_{epoch:04d}.png")
         plt.close()
 
 
