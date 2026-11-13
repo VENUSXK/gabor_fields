@@ -1,6 +1,6 @@
 [submodule "mitsuba3"]
 	path = submodules/mitsuba3
-	url = https://github.com/Arcanous98/mitsuba3_gfields
+	url = https://github.com/VENUSXK/mitsuba3_gfields
 	branch = main
 [submodule "submodules/volprim"]
 	path = submodules/volprim
