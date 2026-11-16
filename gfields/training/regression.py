@@ -900,7 +900,8 @@ def create_lr_dict(args: argparse.Namespace, global_lr: float, level: int) -> Di
         lr_dict['column_center_xz']      = global_lr * args.centers_lr
         lr_dict['column_scale_xz']       = global_lr * args.scales_lr
         lr_dict['column_quaternions'] = global_lr * args.quats_lr
-        lr_dict['primitive_center_y']    = global_lr * args.centers_lr
+        # keep primitive y centers at their initialized slab positions
+        lr_dict['primitive_center_y']    = 0.0
         lr_dict['primitive_scale_y']     = global_lr * args.scales_lr
         lr_dict['primitive_opacity']       = global_lr * args.opacity_lr
     else:
