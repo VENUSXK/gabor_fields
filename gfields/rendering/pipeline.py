@@ -11,7 +11,7 @@ This module owns the public functions used by every rendering CLI:
 * ``AssetInfo`` / ``SteerableAssetInfo`` dataclasses
 * ``detect_asset_info`` / ``load_steerable_asset`` (steerable detection lives in
   ``gfields.io.is_steerable_asset``)
-* ``load_pyramid_level`` -- build an ``ellipsoidsmesh`` scene-dict entry
+* ``load_pyramid_level`` -- build mesh or grouped analytic ellipsoid geometry
 * ``create_integrator_config`` -- build a hierarchical PRB or tomography integrator
 * ``create_environment_config`` -- envmap or constant emitter setup
 * ``envmap_to_world_transform`` -- shared transform helper
@@ -58,6 +58,9 @@ class AssetInfo:
     # Empty unless pruning is active; consumed by the render CLIs as a
     # ``primitive_subset`` when building each level's scene entry.
     prune_masks: Dict[int, Any] = field(default_factory=dict)
+    # retain the representation and fixed group size for each ply level.
+    use_columns_representation: bool = False
+    primitives_per_column: Dict[int, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
         extent_summary: Dict[int, Any] = {}
@@ -68,7 +71,8 @@ class AssetInfo:
                 extent_summary[lvl] = ext
         return (
             f"AssetInfo(path={self.path}, levels={self.num_levels}, "
-            f"primitives={self.num_primitives}, extents={extent_summary})"
+            f"primitives={self.num_primitives}, extents={extent_summary}, "
+            f"use_columns_representation={self.use_columns_representation}, primitives_per_column={self.primitives_per_column})"
         )
 
 
@@ -95,7 +99,7 @@ class SteerableAssetInfo:
         )
 
 
-def detect_asset_info(asset_path: str | os.PathLike[str]) -> AssetInfo:
+def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False) -> AssetInfo:
     """Auto-detect a pyramid asset's structure (num levels, primitive counts, extents).
 
     Reads the unified per-level store ``<asset>/data/root.primitives_pyr*.ply``.
@@ -112,11 +116,16 @@ def detect_asset_info(asset_path: str | os.PathLike[str]) -> AssetInfo:
                   if os.path.isdir(ply_folder) else [])
     if ply_levels:
         num_levels = 1 + max(ply_levels)
-        has_omega, has_albedo, num_primitives, extents = {}, {}, {}, {}
+        has_omega, has_albedo, num_primitives, extents, primitives_per_column = {}, {}, {}, {}, {}
         for level in range(num_levels):
             a = gfields.io.load_ellipsoid_ply(
-                os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"))
-            num_primitives[level] = len(a["centers"])
+                os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation)
+            # count expanded primitives without discarding their column layout.
+            if use_columns_representation:
+                num_primitives[level] = len(a['primitive_center_y'])
+                primitives_per_column[level] = a['primitives_per_column']
+            else:
+                num_primitives[level] = len(a['centers'])
             has_omega[level] = "omega" in a
             has_albedo[level] = "albedo" in a
             ext = a.get("extent")
@@ -125,12 +134,15 @@ def detect_asset_info(asset_path: str | os.PathLike[str]) -> AssetInfo:
         return AssetInfo(
             path=asset_path, npy_folder=os.path.join(asset_path, "npy_data"),
             ply_folder=ply_folder, num_levels=num_levels, has_omega=has_omega,
-            has_albedo=has_albedo, num_primitives=num_primitives, extents=extents)
+            has_albedo=has_albedo, num_primitives=num_primitives, extents=extents,
+            use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
     npy_levels = (gfields.io.npy_asset_levels(npy_folder)
                   if os.path.isdir(npy_folder) else [])
+    if npy_levels and use_columns_representation:
+        raise ValueError('Column representation requires a PLY with metadata, column, and primitive elements')
     if npy_levels:
         num_levels = 1 + max(npy_levels)
         has_omega, has_albedo, num_primitives, extents = {}, {}, {}, {}
@@ -153,11 +165,11 @@ def detect_asset_info(asset_path: str | os.PathLike[str]) -> AssetInfo:
     )
 
 
-def _ellipsoidsmesh_entry(
+def _ellipsoids_entry(
     *, centers, scales, quaternions, opacities, omega, albedo, extent,
-    visibility_mask: int,
+    visibility_mask: int, use_columns_representation=False, primitives_per_column=1,
 ) -> Dict[str, Any]:
-    """Pack per-primitive numpy arrays into an ``ellipsoidsmesh`` scene-dict entry.
+    """Pack per-primitive arrays into mesh or grouped analytic ellipsoid geometry.
 
     Shared by :func:`load_pyramid_level` and :func:`load_steerable_asset`; all
     array args are numpy (scales already applied by the caller). ``extent`` is a
@@ -169,7 +181,7 @@ def _ellipsoidsmesh_entry(
     n = int(np.asarray(centers).reshape(-1, 3).shape[0])
     extent_value: Any = (mi.TensorXf(np.asarray(extent, np.float32).reshape(-1, 1))
                          if isinstance(extent, np.ndarray) else float(extent))
-    return {
+    entry = {
         "type": "ellipsoidsmesh",
         "shell": "uv_sphere",
         "centers": mi.TensorXf(np.ravel(centers), shape=(n, 3)),
@@ -181,6 +193,13 @@ def _ellipsoidsmesh_entry(
         "extent": extent_value,
         "visibility_mask": visibility_mask,
     }
+
+    # reuse the same tensors and select the grouped analytic geometry when requested.
+    if use_columns_representation:
+        entry['type'] = 'ellipsoids'
+        entry.pop('shell')
+        entry['primitives_per_column'] = primitives_per_column
+    return entry
 
 
 def load_steerable_asset(
@@ -250,7 +269,7 @@ def load_steerable_asset(
         else:
             albedo_values = np.ones((n_prims, 3), dtype=np.float32) * float(albedo_scale)
 
-        primitives_dict[subband_key] = _ellipsoidsmesh_entry(
+        primitives_dict[subband_key] = _ellipsoids_entry(
             centers=centers, scales=scales, quaternions=quaternions,
             opacities=opacities, omega=omega, albedo=albedo_values, extent=extent,
             visibility_mask=subband_info["visibility_mask"])
@@ -288,18 +307,38 @@ def load_pyramid_level(
     albedo_rgb: Optional[List[float]] = None,
     use_asset_albedo: bool = False,
 ) -> Dict[str, Any]:
-    """Build an ``ellipsoidsmesh`` scene-dict entry for one pyramid level."""
+    """Build mesh or grouped analytic geometry for one pyramid level."""
     num_prims = asset_info.num_primitives[level]
+    use_columns_representation = asset_info.use_columns_representation
+    primitives_per_column = asset_info.primitives_per_column.get(level, 1)
     import gfields.io
     if getattr(asset_info, "ply_folder", None):
         a = gfields.io.load_ellipsoid_ply(
-            os.path.join(asset_info.ply_folder, f"root.primitives_pyr{level}.ply"))
+            os.path.join(asset_info.ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation)
     elif getattr(asset_info, "npy_folder", None):
         # Deprecated legacy per-array npy_data/ layout (emits a DeprecationWarning).
         a = gfields.io.load_ellipsoid_npy_level(asset_info.npy_folder, level)
     else:
         raise ValueError(
             f"Asset {asset_info.path} has no data/*.ply store or legacy npy_data/ dir.")
+    if use_columns_representation:
+        import mitsuba as mi
+        from gfields.integrators.common import GaussianColumn
+
+        # restore the shared parameter layout without creating an optimizer.
+        parameters = {name: mi.Float(a[name]) for name in ('column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'primitive_opacity')}
+        parameters['column_center_xz'] = mi.Point2f(a['column_center_xz'].T)
+        parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
+        if a['primitives_per_column'] != primitives_per_column or len(a['primitive_center_y']) != num_prims:
+            raise ValueError('Column PLY layout changed after asset detection')
+        columns = GaussianColumn(parameters, primitives_per_column)
+
+        # reuse column expansion before the common rendering transformations.
+        centers, scales, quaternions, opacities = columns.expand()
+        a = {'centers': centers.numpy().T, 'scales': scales.numpy().T, 'quaternions': quaternions.numpy().T,
+             'opacities': opacities.numpy(), 'omega': np.zeros(num_prims, dtype=np.float32),
+             'albedo': np.broadcast_to(a['albedo'], (num_prims, 3)).copy(), 'extent': a['extent']}
+
     centers, scales, quaternions = a["centers"], a["scales"], a["quaternions"]
     # Opacity column name varies by producer (regression -> 'opacities',
     # optimize_hierarchical -> 'sigma_t'); accept either.
@@ -319,6 +358,16 @@ def load_pyramid_level(
         albedo = np.ascontiguousarray(asset_albedo, dtype=np.float32).reshape(num_prims, 3)
     else:
         albedo = np.ones((num_prims, 3), dtype=np.float32)
+
+    if primitive_subset is not None and use_columns_representation:
+        # allow complete column selections only, preserving contiguous child order.
+        selected = np.asarray(np.arange(num_prims)[primitive_subset])
+        if selected.ndim != 1 or not selected.size or selected.size % primitives_per_column:
+            raise ValueError('Column rendering requires a non-empty selection of complete columns')
+        groups = selected.reshape(-1, primitives_per_column)
+        expected = (groups[:, :1] // primitives_per_column) * primitives_per_column + np.arange(primitives_per_column)
+        if not np.array_equal(groups, expected):
+            raise ValueError('Primitive selection splits or reorders children inside a column; select complete columns')
 
     if primitive_subset is not None:
         centers = np.ascontiguousarray(centers[primitive_subset])
@@ -347,11 +396,11 @@ def load_pyramid_level(
     else:
         extent_out = float(extent)
 
-    return _ellipsoidsmesh_entry(
+    return _ellipsoids_entry(
         centers=centers, scales=scales, quaternions=quaternions,
         opacities=opacities * opacity_scale, omega=omega,
         albedo=albedo * albedo_scale, extent=extent_out,
-        visibility_mask=2 ** level)
+        visibility_mask=2 ** level, use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
 
 
 # ---------------------------------------------------------------------------

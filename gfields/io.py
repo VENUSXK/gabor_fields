@@ -63,7 +63,7 @@ def get_plugin_type(obj):
         return class_to_plugin[cname]
     return cname.lower()  # e.g. 'EllipsoidsMesh' -> 'ellipsoidsmesh'
 
-def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False):
+def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False, use_columns_representation=False):
     '''
     Generate a Python asset that contains a dictionary that represents a Mitsuba
     scene.
@@ -112,10 +112,15 @@ def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False):
 
             os.makedirs(join(output_folder, 'data'), exist_ok=True)
             filename = join(output_folder, 'data', f'{path}.ply')
-            ellipsoid_dict_to_ply(d, extras_keys, filename)
+            # choose the ply layout from the dictionary without passing a column object.
+            save_as_columns = use_columns_representation and 'column_center_xz' in d
+            ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=save_as_columns)
 
+            # remove serialized arrays from the generated asset dictionary.
             for k in extras_keys + ['centers', 'scales', 'quaternions']:
-                del d[k]
+                d.pop(k, None)
+            if save_as_columns:
+                d.pop('primitives_per_column', None)
             d['filename'] = filename
 
         for k, v in d.items():
@@ -367,14 +372,67 @@ def object_to_dict(root):
     return cb._dict['root']
 
 
-def load_ellipsoid_ply(filename):
-    '''Inverse of `ellipsoid_dict_to_ply`: read an ellipsoid `.ply` (the 3DGS
-    layout written by `dict_to_asset`) back into raw per-primitive numpy arrays,
-    undoing the log-scale and (i,j,k,r)->(r,i,j,k) quaternion reordering. Returns
-    a dict `{centers, scales, quaternions, <extras: opacities, omega, albedo,
-    extent, ...>}` matching the per-array npy format the pipeline used to store.'''
+def load_ellipsoid_ply(filename, use_columns_representation=False):
+    """Read shared column parameters or decode the existing Gaussian vertex layout."""
     import plyfile
-    v = plyfile.PlyData.read(str(filename))['vertex'].data
+
+    # read the file once and select the requested representation.
+    ply = plyfile.PlyData.read(str(filename))
+    element_names = {element.name for element in ply.elements}
+    if use_columns_representation:
+        required_fields = {
+            'metadata': ('format_version', 'primitives_per_column', 'extent', 'albedo_r', 'albedo_g', 'albedo_b'),
+            'column': ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle'),
+            'primitive': ('center_y', 'scale_y', 'opacity'),
+        }
+
+        # reject incomplete tables before interpreting the parameter arrays.
+        for name, fields in required_fields.items():
+            if name not in element_names:
+                raise ValueError(f'Column PLY requires a {name!r} element; use_columns_representation must match the file format')
+            missing_fields = set(fields) - set(ply[name].data.dtype.names)
+            if missing_fields:
+                raise ValueError(f'Column PLY element {name!r} is missing fields: {sorted(missing_fields)}')
+
+        # restore file-wide settings and the fixed-size column layout.
+        if len(ply['metadata'].data) != 1:
+            raise ValueError('Column PLY must contain exactly one metadata record')
+        metadata = ply['metadata'].data[0]
+        if int(metadata['format_version']) != 1:
+            raise ValueError(f'Unsupported column PLY version: {metadata["format_version"]}')
+        columns, primitives = ply['column'].data, ply['primitive'].data
+        primitives_per_column = int(metadata['primitives_per_column'])
+        if primitives_per_column <= 0 or not len(columns) or len(primitives) != len(columns) * primitives_per_column:
+            raise ValueError('Column PLY primitive count must equal column count times primitives_per_column')
+
+        # preserve physical scales and map the saved angle to the existing class key.
+        out = {
+            'column_center_xz': np.stack((columns['center_x'], columns['center_z']), axis=-1).astype(np.float32),
+            'column_scale_xz': np.stack((columns['scale_x'], columns['scale_z']), axis=-1).astype(np.float32),
+            'column_quaternions': columns['rotation_angle'].astype(np.float32),
+            'primitive_center_y': primitives['center_y'].astype(np.float32),
+            'primitive_scale_y': primitives['scale_y'].astype(np.float32),
+            'primitive_opacity': primitives['opacity'].astype(np.float32),
+        }
+
+        # reject non-finite geometry and invalid positive scale parameters.
+        if not all(np.isfinite(values).all() for values in out.values()):
+            raise ValueError('Column PLY parameters must be finite')
+        if np.any(out['column_scale_xz'] <= 0) or np.any(out['primitive_scale_y'] <= 0):
+            raise ValueError('Column PLY scales must be positive')
+        extent = float(metadata['extent'])
+        albedo = np.array([metadata['albedo_r'], metadata['albedo_g'], metadata['albedo_b']], dtype=np.float32)
+        if not np.isfinite(extent) or extent <= 0 or not np.isfinite(albedo).all():
+            raise ValueError('Column PLY requires a finite positive extent and finite RGB albedo')
+
+        # return compact parameters without expanding or creating an optimizer.
+        out.update(primitives_per_column=primitives_per_column, extent=extent, albedo=albedo)
+        return out
+
+    # keep gaussian log-scale and quaternion decoding unchanged.
+    if 'vertex' not in element_names:
+        raise ValueError('Gaussian PLY requires a vertex element; use use_columns_representation=True for a column PLY')
+    v = ply['vertex'].data
     names = set(v.dtype.names)
 
     def cols(prefix, n):

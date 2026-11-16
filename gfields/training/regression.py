@@ -1132,29 +1132,34 @@ def write_optimizer_params_to_scene(opt: mi.ad.Optimizer, params: mi.SceneParame
 
 # region I/O
 
-def save_model(output_path: Path, scene: mi.Scene, level: int) -> None:
-    """
-    Save the final optimized model to the output path in numpy format.
-    The folder structure is created as follows:
-    - output_path/optimized_asset_pyr{level}/
-        - npy_data/
-            - omega_pyr{0..level}.npy
-            - centers_pyr{0..level}.npy
-            - scales_pyr{0..level}.npy
-            - quaternions_pyr{0..level}.npy
-            - opacities_pyr{0..level}.npy
-            - albedo_pyr{0..level}.npy
-        - data/
-            - root.primitives_pyr{0..level}.ply
-        - __init__.py
-    """
+def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_representation=False, columns=None) -> None:
+    """Save a scene asset, optionally storing its Gaussian level as shared columns."""
+    if use_columns_representation and (columns is None or level != 0):
+        raise ValueError('Column PLY export requires shared column parameters at Gaussian level 0')
+
+    # reuse scene traversal and the existing asset directory layout.
     asset_dir = output_path / f'optimized_asset_pyr{level}'
-    (asset_dir / 'npy_data').mkdir(parents=True, exist_ok=True)  # opt_state (Adam moments) still lives here
+    (asset_dir / 'npy_data').mkdir(parents=True, exist_ok=True)
     final_asset = gfields.io.object_to_dict(scene)
-    # Canonical asset storage: one .ply per pyramid level under <asset>/data/
-    # (packs centers/scales/quaternions/opacities/omega/albedo/extent). The
-    # former per-array npy_data/*_pyr*.npy duplicated this and has been retired.
-    gfields.io.dict_to_asset(final_asset, str(asset_dir))
+
+    if use_columns_representation:
+        # replace expanded geometry with the original shared parameter arrays.
+        primitive = final_asset[f'primitives_pyr{level}']
+        parameters = columns.parameters
+        for name in ('centers', 'scales', 'quaternions', 'opacities', 'omega', 'filename'):
+            primitive.pop(name, None)
+        primitive['column_center_xz'] = np.asarray(parameters['column_center_xz'], dtype=np.float32).T.copy()
+        primitive['column_scale_xz'] = np.asarray(parameters['column_scale_xz'], dtype=np.float32).T.copy()
+
+        # carry the remaining column data through the same primitive dictionary.
+        primitive['column_rotation_angle'] = np.asarray(parameters['column_quaternions'], dtype=np.float32).reshape(-1).copy()
+        for name in ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity'):
+            primitive[name] = np.asarray(parameters[name], dtype=np.float32).reshape(-1).copy()
+        primitive['primitives_per_column'] = columns.primitives_per_column
+
+    # select the output representation without passing columns to the ply writer.
+    gfields.io.dict_to_asset(final_asset, str(asset_dir), use_columns_representation=use_columns_representation)
+
 
 
 def save_optimizer_state(opt: 'gfields.optimizers.BoundedAdam', output_path: Path, level: int) -> None:

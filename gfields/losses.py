@@ -183,6 +183,28 @@ def l1(reference, image) -> mi.Float:
     return dr.mean(dr.abs(reference - image), axis=None)
 
 
+def gradient_l1(reference, image, num_cams: int = 1) -> mi.TensorXf:
+    """Evaluate mean horizontal/vertical gradient error without autodiff.
+
+    Images have shape [height, camera_width * num_cams, channels]. Camera
+    boundaries are excluded; a spatial axis of length one contributes zero.
+    Lower values indicate closer image gradients, with zero for an exact match.
+    """
+    # validate image dimensions and separate horizontally packed cameras
+    if reference.shape != image.shape or len(image.shape) != 3:
+        raise ValueError('gradient_l1 requires matching [height, width, channels] images.')
+    height, width, channels = image.shape
+    if num_cams < 1 or width % num_cams or min(height, width, channels) < 1:
+        raise ValueError('gradient_l1 requires nonempty images and equal-width cameras.')
+    camera_width = width // num_cams
+    with dr.suspend_grad():
+        error = dr.reshape(mi.TensorXf, reference - image, shape=(height, num_cams, camera_width, channels))
+        # compare adjacent pixels within each camera without tracking gradients
+        horizontal = dr.mean(dr.abs(error[:, :, 1:, :] - error[:, :, :-1, :]), axis=None) if camera_width > 1 else mi.TensorXf(0.0)
+        vertical = dr.mean(dr.abs(error[1:, :, :, :] - error[:-1, :, :, :]), axis=None) if height > 1 else mi.TensorXf(0.0)
+        return (horizontal + vertical) * 0.5
+
+
 def l2(reference, image) -> mi.Float:
     '''
     L2 loss function

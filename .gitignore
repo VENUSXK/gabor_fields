@@ -1,6 +1,7 @@
 data/ls_data/
 
 ## jinghe
+data/thin_layer
 data/laoshan
 *.log
 

@@ -177,6 +177,7 @@ def parse_args():
                         help='Render Gaussian pyramid of the asset')
     parser.add_argument('--render_pyramid_laplacian', action='store_true',
                         help='Render Laplacian pyramid of the asset')
+    parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
     parser.add_argument('--multiple_scattering', action='store_true',
                         help='Enable multiple scattering rendering')
     parser.add_argument('--no_nee', action='store_true',
@@ -391,6 +392,7 @@ def _video_parse_args() -> argparse.Namespace:
         prog='gfields.render video',
         description='Env-map-lit turntable / rotating-envmap video of an asset')
     p.add_argument('asset', help='Optimized asset directory (unified data/root.primitives_pyr*.ply layout)')
+    p.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
     p.add_argument('--motion', choices=['turntable', 'envmap'],
                    default='turntable', help='Camera orbit or rotating env map')
     p.add_argument('--envmap', default=str(default_envmap),
@@ -445,7 +447,7 @@ def _video_build_scene_dict(args, asset_dir) -> dict:
     from gfields.rendering.pipeline import (
         detect_asset_info, load_pyramid_level, create_integrator_config,
         create_environment_config)
-    info = detect_asset_info(str(asset_dir))
+    info = detect_asset_info(str(asset_dir), use_columns_representation=args.use_columns_representation)
     scene_dict: dict = {
         'type': 'scene',
         'integrator': create_integrator_config(
@@ -568,6 +570,8 @@ def main():
 
     # Check if this is a steerable asset
     if is_steerable_asset(args.asset):
+        if args.use_columns_representation:
+            raise ValueError('Column representation cannot be used with a steerable asset')
         print("=" * 60)
         print("Steerable Asset Detected")
         print("=" * 60)
@@ -575,7 +579,7 @@ def main():
         return
     
     # Detect pyramid asset structure
-    asset_info = detect_asset_info(args.asset)
+    asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation)
     print(f"Detected asset: {asset_info}")
     
     # One-shot pre-render refinement (opt-in, non-destructive): adaptively clamp
@@ -598,8 +602,12 @@ def main():
             for level in range(asset_info.num_levels):
                 # Load scales, omega, opacities for this level from the unified
                 # per-level .ply store.
-                a = gfields.io.load_ellipsoid_ply(
-                    os.path.join(asset_info.ply_folder, f'root.primitives_pyr{level}.ply'))
+                # reuse column expansion for refinement instead of reading the vertex layout.
+                if asset_info.use_columns_representation:
+                    a = load_pyramid_level(asset_info, level, extent=asset_info.extents[level], use_asset_albedo=True)
+                else:
+                    a = gfields.io.load_ellipsoid_ply(
+                        os.path.join(asset_info.ply_folder, f'root.primitives_pyr{level}.ply'))
                 scales = np.asarray(a['scales'], dtype=np.float32)
 
                 omega = np.asarray(a['omega'], dtype=np.float32) if 'omega' in a else None

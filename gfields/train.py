@@ -36,7 +36,6 @@ from gfields.training.callbacks import (
     GradientTrackerCallback,
     MetricsAccumulatorCallback,
     PlotCallback,
-    ColumnSlicesCallback,
 )
 from gfields.training.configs import get_volume_config
 from tqdm import tqdm
@@ -50,7 +49,7 @@ def column_render_metrics(reference_image, image):
     with dr.suspend_grad():
         image = dr.clip(image, 0.0, 1.0)
         mse = float(dr.mean(dr.square(reference_image - image), axis=None).array[0])
-        return {'mse': mse, 'psnr_db': float(-10.0 * np.log10(mse)) if mse > 0 else None, 'ssim': 1.0 - float(ssim_loss_fn(reference_image, image, args.cam_count).array[0]), 'l1': float(gfields.losses.l1(reference_image, image).array[0])}
+        return {'mse': mse, 'psnr_db': float(-10.0 * np.log10(mse)) if mse > 0 else None, 'ssim': 1.0 - float(ssim_loss_fn(reference_image, image, args.cam_count).array[0]), 'l1': float(gfields.losses.l1(reference_image, image).array[0]), 'gradient_l1': float(gfields.losses.gradient_l1(reference_image, image, args.cam_count).array[0])}
 
 
 def _integrator_scene_kwargs() -> Dict[str, Any]:
@@ -89,20 +88,23 @@ def _batched_render_loss(
     seed: int,
     l1_weight: float,
     ssim_weight: float,
-) -> Tuple[mi.TensorXf, mi.Float, mi.Float, mi.Float, mi.Float]:
+    compute_gradient_metric: bool = False,
+) -> Tuple[mi.TensorXf, mi.Float, mi.Float, mi.Float, mi.Float, Optional[mi.TensorXf]]:
     '''Render camera batches and average L1/SSIM loss (reduces peak ray count).
 
-    Returns ``(last_batch_image, loss, l1, ssim, mse)`` where ``loss``, ``l1``,
+    Returns ``(last_batch_image, loss, l1, ssim, mse, gradient_l1)`` where ``loss``, ``l1``,
     ``ssim`` and ``mse`` are full-image averages over every camera batch.  The
     MSE is returned so a full-image PSNR can be logged even when
     ``opt_cam_batch`` renders only a subset of cameras per pass (the returned
-    image is just the last batch).
+    image is just the last batch). Gradient L1 is an optional detached metric
+    averaged over the same camera batches; it never contributes to the loss.
     '''
     total_cameras = 0
     loss: mi.Float | None = None
     l1_acc: mi.Float | None = None
     ssim_acc: mi.Float | None = None
     mse_acc: mi.Float | None = None
+    gradient_l1_acc: mi.TensorXf | None = None
     last_image: mi.TensorXf | None = None
     for sensor, sl in cam_batches:
         image = mi.render(
@@ -121,11 +123,18 @@ def _batched_render_loss(
         l1_acc = batch_l1 * n_cams if l1_acc is None else (l1_acc + batch_l1 * n_cams)
         ssim_acc = batch_ssim * n_cams if ssim_acc is None else (ssim_acc + batch_ssim * n_cams)
         mse_acc = batch_mse * n_cams if mse_acc is None else (mse_acc + batch_mse * n_cams)
+        # evaluate image gradients only on logging iterations without autodiff
+        if compute_gradient_metric:
+            with dr.suspend_grad():
+                batch_gradient_l1 = gfields.losses.gradient_l1(batch_ref, image, n_cams)
+                gradient_l1_acc = batch_gradient_l1 * n_cams if gradient_l1_acc is None else gradient_l1_acc + batch_gradient_l1 * n_cams
         last_image = image
     assert (loss is not None and last_image is not None and l1_acc is not None
             and ssim_acc is not None and mse_acc is not None)
     inv = 1.0 / float(total_cameras)
-    return last_image, loss * inv, l1_acc * inv, ssim_acc * inv, mse_acc * inv
+    with dr.suspend_grad():
+        gradient_metric = gradient_l1_acc * inv if gradient_l1_acc is not None else None
+    return last_image, loss * inv, l1_acc * inv, ssim_acc * inv, mse_acc * inv, gradient_metric
 
 
 # Optimization Setup
@@ -279,10 +288,6 @@ if not args.skip_gaussian_optim:
         PlotCallback(columns=gaussian_columns),
         MetricsAccumulatorCallback()
     ])
-    if args.use_columns_representation:
-        callbacks.register_callbacks([
-            ColumnSlicesCallback(gaussian_columns, gauss_ref_volume, volume_config)
-        ])
     callbacks.setup()
 
 
@@ -305,11 +310,16 @@ if not args.skip_gaussian_optim:
             if it + 1 >= args.iterations_gaussian * 0.9:
                 args.opt_spp = 2
 
+            # select logging iterations before rendering evaluation metrics
+            inspect_iters = (2, 4, 6, 8, 10, 15, 20, 25, 50, 59)
+            do_log = ((it + 1) % args.log_every == 0
+                      or (it + 1) == args.iterations_gaussian
+                      or (it + 1) in inspect_iters)
             with timer.track('forward'):
-                image, img_loss, l1, ssim, img_mse = _batched_render_loss(
+                image, img_loss, l1, ssim, img_mse, gradient_l1 = _batched_render_loss(
                     scene, scene_params, ref_image, opt_cam_batches,
                     spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
-                    l1_weight=0.75, ssim_weight=0.25,
+                    l1_weight=0.75, ssim_weight=0.25, compute_gradient_metric=do_log,
                 )
 
             with timer.track('loss'):
@@ -329,12 +339,6 @@ if not args.skip_gaussian_optim:
                 opt.step()
                 write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
 
-            # Metrics force a device->host sync; only pay for them on the
-            # configured cadence (plus the image-inspection iterations).
-            inspect_iters = (2, 4, 6, 8, 10, 15, 20, 25, 50, 59)
-            do_log = ((it + 1) % args.log_every == 0
-                      or (it + 1) == args.iterations_gaussian
-                      or (it + 1) in inspect_iters)
             relocate_now = not args.use_columns_representation and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
             deletable = 0
             if do_log or relocate_now:
@@ -358,7 +362,7 @@ if not args.skip_gaussian_optim:
                     psnr = -10.0 / dr.log(mi.Float(10.0)) * dr.log(dr.maximum(img_mse, 1e-12))
                     metrics: Dict[str, float] = {
                         "loss": loss.array[0], "L1": l1.array[0],
-                        "SSIM": ssim.array[0], "PSNR": psnr.array[0],
+                        "SSIM": ssim.array[0], "PSNR": psnr.array[0], "gradient_l1": float(gradient_l1.array[0]),
                         "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0],
                         "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                     }
@@ -369,7 +373,7 @@ if not args.skip_gaussian_optim:
 
                 # Frequent checkpoint (resumable via --from_gaussian_checkpoint).
                 if (it + 1) % args.checkpoint_every == 0:
-                    save_model(args.output, scene, level=GAUSS_LVL)
+                    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
 
             pbar.update(1)
             if do_log:
@@ -400,7 +404,7 @@ if not args.skip_gaussian_optim:
     mi.util.write_bitmap(str(args.output / f'optimized_pyr0.exr'), optimized)
 
     green("- Saving optimized model...")
-    save_model(args.output, scene, level=GAUSS_LVL)
+    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
     if args.use_columns_representation:
         render_metrics = {'initial': initial_render_metrics, 'final': column_render_metrics(ref_image, optimized), 'render_spp': args.ref_kernel_spp, 'render_seed': 0, 'parameters': gaussian_columns.parameter_stats()}
         (args.output / 'column_render_metrics.json').write_text(json.dumps(render_metrics, indent=2), encoding='utf-8')
@@ -408,6 +412,7 @@ if not args.skip_gaussian_optim:
     print(f'\nFinal PSNR: {gfields.losses.psnr(ref_image, dr.clip(optimized, 0.0, 1.0)).array[0]}')
     print(f'Final SSIM: {ssim_loss_fn(ref_image, dr.clip(optimized, 0.0, 1.0), args.cam_count).array[0]}')
     print(f'Final L1: {gfields.losses.l1(ref_image, dr.clip(optimized, 0.0, 1.0)).array[0]}')
+    print(f'Final gradient L1: {gfields.losses.gradient_l1(ref_image, dr.clip(optimized, 0.0, 1.0), args.cam_count).array[0]}')
 
     callbacks.on_optim_end()
 
@@ -620,11 +625,16 @@ try:
             iter_batches = _cam_rng.sample(per_cam_batches, k)
         else:
             iter_batches = gabor_opt_batches
+        # select logging iterations before rendering evaluation metrics
+        inspect_iters = {2, 4, 6, 8, 10, 15, 20}
+        do_log = ((it + 1) % args.log_every == 0
+                  or (it + 1) == args.iterations_gabor
+                  or (it + 1) in inspect_iters)
         with gabor_timer.track('forward'):
-            image, img_loss, l1, ssim, img_mse = _batched_render_loss(
+            image, img_loss, l1, ssim, img_mse, gradient_l1 = _batched_render_loss(
                 scene, scene_params, ref_image, iter_batches,
                 spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
-                l1_weight=0.80, ssim_weight=0.20,
+                l1_weight=0.80, ssim_weight=0.20, compute_gradient_metric=do_log,
             )
 
         if dr.any(dr.isnan(image)):
@@ -673,12 +683,6 @@ try:
             densify_idx += 1
             print(f"Densification took {(time.time() - t) * 1000:.2f} ms, with band {band} and init_omega {args.init_omega:.3f}")
 
-        # Metrics force a device->host sync; only pay for them on the
-        # configured cadence (plus the image-inspection iterations).
-        inspect_iters = {2, 4, 6, 8, 10, 15, 20}
-        do_log = ((it + 1) % args.log_every == 0
-                  or (it + 1) == args.iterations_gabor
-                  or (it + 1) in inspect_iters)
         relocate_now = (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
         deletable = 0
         if do_log or relocate_now:
@@ -697,7 +701,7 @@ try:
                 psnr = -10.0 / dr.log(mi.Float(10.0)) * dr.log(dr.maximum(img_mse, 1e-12))
                 metrics: Dict[str, float] = {
                     "loss": loss.array[0], "L1": l1.array[0],
-                    "SSIM": ssim.array[0], "PSNR": psnr.array[0],
+                    "SSIM": ssim.array[0], "PSNR": psnr.array[0], "gradient_l1": float(gradient_l1.array[0]),
                     "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0], "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                 }
                 callbacks.on_suspend_grad(it, opt, metrics)
