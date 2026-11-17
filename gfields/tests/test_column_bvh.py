@@ -23,13 +23,18 @@ def make_columns():
     return columns
 
 
-def make_scene(grouped, anyhit):
+def make_scene(grouped, anyhit, mesh=False, integrator_type='gfields_tomography'):
     # compare analytic geometry with identical finite support in both cases.
     columns = make_columns()
-    scene_dict = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=grouped, use_anyhit=anyhit)
+    scene_dict = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=grouped, use_anyhit=anyhit, use_column_mesh=mesh, integrator_type=integrator_type)
+    if integrator_type != 'gfields_tomography':
+        scene_dict['integrator'].pop('render_marginalization', None)
+        scene_dict['integrator']['kernel_type'] = 'gaussian'
+        scene_dict['integrator']['max_depth'] = 3
     primitive = scene_dict['primitives_pyr0']
-    primitive['type'] = 'ellipsoids'
-    primitive.pop('shell', None)
+    if not mesh:
+        primitive['type'] = 'ellipsoids'
+        primitive.pop('shell', None)
     scene_dict['sensor'] = {'type': 'orthographic', 'to_world': mi.ScalarTransform4f.look_at(origin=[0, 0, -3], target=[0, 0, 0], up=[0, 1, 0]), 'film': {'type': 'hdrfilm', 'width': 16, 'height': 16, 'rfilter': {'type': 'box'}}, 'sampler': {'type': 'independent', 'sample_count': 2}}
 
     # bind shared optimizer parameters through the existing scene interface.
@@ -62,6 +67,10 @@ class ColumnBvhConfigurationTests(unittest.TestCase):
 
 @unittest.skipUnless(mi.variant().startswith('cuda'), 'Grouped column acceleration requires the CUDA backend')
 class ColumnBvhCudaTests(unittest.TestCase):
+    use_column_mesh = False
+    grouped_primitive_count = 2
+    make_scene = staticmethod(make_scene)
+
     def test_small_scale_supports_at_training_primitive_count(self):
         from gfields.training.configs import GenericConfig
         from gfields.training.regression import generate_random_columns
@@ -72,9 +81,10 @@ class ColumnBvhCudaTests(unittest.TestCase):
         columns = generate_random_columns(6144, 4, 0.00006, 1.0, 0.0, volume=volume, volume_config=GenericConfig(), column_slab_depth=8)
         scenes = []
         for grouped in (False, True):
-            scene_dict = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=grouped)
-            scene_dict['primitives_pyr0']['type'] = 'ellipsoids'
-            scene_dict['primitives_pyr0'].pop('shell', None)
+            scene_dict = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=grouped, use_column_mesh=self.use_column_mesh and grouped)
+            if not (self.use_column_mesh and grouped):
+                scene_dict['primitives_pyr0']['type'] = 'ellipsoids'
+                scene_dict['primitives_pyr0'].pop('shell', None)
             scenes.append(mi.load_dict(scene_dict))
 
         # compare identical random rays across full and grouped acceleration.
@@ -84,14 +94,14 @@ class ColumnBvhCudaTests(unittest.TestCase):
         values = [scene.ray_transmittance_ellipsoids(ray, mi.UInt32(0), flags, mi.Bool(True)).numpy() for scene in scenes]
         np.testing.assert_allclose(values[0], values[1], rtol=2e-5, atol=2e-6)
         self.assertEqual(scenes[0].shapes()[0].primitive_count(), 24576)
-        self.assertEqual(scenes[1].shapes()[0].primitive_count(), 6144)
+        self.assertEqual(scenes[1].shapes()[0].primitive_count(), 6144 * (12 if self.use_column_mesh else 1))
 
     def test_hit_ids_inside_origins_and_finite_segments(self):
         # rays cover each child, a miss, an interior origin, and a short segment.
-        baseline = make_scene(False, False)[0]
-        grouped = make_scene(True, False)[0]
+        baseline = self.make_scene(False, False)[0]
+        grouped = self.make_scene(True, False)[0]
         self.assertEqual(baseline.shapes()[0].primitive_count(), 4)
-        self.assertEqual(grouped.shapes()[0].primitive_count(), 2)
+        self.assertEqual(grouped.shapes()[0].primitive_count(), self.grouped_primitive_count)
         ray = mi.Ray3f(mi.Point3f(mi.Float([-0.35, -0.35, 0.35, 0.35, 2, -0.35, -0.35, -0.35]), mi.Float([-0.45, 0.45, -0.45, 0.45, 0, -0.45, -0.45, 0]), mi.Float([-3, -3, -3, -3, -3, 0, -3, -3])), mi.Vector3f(0, 0, 1))
         ray.maxt = mi.Float([10, 10, 10, 10, 10, 10, 1, 10])
         expected = baseline.ray_intersect(ray)
@@ -121,8 +131,8 @@ class ColumnBvhCudaTests(unittest.TestCase):
 
     def test_stochastic_transmittance_and_free_flight_queries(self):
         # stateless seeds must identify the same child irrespective of grouping.
-        baseline = make_scene(False, True)[0]
-        grouped = make_scene(True, True)[0]
+        baseline = self.make_scene(False, True)[0]
+        grouped = self.make_scene(True, True)[0]
         seeds = dr.arange(mi.UInt32, 128) + 17
         ray = mi.Ray3f(mi.Point3f(dr.full(mi.Float, -0.35, 128), dr.full(mi.Float, -2.0, 128), 0), mi.Vector3f(0, 1, 0))
         flags = int(mi.RayFlags.StochasticEllipsoids)
@@ -149,7 +159,7 @@ class ColumnBvhCudaTests(unittest.TestCase):
 
     def test_covering_queries_preserve_overlapping_children(self):
         # overlap the two children so collection must append both ids once.
-        scenes = [make_scene(False, True), make_scene(True, True)]
+        scenes = [self.make_scene(False, True), self.make_scene(True, True)]
         for scene, params, opt, columns in scenes:
             opt['primitive_center_y'] = mi.Float([0.0, 0.1, 0.0, 0.1])
             opt['primitive_scale_y'] = dr.full(mi.Float, 0.1, 4)
@@ -179,7 +189,7 @@ class ColumnBvhCudaTests(unittest.TestCase):
     def test_checkpoint_keeps_every_expanded_gaussian(self):
         # grouped acceleration must not truncate the saved primitive arrays.
         from gfields.training.regression import save_model
-        scene, params, opt, columns = make_scene(True, True)
+        scene, params, opt, columns = self.make_scene(True, True)
         root = Path(__file__).resolve().parents[2] / 'results' / 'column_bvh_checks'
         root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=root) as directory:
@@ -194,8 +204,8 @@ class ColumnBvhCudaTests(unittest.TestCase):
     def test_render_and_adjoint_match_before_and_after_optimizer_updates(self):
         for anyhit in (False, True):
             with self.subTest(anyhit=anyhit):
-                baseline = make_scene(False, anyhit)
-                grouped = make_scene(True, anyhit)
+                baseline = self.make_scene(False, anyhit)
+                grouped = self.make_scene(True, anyhit)
                 for iteration in range(2):
                     images, gradients = [], []
                     for scene, params, opt, columns in (baseline, grouped):
@@ -224,6 +234,102 @@ class ColumnBvhCudaTests(unittest.TestCase):
                     actual = grouped[0].ray_intersect(ray)
                     self.assertTrue(bool(actual.is_valid()[0]))
                     self.assertEqual(int(actual.prim_index[0]), int(expected.prim_index[0]))
+
+
+class ColumnMeshCudaTests(ColumnBvhCudaTests):
+    use_column_mesh = True
+    grouped_primitive_count = 24
+    make_scene = staticmethod(lambda grouped, anyhit: make_scene(grouped, anyhit, mesh=grouped))
+
+    def test_segments_inside_proxy(self):
+        # compare short rays whose origins and ends both lie inside a proxy box.
+        columns = make_columns()
+        columns.parameters['primitive_center_y'] = mi.Float([-.15, .15, -.15, .15])
+        columns.parameters['primitive_scale_y'] = mi.Float([.03] * 4)
+        scenes = []
+        for mesh in (False, True):
+            data = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=True, use_column_mesh=mesh)
+            scenes.append(mi.load_dict(data))
+        ray = mi.Ray3f(mi.Point3f(-.35, -.05, 0), mi.Vector3f(0, 1, 0))
+        ray.maxt = .18
+        expected, actual = [scene.ray_intersect(ray) for scene in scenes]
+        self.assertTrue(bool(actual.is_valid()[0]))
+        self.assertEqual(int(actual.prim_index[0]), 1)
+        np.testing.assert_allclose(actual.t.numpy(), expected.t.numpy(), atol=1e-6)
+        flags = int(mi.RayFlags.TransmittanceEllipsoids)
+        depths = [scene.ray_transmittance_ellipsoids(ray, mi.UInt32(0), flags, True).numpy() for scene in scenes]
+        np.testing.assert_allclose(depths[0], depths[1], rtol=2e-5, atol=1e-6)
+
+
+    def test_overlapping_proxies_preserve_nearest_child_and_opaque_hits(self):
+        # a large empty proxy must not hide a nearer child in another column.
+        columns = make_columns()
+        columns.parameters['column_center_xz'] = mi.Point2f(mi.Float([0., 0.]), mi.Float([0., -.2]))
+        columns.parameters['column_scale_xz'] = mi.Vector2f(mi.Float([.1, .1]), mi.Float([.4, .1]))
+        columns.parameters['primitive_center_y'] = mi.Float([-.5, .5, -.3, .3])
+        columns.parameters['primitive_scale_y'] = mi.Float([.01, .01, .05, .05])
+        scenes = []
+        for mesh in (False, True):
+            data = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_bvh=True, use_column_mesh=mesh)
+            data['blocker'] = {'type': 'rectangle', 'to_world': mi.ScalarTransform4f.translate([0., 0., -.3]) @ mi.ScalarTransform4f.scale(.08)}
+            scenes.append(mi.load_dict(data))
+        ray = mi.Ray3f(mi.Point3f(0., mi.Float([-.3, 0., .3]), -3.), mi.Vector3f(0., 0., 1.))
+        expected, actual = [scene.ray_intersect(ray) for scene in scenes]
+        np.testing.assert_array_equal(actual.is_valid().numpy(), expected.is_valid().numpy())
+        np.testing.assert_array_equal(actual.prim_index.numpy(), expected.prim_index.numpy())
+        np.testing.assert_allclose(actual.t.numpy(), expected.t.numpy(), atol=2e-6)
+        self.assertEqual(int(actual.prim_index[0]), 2)
+        self.assertEqual(int(actual.prim_index[2]), 3)
+        np.testing.assert_allclose(actual.t.numpy()[1], 2.7, atol=2e-6)
+
+    def test_single_child_columns_and_per_primitive_extents(self):
+        # one-child columns retain twelve triangles and accept tensor extents.
+        columns = make_columns()
+        columns.primitives_per_column = 1
+        columns.parameters['column_center_xz'] = mi.Point2f(mi.Float([0.] * 4), mi.Float([0.] * 4))
+        columns.parameters['column_scale_xz'] = mi.Vector2f(dr.full(mi.Float, .1, 4))
+        columns.parameters['column_quaternions'] = dr.zeros(mi.Float, 4)
+        data = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=columns, use_column_mesh=True)
+        scene = mi.load_dict(data)
+        self.assertEqual(scene.shapes()[0].primitive_count(), 48)
+        ray = mi.Ray3f(mi.Point3f(.4, -.45, -3.), mi.Vector3f(0., 0., 1.))
+        self.assertFalse(bool(scene.ray_test(ray)[0]))
+        data['primitives_pyr0']['extent'] = mi.TensorXf(np.full((4, 1), 6., dtype=np.float32))
+        expanded_scene = mi.load_dict(data)
+        self.assertTrue(bool(expanded_scene.ray_test(ray)[0]))
+
+
+    def test_compact_ply_load_selects_column_mesh(self):
+        from gfields.training.regression import save_model
+        from gfields.rendering.pipeline import detect_asset_info, load_pyramid_level
+
+        # load the same compact file through both selectable acceleration modes.
+        scene, params, opt, columns = self.make_scene(True, True)
+        with tempfile.TemporaryDirectory() as directory:
+            save_model(Path(directory), scene, 0, use_columns_representation=True, columns=columns)
+            asset = Path(directory) / 'optimized_asset_pyr0'
+            for mesh in (False, True):
+                info = detect_asset_info(asset, use_columns_representation=True, use_column_mesh=mesh)
+                entry = load_pyramid_level(info, 0)
+                self.assertEqual(entry['type'], 'ellipsoidsmesh' if mesh else 'ellipsoids')
+                self.assertEqual(entry['primitives_per_column'], 2)
+                if mesh:
+                    self.assertEqual(entry['shell'], 'box')
+                loaded = mi.load_dict({'type': 'scene', 'primitives': entry})
+                self.assertEqual(loaded.shapes()[0].primitive_count(), 24 if mesh else 2)
+
+
+    def test_multiple_scattering_render_matches_analytic_columns(self):
+        # exercise the production sequential and stochastic rendering integrators.
+        for integrator in ('gfields_prb', 'gfields_prb_stochastic'):
+            with self.subTest(integrator=integrator):
+                images = []
+                for mesh in (False, True):
+                    scene, params, opt, columns = make_scene(True, False, mesh=mesh, integrator_type=integrator)
+                    params['primitives_pyr0.albedo'] = dr.full(mi.Float, .7, 12)
+                    params.update()
+                    images.append(mi.render(scene, params, spp=4, seed=93).numpy())
+                np.testing.assert_allclose(images[0], images[1], rtol=5e-5, atol=2e-6)
 
 
 if __name__ == '__main__':

@@ -15,8 +15,8 @@ that event. Children missing the ray are excluded even if their union AABB inter
 
 Parameter writes continue to use the existing expand/write/update flow. The analytic
 shape recomputes column bounds and marks acceleration data dirty when geometry or
-support parameters change. Saved PLY assets still contain every expanded Gaussian;
-they do not preserve the column grouping or shared optimizer state.
+support parameters change. Compact Column PLY assets preserve the shared parameters
+and primitives_per_column; expanded per-Gaussian arrays are reconstructed on loading.
 
 Grouped geometry currently requires the CUDA backend. Scalar, LLVM, and Metal grouped
 requests fail explicitly. The analytic support differs from the existing polygonal
@@ -57,3 +57,58 @@ interior origins, gaps between children, deterministic and stochastic transmitta
 free-flight sampling, overlapping coverage collection, forward images, parameter
 gradients, bounds updates, and complete expanded PLY export. Short training runs also
 exercise the new flag with any-hit enabled and disabled.
+
+
+## Column mesh shells
+
+On `exp/column-mesh-shell`, add `--use_column_mesh` together with
+`--use_columns_representation` to training, static rendering, or video rendering.
+The flag selects `ellipsoidsmesh` with `shell=box` and an explicit
+`primitives_per_column`. Training also enables the grouped-geometry configuration.
+Omitting the new flag preserves the existing analytic Column rendering path; training
+still uses its existing mesh default unless `--use_column_bvh` is requested.
+Primitive Y centers remain trainable on this branch.
+
+Each column contributes one conservative axis-aligned box mesh: 24 template vertices
+and 12 triangles. The box encloses the union of all child ellipsoid supports, including
+rotation and per-primitive extents. With 6144 columns and four primitives per column,
+there are 73728 triangles instead of the independent UV shells' 1769472 triangles.
+OptiX still builds its own triangle BVH; one shell does not mean one BVH leaf.
+Shared arrays, Gaussian evaluation, optimizer updates, and compact PLY export are reused.
+Grouped mesh geometry requires CUDA and fails explicitly on other backends.
+
+A shell hit is only a candidate. CUDA reuses the analytic child support test and the
+existing optical-depth, free-flight, and coverage helpers with resolved child indices.
+The complete closed box is queried using its exit faces, once per column, so rays
+starting inside a proxy and finite segments ending before a proxy exit are supported.
+Ordinary geometry is traced separately; its nearest hit is merged with the closest
+actual child, rather than treating a proxy face as a Gaussian event. This preserves
+opaque blockers and overlapping-column ordering. Dedicated queries preserve their
+original segment clipping, activity masks, sampling seeds, and child coverage ids.
+
+The correctness-first implementation uses an additional complete-proxy traversal.
+That is expensive for the sequential closest-hit walk and is not a general speedup.
+An illustrative synthetic thin-slab test on an RTX 5070 Ti Laptop GPU, 24576 Gaussians,
+256 x 144 orthographic pixels, spp=1, seed=0, three warmups and six timed renders gave:
+
+| Geometry | Warm scene construction median | Sequential tomography median | Any-hit tomography median |
+| --- | ---: | ---: | ---: |
+| Independent UV mesh shells | 8.80 ms | 25.57 ms | 4.02 ms |
+| Analytic Column bounds | 1.97 ms | 79.97 ms | 6.90 ms |
+| Column box mesh shells | 3.07 ms | 632.82 ms | 3.95 ms |
+
+Scene construction was timed separately with two warmups and four samples, using
+preconstructed parameter tensors and synchronization after each load. It includes
+scene setup and acceleration construction, rather than isolated BVH builder time.
+These are forward-render timings, not training or multiple-scattering benchmarks.
+The analytic Column and Column mesh images matched at rtol=5e-5, atol=2e-6.
+Use identical assets, integrators, cameras, and settings for an application benchmark;
+prefer the analytic path for sequential traversal until that path is improved. For
+training or tomography experiments, `--use_anyhit` selects the relevant any-hit path.
+
+The regression suite also compares child ids and distances, finite segments entirely
+inside a proxy, overlapping columns with opaque geometry, containing-support collection,
+stochastic queries, one-child columns, tensor extents, compact PLY reload, optimization
+updates, forward images and shared-parameter gradients. Both multiple-scattering
+integrators are checked against analytic Column geometry. Run the verification command
+above after rebuilding the native plugin and refreshing its Python runtime package.

@@ -60,6 +60,7 @@ class AssetInfo:
     prune_masks: Dict[int, Any] = field(default_factory=dict)
     # retain the representation and fixed group size for each ply level.
     use_columns_representation: bool = False
+    use_column_mesh: bool = False
     primitives_per_column: Dict[int, int] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
@@ -72,7 +73,7 @@ class AssetInfo:
         return (
             f"AssetInfo(path={self.path}, levels={self.num_levels}, "
             f"primitives={self.num_primitives}, extents={extent_summary}, "
-            f"use_columns_representation={self.use_columns_representation}, primitives_per_column={self.primitives_per_column})"
+            f"use_columns_representation={self.use_columns_representation}, use_column_mesh={self.use_column_mesh}, primitives_per_column={self.primitives_per_column})"
         )
 
 
@@ -99,13 +100,16 @@ class SteerableAssetInfo:
         )
 
 
-def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False) -> AssetInfo:
+def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False, use_column_mesh=False) -> AssetInfo:
     """Auto-detect a pyramid asset's structure (num levels, primitive counts, extents).
 
     Reads the unified per-level store ``<asset>/data/root.primitives_pyr*.ply``.
     Legacy per-array ``npy_data/*.npy`` assets must be converted first with
     ``gfields migrate assets``.
     """
+    # mesh shells require the compact column layout to recover child groups
+    if use_column_mesh and not use_columns_representation:
+        raise ValueError('Column mesh shells require use_columns_representation')
     asset_path = str(asset_path)
     import gfields.io
 
@@ -135,7 +139,7 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             path=asset_path, npy_folder=os.path.join(asset_path, "npy_data"),
             ply_folder=ply_folder, num_levels=num_levels, has_omega=has_omega,
             has_albedo=has_albedo, num_primitives=num_primitives, extents=extents,
-            use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
+            use_columns_representation=use_columns_representation, use_column_mesh=use_column_mesh, primitives_per_column=primitives_per_column)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
@@ -167,9 +171,9 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
 
 def _ellipsoids_entry(
     *, centers, scales, quaternions, opacities, omega, albedo, extent,
-    visibility_mask: int, use_columns_representation=False, primitives_per_column=1,
+    visibility_mask: int, use_columns_representation=False, primitives_per_column=1, use_column_mesh=False,
 ) -> Dict[str, Any]:
-    """Pack per-primitive arrays into mesh or grouped analytic ellipsoid geometry.
+    """Pack primitive arrays into independent meshes or grouped column geometry.
 
     Shared by :func:`load_pyramid_level` and :func:`load_steerable_asset`; all
     array args are numpy (scales already applied by the caller). ``extent`` is a
@@ -194,10 +198,13 @@ def _ellipsoids_entry(
         "visibility_mask": visibility_mask,
     }
 
-    # reuse the same tensors and select the grouped analytic geometry when requested.
+    # reuse the same tensors and select analytic bounds or column mesh shells.
     if use_columns_representation:
-        entry['type'] = 'ellipsoids'
-        entry.pop('shell')
+        entry['type'] = 'ellipsoidsmesh' if use_column_mesh else 'ellipsoids'
+        if use_column_mesh:
+            entry['shell'] = 'box'
+        else:
+            entry.pop('shell')
         entry['primitives_per_column'] = primitives_per_column
     return entry
 
@@ -400,7 +407,7 @@ def load_pyramid_level(
         centers=centers, scales=scales, quaternions=quaternions,
         opacities=opacities * opacity_scale, omega=omega,
         albedo=albedo * albedo_scale, extent=extent_out,
-        visibility_mask=2 ** level, use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
+        visibility_mask=2 ** level, use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column, use_column_mesh=asset_info.use_column_mesh)
 
 
 # ---------------------------------------------------------------------------

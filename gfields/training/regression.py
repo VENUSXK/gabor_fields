@@ -131,6 +131,7 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--gauss_count',         type=int,   default=12**3,   help='Resolution of the 3D grid of volumetric primitives') # 16 for gabor
     parser.add_argument('--use_columns_representation', '--gaussian_columns', dest='use_columns_representation', action='store_true', help='Fit shared-XZ Gaussian columns (Gaussian stage only; expanded for rendering)')
     parser.add_argument('--use_column_bvh', action='store_true', help='Trace one analytic BVH bound per column while retaining per-primitive integration')
+    parser.add_argument('--use_column_mesh', action='store_true', help='Use one conservative box mesh per column instead of analytic column bounds')
     parser.add_argument('--init_from_columns', action='store_true', help='Initialize independent Gaussians from expanded columns without sharing their optimization parameters')
     parser.add_argument('--column_count', type=int, default=64, help='Total number of shared XZ footprints, distributed among initialization slabs')
     parser.add_argument('--primitives_per_column', type=int, default=4, help='Number of axial Gaussian primitives per column')
@@ -185,6 +186,10 @@ def setup() -> argparse.Namespace:
     args = parser.parse_args(build_train_argv(sys.argv[1:]))
 
     # require shared column layout for grouped geometry.
+    if args.use_column_mesh:
+        if not args.use_columns_representation:
+            parser.error('--use_column_mesh requires --use_columns_representation')
+        args.use_column_bvh = True
     if args.use_column_bvh and not args.use_columns_representation:
         parser.error('--use_column_bvh requires --use_columns_representation')
 
@@ -940,6 +945,7 @@ def create_scene_dict_from_primitives(
     use_kernel_freeze: bool = False,
     use_anyhit: bool = False,
     use_column_bvh: bool = False,
+    use_column_mesh: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a Mitsuba scene dictionary from primitive parameters.
@@ -949,6 +955,7 @@ def create_scene_dict_from_primitives(
         level: Pyramid level index
         use_columns_representation: Expand shared columns instead of independent arrays.
         use_column_bvh: Submit one analytic acceleration bound per column.
+        use_column_mesh: Use a conservative box mesh per column instead of analytic bounds.
         columns: Shared column parameters to expand instead of supplying
             centers, scales, quaternions, opacities, albedo, and omega separately.
         centers: (N, 3) primitive center positions
@@ -968,7 +975,7 @@ def create_scene_dict_from_primitives(
         Scene dictionary ready for mi.load_dict()
     """
     # validate the grouped acceleration layout before scene creation.
-    if use_column_bvh and (not use_columns_representation or columns is None or level != 0):
+    if (use_column_bvh or use_column_mesh) and (not use_columns_representation or columns is None or level != 0):
         raise ValueError('Column BVH requires Gaussian-level shared column parameters')
 
     # Expand shared columns into primitive arrays before creating the scene.
@@ -1025,9 +1032,12 @@ def create_scene_dict_from_primitives(
     }
 
     # retain expanded parameters but group their acceleration bounds.
-    if use_column_bvh:
-        prim_dict['type'] = 'ellipsoids'
-        prim_dict.pop('shell')
+    if use_column_bvh or use_column_mesh:
+        prim_dict['type'] = 'ellipsoidsmesh' if use_column_mesh else 'ellipsoids'
+        if use_column_mesh:
+            prim_dict['shell'] = 'box'
+        else:
+            prim_dict.pop('shell')
         prim_dict['primitives_per_column'] = columns.primitives_per_column
 
     scene_dict = {

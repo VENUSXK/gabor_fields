@@ -178,6 +178,7 @@ def parse_args():
     parser.add_argument('--render_pyramid_laplacian', action='store_true',
                         help='Render Laplacian pyramid of the asset')
     parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
+    parser.add_argument('--use_column_mesh', action='store_true', help='Use one conservative box mesh per column; requires --use_columns_representation')
     parser.add_argument('--multiple_scattering', action='store_true',
                         help='Enable multiple scattering rendering')
     parser.add_argument('--no_nee', action='store_true',
@@ -393,6 +394,7 @@ def _video_parse_args() -> argparse.Namespace:
         description='Env-map-lit turntable / rotating-envmap video of an asset')
     p.add_argument('asset', help='Optimized asset directory (unified data/root.primitives_pyr*.ply layout)')
     p.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
+    p.add_argument('--use_column_mesh', action='store_true', help='Use one conservative box mesh per column; requires --use_columns_representation')
     p.add_argument('--motion', choices=['turntable', 'envmap'],
                    default='turntable', help='Camera orbit or rotating env map')
     p.add_argument('--envmap', default=str(default_envmap),
@@ -447,7 +449,7 @@ def _video_build_scene_dict(args, asset_dir) -> dict:
     from gfields.rendering.pipeline import (
         detect_asset_info, load_pyramid_level, create_integrator_config,
         create_environment_config)
-    info = detect_asset_info(str(asset_dir), use_columns_representation=args.use_columns_representation)
+    info = detect_asset_info(str(asset_dir), use_columns_representation=args.use_columns_representation, use_column_mesh=args.use_column_mesh)
     scene_dict: dict = {
         'type': 'scene',
         'integrator': create_integrator_config(
@@ -579,7 +581,7 @@ def main():
         return
     
     # Detect pyramid asset structure
-    asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation)
+    asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation, use_column_mesh=args.use_column_mesh)
     print(f"Detected asset: {asset_info}")
     
     # One-shot pre-render refinement (opt-in, non-destructive): adaptively clamp
