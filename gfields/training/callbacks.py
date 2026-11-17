@@ -159,7 +159,7 @@ class PlotCallback(CallbackABC):
         shared_scales = parameters['column_scale_xz'].numpy()
         axial_scales = parameters['primitive_scale_y'].numpy()
         opacity = parameters['primitive_opacity'].numpy()
-        area = np.repeat(np.prod(shared_scales, axis=0), self.columns.primitives_per_column)
+        area = np.prod(shared_scales, axis=0)[self.columns.primitive_indices.numpy()]
         density = opacity / ((2.0 * np.pi) ** 1.5 * area * axial_scales)
         before = {'opacities': opacity, 'scales': np.concatenate((shared_scales.reshape(-1), axial_scales)),
                   'column_scale_xz': shared_scales.reshape(-1), 'primitive_scale_y': axial_scales,

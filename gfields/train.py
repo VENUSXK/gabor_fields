@@ -295,6 +295,7 @@ if not args.skip_gaussian_optim:
 
     # Initialize benchmark timer
     timer = gfields.benchmark.OptimizationTimer(log_every=9999, log_level=1)
+    adaptation_since_log = {'split': 0, 'pruned': 0}
     try:
         progress_iterations = range(args.epoch_start, args.epoch_start + args.iterations_gaussian)
         pbar = tqdm(progress_iterations, desc='Gaussian Optimization', unit='step')
@@ -334,9 +335,20 @@ if not args.skip_gaussian_optim:
                 dr.backward(loss)
 
 
+            # collect Y gradients before optimizer updates replace the parameter arrays.
+            training_iteration = it - args.epoch_start + 1
+            if args.use_adaptive_columns and training_iteration <= args.column_adapt_until:
+                accumulate_column_y_gradients(gaussian_columns)
             callbacks.on_before_opt_step(it, opt)
+
+            # adapt independent Y parameters after the step and write the scene once.
+            adaptation = {'pruned': 0, 'split': 0}
             with timer.track('opt_step'):
                 opt.step()
+                if args.use_adaptive_columns:
+                    adaptation = adapt_column_primitives(gaussian_columns, args, training_iteration)
+                    for name, count in adaptation.items():
+                        adaptation_since_log[name] += count
                 write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
 
             relocate_now = not args.use_columns_representation and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
@@ -366,6 +378,10 @@ if not args.skip_gaussian_optim:
                         "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0],
                         "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                     }
+                    if args.use_adaptive_columns:
+                        metrics.update(primitive_count=float(dr.width(opt['primitive_center_y'])),
+                                       column_splits=float(adaptation_since_log['split']), column_pruned=float(adaptation_since_log['pruned']))
+                        adaptation_since_log = {'split': 0, 'pruned': 0}
                     callbacks.on_suspend_grad(it, opt, metrics)
 
                 if img_write_modulo == 0 or (it + 1) in inspect_iters:

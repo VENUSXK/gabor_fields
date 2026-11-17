@@ -61,6 +61,7 @@ class AssetInfo:
     # retain the representation and fixed group size for each ply level.
     use_columns_representation: bool = False
     primitives_per_column: Dict[int, int] = field(default_factory=dict)
+    primitive_count_per_column: Dict[int, Any] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
         extent_summary: Dict[int, Any] = {}
@@ -117,6 +118,7 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
     if ply_levels:
         num_levels = 1 + max(ply_levels)
         has_omega, has_albedo, num_primitives, extents, primitives_per_column = {}, {}, {}, {}, {}
+        primitive_count_per_column = {}
         for level in range(num_levels):
             a = gfields.io.load_ellipsoid_ply(
                 os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation)
@@ -124,6 +126,7 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             if use_columns_representation:
                 num_primitives[level] = len(a['primitive_center_y'])
                 primitives_per_column[level] = a['primitives_per_column']
+                primitive_count_per_column[level] = a['primitive_count_per_column']
             else:
                 num_primitives[level] = len(a['centers'])
             has_omega[level] = "omega" in a
@@ -135,7 +138,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             path=asset_path, npy_folder=os.path.join(asset_path, "npy_data"),
             ply_folder=ply_folder, num_levels=num_levels, has_omega=has_omega,
             has_albedo=has_albedo, num_primitives=num_primitives, extents=extents,
-            use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
+            use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column,
+            primitive_count_per_column=primitive_count_per_column)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
@@ -311,6 +315,7 @@ def load_pyramid_level(
     num_prims = asset_info.num_primitives[level]
     use_columns_representation = asset_info.use_columns_representation
     primitives_per_column = asset_info.primitives_per_column.get(level, 1)
+    grouped_columns = use_columns_representation
     import gfields.io
     if getattr(asset_info, "ply_folder", None):
         a = gfields.io.load_ellipsoid_ply(
@@ -331,7 +336,14 @@ def load_pyramid_level(
         parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
         if a['primitives_per_column'] != primitives_per_column or len(a['primitive_center_y']) != num_prims:
             raise ValueError('Column PLY layout changed after asset detection')
-        columns = GaussianColumn(parameters, primitives_per_column)
+        counts = a['primitive_count_per_column']
+        if level in asset_info.primitive_count_per_column and not np.array_equal(counts, asset_info.primitive_count_per_column[level]):
+            raise ValueError('Column PLY counts changed after asset detection')
+        columns = GaussianColumn(parameters, primitives_per_column, primitive_count_per_column=counts)
+
+        # variable-length columns use the existing per-primitive geometry path.
+        grouped_columns = bool(np.all(counts == counts[0]))
+        primitives_per_column = int(counts[0]) if grouped_columns else 1
 
         # reuse column expansion before the common rendering transformations.
         centers, scales, quaternions, opacities = columns.expand()
@@ -359,7 +371,7 @@ def load_pyramid_level(
     else:
         albedo = np.ones((num_prims, 3), dtype=np.float32)
 
-    if primitive_subset is not None and use_columns_representation:
+    if primitive_subset is not None and grouped_columns:
         # allow complete column selections only, preserving contiguous child order.
         selected = np.asarray(np.arange(num_prims)[primitive_subset])
         if selected.ndim != 1 or not selected.size or selected.size % primitives_per_column:
@@ -400,7 +412,7 @@ def load_pyramid_level(
         centers=centers, scales=scales, quaternions=quaternions,
         opacities=opacities * opacity_scale, omega=omega,
         albedo=albedo * albedo_scale, extent=extent_out,
-        visibility_mask=2 ** level, use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column)
+        visibility_mask=2 ** level, use_columns_representation=grouped_columns, primitives_per_column=primitives_per_column)
 
 
 # ---------------------------------------------------------------------------
