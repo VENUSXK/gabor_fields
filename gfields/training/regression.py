@@ -648,7 +648,6 @@ def generate_random_kernels(
             if volume is None or volume_config is None:
                 raise ValueError("Volume and volume_config must be provided for importance sampling.")
             centers = importance_sample_positions(volume, volume_config, n_gmm=num_kernels, threshold=1e-6)
-            centers = np.ascontiguousarray(centers[:, ::-1])
         else:
             centers = np.random.rand(num_kernels, 3) * 2.0 - 1.0
 
@@ -680,17 +679,30 @@ def generate_random_kernels(
 
 
 def importance_sample_positions(volume: np.ndarray, volume_config: VolumeConfig, n_gmm: int = 1_000, threshold: float = 1e-6) -> np.ndarray:
-    # sampling randomly from occupied voxels, not full importance sampling, to ensure wide coverage when using low numbers of kernels
-    volume_slice = np.where(np.abs(volume) > threshold)
-    volume_slice = np.stack(
-        [volume_slice[0], volume_slice[1], volume_slice[2]], axis=1
-    )
-    starting_points = volume_slice[np.random.permutation(volume_slice.shape[0])[:n_gmm]]
+    """Sample occupied voxel centers and return an (n_gmm, 3) array in world xyz order."""
+    # validate the volume and requested number of primitive centers
+    if volume.ndim != 3 or min(volume.shape) <= 0 or n_gmm <= 0:
+        raise ValueError('Position sampling requires a nonempty 3D volume and a positive sample count.')
+    occupied_indices = np.argwhere(np.abs(volume) > threshold)
+    occupied_count = len(occupied_indices)
+    if occupied_count == 0:
+        raise ValueError('Cannot sample positions from a volume without occupied voxels.')
 
-    # project indices to world space
-    starting_points_norm = (starting_points / np.array(volume.shape) - 0.5) * volume_config.volume_scale
+    # retain uniform occupied-voxel sampling and repeat only when necessary
+    indices = np.random.permutation(occupied_count)[:n_gmm]
+    if occupied_count < n_gmm:
+        extra_indices = np.random.choice(occupied_count, n_gmm - occupied_count, replace=True)
+        indices = np.concatenate((indices, extra_indices))
+    sampled_indices = occupied_indices[indices]
 
-    return starting_points_norm
+    # convert voxel centers from zyx indices to normalized xyz coordinates
+    normalized_zyx = (sampled_indices + 0.5) / np.asarray(volume.shape)
+    normalized_xyz = np.ascontiguousarray(normalized_zyx[:, ::-1], dtype=np.float32)
+    points = mi.Point3f(normalized_xyz.T)
+
+    # use the reference volume transform for both scaling and translation
+    world_points = mi.Transform4f(volume_config.to_world) @ points
+    return np.ascontiguousarray(world_points.numpy().T, dtype=np.float32)
 
 # endregion Initialization
 
