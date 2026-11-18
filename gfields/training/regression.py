@@ -136,6 +136,20 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--primitives_per_column', type=int, default=4, help='Number of axial Gaussian primitives per column')
     parser.add_argument('--column_slab_depth', type=int, default=0, help='Initialization slab depth in y voxels; 0 uses the complete occupied y range; tails remain unrestricted')
     parser.add_argument('--column_lr', type=float, default=0.01, help='Base learning rate for Gaussian column parameters, multiplied by existing parameter LR multipliers')
+    # configure optional variable-length column adaptation.
+    parser.add_argument('--use_adaptive_columns', action='store_true', help='Enable periodic Y splitting and low-contribution pruning')
+    parser.add_argument('--column_adapt_every', type=int, default=20, help='Iterations between column adaptation checks')
+    parser.add_argument('--column_adapt_from', type=int, default=0, help='First adaptation iteration; 0 uses the end of LR warmup')
+    parser.add_argument('--column_adapt_until', type=int, default=0, help='Last adaptation iteration; 0 uses 80 percent of Gaussian training')
+    parser.add_argument('--column_max_primitives', type=int, default=0, help='Global primitive cap; 0 allows twice the initial count')
+    parser.add_argument('--column_max_primitives_per_column', type=int, default=16, help='Maximum primitives in one column after splitting')
+    parser.add_argument('--column_max_splits', type=int, default=256, help='Maximum parent splits per adaptation check')
+    parser.add_argument('--column_split_grad_threshold', type=float, default=1e-4, help='Minimum mean absolute Y-center gradient for splitting')
+    parser.add_argument('--column_prune_weight_threshold', type=float, default=0.01, help='Maximum column weight fraction for low-contribution pruning')
+    parser.add_argument('--column_prune_density_threshold', type=float, default=0.001, help='Maximum normalized peak density for low-contribution pruning')
+    parser.add_argument('--column_prune_checks', type=int, default=3, help='Consecutive low-contribution checks before deletion')
+    parser.add_argument('--column_protection_checks', type=int, default=2, help='Pruning checks skipped by newly split children')
+
     parser.add_argument('--gabor_count',         type=int,   default=12**3,   help='Resolution of the 3D grid of volumetric primitives') # 16 for gabor
     parser.add_argument('--init_albedo',         type=float, default=0.0,     help='Initial value for the volumetric primitive albedo')
     parser.add_argument('--init_omega',          type=float, default=np.pi/2, help='Initial value for the volumetric primitive frequency weights')
@@ -208,6 +222,24 @@ def setup() -> argparse.Namespace:
         args.gauss_count = args.column_count * args.primitives_per_column
         args.densify_until = 0
         args.relocate_until = 0
+
+    # resolve adaptation defaults and exclude fixed-size grouped acceleration.
+    if args.use_adaptive_columns:
+        if not args.use_columns_representation or args.use_column_bvh:
+            parser.error('--use_adaptive_columns requires --use_columns_representation without --use_column_bvh')
+        args.column_adapt_from = args.column_adapt_from or max(1, int(args.iterations_gaussian * args.warmup_ratio))
+        args.column_adapt_until = args.column_adapt_until or max(1, int(args.iterations_gaussian * 0.8))
+        args.column_max_primitives = args.column_max_primitives or 2 * args.gauss_count
+        if args.column_adapt_every <= 0 or not 1 <= args.column_adapt_from <= args.column_adapt_until <= args.iterations_gaussian:
+            parser.error('Column adaptation requires a positive interval and a valid iteration window')
+        if args.column_max_primitives < args.gauss_count or args.column_max_primitives_per_column < args.primitives_per_column or args.column_max_splits < 0:
+            parser.error('Column adaptation caps must cover initial primitives; column_max_splits must be nonnegative')
+        if not np.isfinite(args.column_split_grad_threshold) or args.column_split_grad_threshold <= 0:
+            parser.error('column_split_grad_threshold must be positive and finite')
+        if not 0 < args.column_prune_weight_threshold <= 1 or not 0 < args.column_prune_density_threshold < np.inf:
+            parser.error('Column pruning requires a weight fraction in (0, 1] and positive finite peak density')
+        if args.column_prune_checks <= 0 or args.column_protection_checks < 0:
+            parser.error('Column pruning requires positive observation checks and nonnegative protection checks')
 
     if args.volume_grid is None:
         parser.error("no volume: pass a preset/volume target (e.g. `wdas8` or "
@@ -982,6 +1014,8 @@ def create_scene_dict_from_primitives(
     # validate the grouped acceleration layout before scene creation.
     if use_column_bvh and (not use_columns_representation or columns is None or level != 0):
         raise ValueError('Column BVH requires Gaussian-level shared column parameters')
+    if use_column_bvh and np.any(columns.primitive_count_per_column.numpy() != columns.primitives_per_column):
+        raise ValueError('Column BVH requires a fixed group size; use per-primitive geometry for variable column counts')
 
     # Expand shared columns into primitive arrays before creating the scene.
     if use_columns_representation:
@@ -1061,12 +1095,11 @@ def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optim
         if columns is None:
             raise ValueError('Gaussian column layout is required for column optimization')
 
-        # Select one representative primitive for each shared XZ footprint.
+        # select the first primitive of each variable-length column.
         primitive_count = dr.width(ellipsoids.center)
-        primitives_per_column = columns.primitives_per_column
-        if primitive_count % primitives_per_column:
+        if primitive_count != dr.width(columns.primitive_indices):
             raise ValueError('Scene primitive count does not match the column layout')
-        indices = dr.arange(mi.UInt32, primitive_count // primitives_per_column) * primitives_per_column
+        indices = dr.gather(mi.UInt32, columns.column_offsets, dr.arange(mi.UInt32, dr.width(columns.primitive_count_per_column)))
         opt['column_center_xz'] = dr.gather(mi.Point2f, mi.Point2f(ellipsoids.center.x, ellipsoids.center.z), indices)
         opt['column_scale_xz'] = dr.gather(mi.Vector2f, mi.Vector2f(ellipsoids.scale.x, ellipsoids.scale.z), indices)
         angles = 2.0 * dr.atan2(ellipsoids.quat.y, ellipsoids.quat.w)
@@ -1128,6 +1161,12 @@ def write_optimizer_params_to_scene(opt: mi.ad.Optimizer, params: mi.SceneParame
         params[f'{primitive_name}.data'] = Ellipsoid.ravel(centers, scales, quaternions)
         params[f'{primitive_name}.opacities'] = primitive_opacity
         params[f'{primitive_name}.omega'] = dr.zeros(mi.Float, dr.width(primitive_opacity))
+
+        # resize constant albedo together with changing primitive geometry.
+        albedo_key = f'{primitive_name}.albedo'
+        albedo_count = 3 * dr.width(primitive_opacity)
+        if albedo_key not in params or dr.width(params[albedo_key]) != albedo_count:
+            params[albedo_key] = dr.full(mi.Float, getattr(columns, 'init_albedo', 0.0), albedo_count)
     else:
         # Normalize rotations and write independent primitive parameters.
         opt[f'quaternions_{level}'] = dr.normalize(opt[f'quaternions_{level}'])
@@ -1168,6 +1207,7 @@ def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_repre
         for name in ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity'):
             primitive[name] = np.asarray(parameters[name], dtype=np.float32).reshape(-1).copy()
         primitive['primitives_per_column'] = columns.primitives_per_column
+        primitive['primitive_count_per_column'] = columns.primitive_count_per_column.numpy().copy()
 
     # select the output representation without passing columns to the ply writer.
     gfields.io.dict_to_asset(final_asset, str(asset_dir), use_columns_representation=use_columns_representation)
@@ -1294,6 +1334,218 @@ def load_model(path: Path, max_depth: int, integrator_type: str = 'gfields_tomog
 
 
 # region Densify, Prune and Regularize
+
+
+def _reset_column_y_gradient_stats(columns):
+    # start a fresh observation window for the current primitive layout.
+    primitive_count = dr.width(columns.parameters['primitive_center_y'])
+    columns.y_gradient_sum = dr.zeros(mi.Float, primitive_count)
+    columns.y_gradient_samples = dr.zeros(mi.UInt32, primitive_count)
+
+
+def accumulate_column_y_gradients(columns):
+    """Collect detached absolute Y gradients after backward and before opt.step()."""
+    # initialize observations and reject stale statistics after external resizing.
+    primitive_count = dr.width(columns.parameters['primitive_center_y'])
+    if not hasattr(columns, 'y_gradient_sum'):
+        _reset_column_y_gradient_stats(columns)
+    if dr.width(columns.y_gradient_sum) != primitive_count or dr.width(columns.y_gradient_samples) != primitive_count:
+        raise ValueError('Reset column Y gradient statistics after changing the primitive layout')
+
+    # ignore non-finite observations instead of allowing them to trigger splits.
+    gradient = dr.detach(dr.abs(dr.grad(columns.parameters['primitive_center_y'])))
+    valid = dr.isfinite(gradient)
+    columns.y_gradient_sum += dr.select(valid, gradient, 0.0)
+    columns.y_gradient_samples += mi.UInt32(valid)
+    dr.eval(columns.y_gradient_sum, columns.y_gradient_samples)
+
+
+def _remap_column_primitive_optimizer(opt, source_indices, values, retained=True):
+    # keep old optimizer state for surviving primitives and zero new child moments.
+    source_indices = mi.UInt32(source_indices)
+    for name, updated in values.items():
+        _, _, learning_rate, extra = opt.state[name]
+        step, first_moment, second_moment, *rest = extra
+        moments = [first_moment, second_moment, *rest]
+        moments = [None if moment is None else dr.select(retained, dr.gather(type(moment), moment, source_indices), 0.0) for moment in moments]
+        if dr.width(step) != 1:
+            step = dr.select(retained, dr.gather(type(step), step, source_indices), 0)
+        opt[name] = type(opt[name])(updated.astype(np.float32))
+        value, promoted, _, _ = opt.state[name]
+        opt.state[name] = value, promoted, learning_rate, (step, *moments)
+
+
+def _read_column_primitive_parameters(columns):
+    # read independent Y parameters and their contiguous column layout.
+    opt = columns.column_optimizer
+    names = ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity')
+    values = {name: opt[name].numpy().astype(np.float64) for name in names}
+    counts = columns.primitive_count_per_column.numpy().astype(np.int64)
+    parents = columns.primitive_indices.numpy()
+    return opt, values, counts, parents
+
+
+def _update_column_primitives(columns, source_indices, values, counts, retained=True, reset_gradients=False):
+    # reuse optimizer state and update the shared column layout.
+    _remap_column_primitive_optimizer(columns.column_optimizer, source_indices, values, retained)
+    source_indices = mi.UInt32(source_indices)
+    columns.set_primitive_count_per_column(counts)
+
+    # preserve survivor histories and start new children with zero pruning observations.
+    for name in ('primitive_prune_check_count', 'primitive_low_contribution_checks'):
+        history = dr.gather(mi.UInt32, getattr(columns, name), source_indices)
+        setattr(columns, name, dr.select(retained, history, 0))
+
+    # reset split observation windows or preserve gradients for pruning survivors.
+    if reset_gradients:
+        _reset_column_y_gradient_stats(columns)
+    elif hasattr(columns, 'y_gradient_sum'):
+        columns.y_gradient_sum = dr.gather(mi.Float, columns.y_gradient_sum, source_indices)
+        columns.y_gradient_samples = dr.gather(mi.UInt32, columns.y_gradient_samples, source_indices)
+
+
+def split_column_primitives_y(columns, *, gradient_threshold: float, max_primitives_per_column: int,
+                              max_primitives: int, max_splits: int, min_gradient_samples: int = 4,
+                              split_offset_ratio: float = 0.5) -> int:
+    """Split ranked Y primitives after opt.step(); consume the current gradient window."""
+    # read current parameters and consume the accumulated gradient observations.
+    if not hasattr(columns, 'y_gradient_sum'):
+        return 0
+    opt, values, counts, parents = _read_column_primitive_parameters(columns)
+    primitive_count = len(parents)
+    samples = columns.y_gradient_samples.numpy()
+    scores = columns.y_gradient_sum.numpy().astype(np.float64) / np.maximum(samples, 1)
+    _reset_column_y_gradient_stats(columns)
+
+    # limit growth by the current split budget and global primitive capacity.
+    split_budget = min(max_splits, max_primitives - primitive_count)
+    if split_budget <= 0:
+        return 0
+    center_upper, center_lower = opt.bounds.get('primitive_center_y', (1.0, -1.0))
+    _, scale_lower = opt.bounds.get('primitive_scale_y', (None, None))
+    _, opacity_lower = opt.bounds.get('primitive_opacity', (None, None))
+
+    # keep child scales, weights, and centers inside their optimizer bounds.
+    centers = values['primitive_center_y']
+    scales = values['primitive_scale_y']
+    weights = values['primitive_opacity']
+    distance = scales * split_offset_ratio
+    child_scales = scales * np.sqrt(1.0 - split_offset_ratio ** 2)
+    scale_floor = max(float(columns.scale_lower_bounds['primitive_scale_y']), float(scale_lower) if scale_lower is not None else 0.0)
+    valid = (samples >= min_gradient_samples) & (scores >= gradient_threshold)
+    valid &= (child_scales >= scale_floor) & (weights > 0) & (weights * 0.5 >= (float(opacity_lower) if opacity_lower is not None else 0.0))
+    if center_lower is not None:
+        valid &= centers - distance >= float(center_lower)
+    if center_upper is not None:
+        valid &= centers + distance <= float(center_upper)
+
+    # prioritize larger average gradients while respecting each column's capacity.
+    candidates = np.flatnonzero(valid)
+    candidates = candidates[np.argsort(-scores[candidates], kind='stable')]
+    selected = []
+    for index in candidates:
+        column_index = parents[index]
+        if counts[column_index] >= max_primitives_per_column:
+            continue
+        selected.append(index)
+        counts[column_index] += 1
+        if len(selected) >= split_budget:
+            break
+    if not selected:
+        return 0
+
+    # replace each selected parent with two consecutive children in the same column.
+    selected = np.asarray(selected, dtype=np.int64)
+    repeats = np.ones(primitive_count, dtype=np.int64)
+    repeats[selected] = 2
+    source_indices = np.repeat(np.arange(primitive_count, dtype=np.uint32), repeats)
+    first_children = np.cumsum(repeats)[selected] - 2
+    child_mask = np.repeat(repeats == 2, repeats)
+
+    # preserve total weight, mean, and variance while separating child centers along y.
+    updated = {name: value[source_indices].copy() for name, value in values.items()}
+    updated['primitive_center_y'][first_children] -= distance[selected]
+    updated['primitive_center_y'][first_children + 1] += distance[selected]
+    updated['primitive_scale_y'][child_mask] = child_scales[source_indices[child_mask]]
+    updated['primitive_opacity'][child_mask] *= 0.5
+    _update_column_primitives(columns, source_indices, updated, counts, mi.Bool(~child_mask), reset_gradients=True)
+    return len(selected)
+
+
+def prune_column_primitives(columns, *, relative_weight_threshold: float, peak_density_threshold: float,
+                            min_low_contribution_checks: int = 3, protection_checks: int = 2) -> int:
+    """Prune after consecutive weak checks, protecting new children and keeping one primitive per column.
+
+    Relative weight is the fraction of column mass; peak density uses a normalized 3D Gaussian.
+    Call once per scheduled check after opt.step(), then write updated parameters to the scene.
+    """
+    # compute peak density using shared XZ scales and independent Y scales.
+    opt, values, counts, parents = _read_column_primitive_parameters(columns)
+    primitive_count = len(parents)
+    weights = np.abs(values['primitive_opacity'])
+    shared_scales = opt['column_scale_xz'].numpy().astype(np.float64)
+    volume = np.prod(shared_scales, axis=0)[parents] * values['primitive_scale_y']
+    finite = np.isfinite(weights) & np.isfinite(volume) & (volume > 0)
+    finite &= np.all(np.isfinite(shared_scales) & (shared_scales > 0), axis=0)[parents]
+    finite &= np.isfinite(values['primitive_center_y']) & (values['primitive_scale_y'] > 0)
+    density = np.full(primitive_count, np.inf)
+    np.divide(weights, (2.0 * np.pi) ** 1.5 * volume, out=density, where=finite)
+
+    # require both a small share of column weight and a small absolute peak density.
+    total_weight = np.bincount(parents, weights=np.where(finite, weights, 0.0), minlength=len(counts))
+    relative_weight = np.zeros(primitive_count, dtype=np.float64)
+    np.divide(weights, total_weight[parents], out=relative_weight, where=total_weight[parents] > 0)
+    low = finite & np.isfinite(density) & (relative_weight < relative_weight_threshold) & (density < peak_density_threshold)
+    age = columns.primitive_prune_check_count.numpy().astype(np.uint64)
+    streak = columns.primitive_low_contribution_checks.numpy().astype(np.uint64)
+
+    # count consecutive weak checks only after the child protection period has ended.
+    maximum = np.iinfo(np.uint32).max
+    streak = np.where(low & (age >= protection_checks), np.minimum(streak + 1, maximum), 0)
+    age = np.minimum(age + 1, maximum)
+    remove = streak >= min_low_contribution_checks
+
+    # preserve the largest weight if all primitives in a column would be deleted.
+    offsets = columns.column_offsets.numpy()
+    for start, end in zip(offsets[:-1], offsets[1:]):
+        if np.all(remove[start:end]):
+            remove[int(start) + int(np.argmax(weights[start:end]))] = False
+
+    # retain the observation history even when this check deletes no primitives.
+    columns.primitive_low_contribution_checks = mi.UInt32(streak.astype(np.uint32))
+    columns.primitive_prune_check_count = mi.UInt32(age.astype(np.uint32))
+    pruned_count = int(np.count_nonzero(remove))
+    if pruned_count == 0:
+        return 0
+
+    # compact surviving parameters, optimizer state, histories, and accumulated gradients together.
+    keep = np.flatnonzero(~remove).astype(np.uint32)
+    updated = {name: value[keep] for name, value in values.items()}
+    counts = np.bincount(parents[keep], minlength=len(counts))
+    _update_column_primitives(columns, keep, updated, counts)
+    return pruned_count
+
+
+def adapt_column_primitives(columns, args, iteration: int):
+    """Run pruning before splitting at the configured checks; scene writing belongs to the caller."""
+    # keep ordinary and fixed-layout training unchanged outside the adaptation window.
+    result = {'pruned': 0, 'split': 0}
+    if not args.use_adaptive_columns or not args.column_adapt_from <= iteration <= args.column_adapt_until:
+        return result
+    if iteration % args.column_adapt_every:
+        return result
+
+    # preserve survivor gradient observations so splitting can use the same check window.
+    result['pruned'] = prune_column_primitives(
+        columns, relative_weight_threshold=args.column_prune_weight_threshold,
+        peak_density_threshold=args.column_prune_density_threshold,
+        min_low_contribution_checks=args.column_prune_checks, protection_checks=args.column_protection_checks)
+    result['split'] = split_column_primitives_y(
+        columns, gradient_threshold=args.column_split_grad_threshold,
+        max_primitives_per_column=args.column_max_primitives_per_column,
+        max_primitives=args.column_max_primitives, max_splits=args.column_max_splits)
+    args.gauss_count = dr.width(columns.parameters['primitive_center_y'])
+    return result
 
 
 def relocate_dead_primitives(opt: gfields.optimizers.BoundedAdam, params: mi.SceneParameters, level: int, threshold: float = 1e-6,

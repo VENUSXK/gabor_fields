@@ -15,6 +15,7 @@ from math import prod
 
 import drjit as dr
 import mitsuba as mi
+import numpy as np
 
 from volprim.integrators.stack import alloc_stack
 
@@ -101,12 +102,13 @@ class Ellipsoid:
 #-------------------------------------------------------------------------------
 
 class GaussianColumn:
+    """Shared XZ footprints with contiguous, variable-length primitive groups."""
     parameter_names = ('column_center_xz', 'column_scale_xz', 'column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'primitive_opacity')
 
-    def __init__(self, parameters, primitives_per_column, scale_lower_bounds=None):
-        # Validate the number of primitives in each column.
-        if primitives_per_column <= 0:
-            raise ValueError("primitives_per_column must be positive")
+    def __init__(self, parameters, primitives_per_column, scale_lower_bounds=None, *, primitive_count_per_column=None):
+        # validate the initial number of primitives per column.
+        if isinstance(primitives_per_column, (bool, np.bool_)) or not isinstance(primitives_per_column, (int, np.integer)) or primitives_per_column <= 0:
+            raise ValueError('primitives_per_column must be a positive integer')
 
         # Keep generated parameters until the scene and optimizer are ready.
         self.column_optimizer = parameters if hasattr(parameters, 'state') else None
@@ -116,10 +118,51 @@ class GaussianColumn:
             'column_scale_xz': [1e-5, 1e-5], 'primitive_scale_y': 1e-5
         }
 
+        # build the initial fixed or variable column layout.
+        if primitive_count_per_column is None:
+            primitive_count_per_column = np.full(dr.width(parameters['column_center_xz']), primitives_per_column, dtype=np.int64)
+        self.set_primitive_count_per_column(primitive_count_per_column)
+
+        # track consecutive low contribution and protect future split children.
+        primitive_count = dr.width(self.primitive_indices)
+        self.primitive_low_contribution_checks = dr.zeros(mi.UInt32, primitive_count)
+        self.primitive_prune_check_count = dr.full(mi.UInt32, np.iinfo(np.uint32).max, primitive_count)
+
     @property
     def parameters(self):
         # Read live optimizer values after binding, otherwise initial parameters.
         return self.column_optimizer if self.column_optimizer is not None else self._parameters
+
+    def set_primitive_count_per_column(self, primitive_count_per_column):
+        """Rebuild layout indices after updating contiguous primitive arrays."""
+        # validate one positive integer count for each shared footprint.
+        counts = np.asarray(primitive_count_per_column)
+        column_count = dr.width(self.parameters['column_center_xz'])
+        if counts.ndim != 1 or counts.size != column_count or counts.dtype.kind not in 'iu':
+            raise ValueError('primitive_count_per_column must contain one integer per column')
+        if np.any(counts <= 0) or np.any(counts > np.iinfo(np.uint32).max):
+            raise ValueError('primitive_count_per_column must contain positive UInt32 counts')
+
+        # check parameter widths before replacing the current layout.
+        primitive_count = sum(int(count) for count in counts)
+        if primitive_count > np.iinfo(np.uint32).max:
+            raise ValueError('Total primitive count exceeds UInt32 indexing')
+        self._validate_parameter_counts(column_count, primitive_count)
+        counts = counts.astype(np.uint32)
+        offsets = np.concatenate((np.zeros(1, dtype=np.uint64), np.cumsum(counts, dtype=np.uint64)))
+
+        # map contiguous primitive ranges to their shared column parameters.
+        indices = np.repeat(np.arange(column_count, dtype=np.uint32), counts.astype(np.int64))
+        self.primitive_count_per_column = mi.UInt32(counts)
+        self.column_offsets = mi.UInt32(offsets.astype(np.uint32))
+        self.primitive_indices = mi.UInt32(indices)
+
+    def _validate_parameter_counts(self, column_count, primitive_count):
+        # reject inconsistent shared and independent parameter arrays.
+        for name in self.parameter_names:
+            expected_count = column_count if name.startswith('column_') else primitive_count
+            if dr.width(self.parameters[name]) != expected_count:
+                raise ValueError(f'{name} must contain {expected_count} entries for the column layout')
 
     def parameter_stats(self):
         optimizer = self.parameters
@@ -131,6 +174,8 @@ class GaussianColumn:
         return {
             'column_count': column_count,
             'primitives_per_column': self.primitives_per_column,
+            'min_primitives_per_column': int(np.min(self.primitive_count_per_column.numpy())),
+            'max_primitives_per_column': int(np.max(self.primitive_count_per_column.numpy())),
             'expanded_gaussian_count': primitive_count,
             'trainable_parameter_count': parameter_count,
             'trainable_parameter_bytes': 4 * parameter_count,
@@ -140,18 +185,14 @@ class GaussianColumn:
         }
 
     def expand(self):
-        # Read the primitive and column counts from the current parameters.
+        # validate live parameter widths against the current column layout.
         column_optimizer = self.parameters
-        primitive_count = dr.width(column_optimizer["primitive_center_y"])
-        column_count = dr.width(column_optimizer["column_center_xz"])
+        column_count = dr.width(self.primitive_count_per_column)
+        primitive_count = dr.width(self.primitive_indices)
+        self._validate_parameter_counts(column_count, primitive_count)
 
-        # Check that all columns contain the expected number of primitives.
-        if primitive_count != column_count * self.primitives_per_column:
-            raise ValueError("Axial primitive count does not match column count")
-        
-        # Map each primitive to its parent column.
-        primitive_indices = dr.arange(mi.UInt32, primitive_count)
-        column_indices = primitive_indices // self.primitives_per_column
+        # read each primitive's parent column without assuming a uniform count.
+        column_indices = self.primitive_indices
 
         # Expand shared XZ positions, scales, and rotations to each primitive.
         column_center_xz = dr.gather(mi.Point2f, column_optimizer["column_center_xz"], column_indices)

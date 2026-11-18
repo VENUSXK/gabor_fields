@@ -177,7 +177,7 @@ def parse_args():
                         help='Render Gaussian pyramid of the asset')
     parser.add_argument('--render_pyramid_laplacian', action='store_true',
                         help='Render Laplacian pyramid of the asset')
-    parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
+    parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY; variable column counts use per-primitive geometry')
     parser.add_argument('--multiple_scattering', action='store_true',
                         help='Enable multiple scattering rendering')
     parser.add_argument('--no_nee', action='store_true',
@@ -392,7 +392,7 @@ def _video_parse_args() -> argparse.Namespace:
         prog='gfields.render video',
         description='Env-map-lit turntable / rotating-envmap video of an asset')
     p.add_argument('asset', help='Optimized asset directory (unified data/root.primitives_pyr*.ply layout)')
-    p.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY parameters and render with grouped column BVH')
+    p.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY; variable column counts use per-primitive geometry')
     p.add_argument('--motion', choices=['turntable', 'envmap'],
                    default='turntable', help='Camera orbit or rotating env map')
     p.add_argument('--envmap', default=str(default_envmap),

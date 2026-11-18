@@ -394,16 +394,23 @@ def load_ellipsoid_ply(filename, use_columns_representation=False):
             if missing_fields:
                 raise ValueError(f'Column PLY element {name!r} is missing fields: {sorted(missing_fields)}')
 
-        # restore file-wide settings and the fixed-size column layout.
+        # restore file-wide settings and support legacy fixed-size column layouts.
         if len(ply['metadata'].data) != 1:
             raise ValueError('Column PLY must contain exactly one metadata record')
         metadata = ply['metadata'].data[0]
-        if int(metadata['format_version']) != 1:
+        version = int(metadata['format_version'])
+        if version not in (1, 2):
             raise ValueError(f'Unsupported column PLY version: {metadata["format_version"]}')
         columns, primitives = ply['column'].data, ply['primitive'].data
         primitives_per_column = int(metadata['primitives_per_column'])
-        if primitives_per_column <= 0 or not len(columns) or len(primitives) != len(columns) * primitives_per_column:
-            raise ValueError('Column PLY primitive count must equal column count times primitives_per_column')
+        if version == 2:
+            if 'primitive_count' not in columns.dtype.names:
+                raise ValueError('Column PLY version 2 requires primitive_count in the column table')
+            counts = columns['primitive_count'].astype(np.uint32)
+        else:
+            counts = np.full(len(columns), primitives_per_column, dtype=np.uint32)
+        if primitives_per_column <= 0 or not len(columns) or np.any(counts == 0) or sum(map(int, counts)) != len(primitives):
+            raise ValueError('Positive per-column counts must sum to the primitive record count')
 
         # preserve physical scales and map the saved angle to the existing class key.
         out = {
@@ -426,7 +433,7 @@ def load_ellipsoid_ply(filename, use_columns_representation=False):
             raise ValueError('Column PLY requires a finite positive extent and finite RGB albedo')
 
         # return compact parameters without expanding or creating an optimizer.
-        out.update(primitives_per_column=primitives_per_column, extent=extent, albedo=albedo)
+        out.update(primitives_per_column=primitives_per_column, primitive_count_per_column=counts, extent=extent, albedo=albedo)
         return out
 
     # keep gaussian log-scale and quaternion decoding unchanged.
