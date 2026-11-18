@@ -132,6 +132,12 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--use_columns_representation', '--gaussian_columns', dest='use_columns_representation', action='store_true', help='Fit shared-XZ Gaussian columns (Gaussian stage only; expanded for rendering)')
     parser.add_argument('--use_column_bvh', action='store_true', help='Trace one analytic BVH bound per column while retaining per-primitive integration')
     parser.add_argument('--init_from_columns', action='store_true', help='Initialize independent Gaussians from expanded columns without sharing their optimization parameters')
+    parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Fit fixed FGC groups using per-Gaussian rendering')
+    parser.add_argument('--init_from_factorized_columns', action='store_true', help='Initialize independent Gaussians from the same expanded FGC layout')
+    parser.add_argument('--group_count', type=int, default=512, help='Number of FGC groups')
+    parser.add_argument('--xz_gaussians_per_group', type=int, default=6, help='XZ Gaussian components per FGC group')
+    parser.add_argument('--y_gaussians_per_group', type=int, default=8, help='Y Gaussian components per FGC group')
+    parser.add_argument('--mixture_lr', type=float, default=1.0, help='Learning-rate multiplier for normalized FGC mixture logits')
     parser.add_argument('--column_count', type=int, default=64, help='Total number of shared XZ footprints, distributed among initialization slabs')
     parser.add_argument('--primitives_per_column', type=int, default=4, help='Number of axial Gaussian primitives per column')
     parser.add_argument('--column_slab_depth', type=int, default=0, help='Initialization slab depth in y voxels; 0 uses the complete occupied y range; tails remain unrestricted')
@@ -210,6 +216,23 @@ def setup() -> argparse.Namespace:
         if args.column_count <= 0 or args.primitives_per_column <= 0 or args.column_slab_depth < 0:
             parser.error('Column counts must be positive; column_slab_depth must be non-negative')
         args.gauss_count = args.column_count * args.primitives_per_column
+
+    # keep factorized training and its matched independent baseline mutually exclusive.
+    fgc_mode = args.use_factorized_columns_representation or args.init_from_factorized_columns
+    if fgc_mode:
+        if args.use_factorized_columns_representation and args.init_from_factorized_columns:
+            parser.error('Choose FGC training or independent FGC initialization')
+        if args.use_columns_representation or args.init_from_columns or args.use_column_bvh or args.use_adaptive_columns:
+            parser.error('FGC modes require per-Gaussian geometry without Column initialization or adaptation')
+        if min(args.group_count, args.xz_gaussians_per_group, args.y_gaussians_per_group) <= 0 or args.column_slab_depth < 0:
+            parser.error('FGC counts must be positive and column_slab_depth must be nonnegative')
+        if args.from_gaussian_checkpoint or args.from_gabor_checkpoint or args.skip_gaussian_optim or args.post_refine or args.post_prune or args.post_clamp:
+            parser.error('FGC comparisons require fresh Gaussian-stage training without post-refinement')
+        if not np.isfinite(args.mixture_lr) or args.mixture_lr < 0 or args.init_opacity <= 0 or args.column_lr <= 0:
+            parser.error('FGC requires positive initial opacity and column_lr, and a finite nonnegative mixture_lr')
+        args.gauss_count = args.group_count * args.xz_gaussians_per_group * args.y_gaussians_per_group
+        args.skip_gabor_optim = True
+        args.densify_until = args.relocate_until = 0
 
     if args.use_columns_representation:
         if args.from_gaussian_checkpoint:
@@ -556,6 +579,52 @@ def generate_random_columns(
     volume_config: VolumeConfig, column_slab_depth: int = 0, seed_offset: int = 0,
 ) -> GaussianColumn:
     """Generate column parameters without creating an optimizer."""
+    # reuse slab sampling and geometry initialization for ordinary columns.
+    parameters, scale_lower_bounds = _generate_column_parameters(
+        column_count, primitives_per_column, init_opacities, init_scale, volume=volume,
+        volume_config=volume_config, column_slab_depth=column_slab_depth, seed_offset=seed_offset,
+    )
+    columns = GaussianColumn(parameters, primitives_per_column, scale_lower_bounds)
+    columns.init_albedo = float(init_albedo)
+    return columns
+
+
+def generate_random_factorized_columns(
+    group_count: int, xz_gaussians_per_group: int, y_gaussians_per_group: int,
+    init_opacities: float, init_scale: float, init_albedo: float, *, volume: np.ndarray,
+    volume_config: VolumeConfig, column_slab_depth: int = 0, seed_offset: int = 0,
+) -> FactorizedGaussianColumn:
+    """Initialize local XZ mixtures sharing Y factors; init_opacities is per expanded Gaussian."""
+    # validate factor counts before generating the shared layout.
+    counts = (group_count, xz_gaussians_per_group, y_gaussians_per_group)
+    if any(isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count <= 0 for count in counts):
+        raise ValueError('FGC group and component counts must be positive integers')
+    if not np.isfinite(init_opacities) or init_opacities < 0:
+        raise ValueError('FGC init_opacities must be finite and nonnegative')
+
+    # generate local XZ patterns and one axial mixture per group.
+    parameters, scale_lower_bounds = _generate_column_parameters(
+        group_count, y_gaussians_per_group, init_opacities, init_scale, volume=volume,
+        volume_config=volume_config, column_slab_depth=column_slab_depth, seed_offset=seed_offset,
+        xz_gaussians_per_group=xz_gaussians_per_group,
+    )
+    parameters.pop('primitive_opacity')
+    parameters['xz_logits'] = dr.zeros(mi.Float, group_count * xz_gaussians_per_group)
+    parameters['y_logits'] = dr.zeros(mi.Float, group_count * y_gaussians_per_group)
+    parameters['group_opacity'] = dr.full(mi.Float, init_opacities * xz_gaussians_per_group * y_gaussians_per_group, group_count)
+
+    # retain rendering metadata without creating an optimizer.
+    columns = FactorizedGaussianColumn(parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds)
+    columns.init_albedo = float(init_albedo)
+    return columns
+
+
+def _generate_column_parameters(
+    column_count: int, primitives_per_column: int, init_opacities: float, init_scale: float,
+    *, volume: np.ndarray, volume_config: VolumeConfig, column_slab_depth: int = 0,
+    seed_offset: int = 0, xz_gaussians_per_group: int = 1,
+):
+    """Share slab projection sampling and voxel-aware scales between Column and FGC."""
     # Validate the column layout and reference volume.
     primitive_count = primitives_per_column
     if column_count <= 0 or primitive_count <= 0:
@@ -595,30 +664,49 @@ def generate_random_columns(
         projection = np.maximum(volume[int(slab_start):min(int(slab_start) + slab_depth, end_y)], 0.0).sum(axis=0, dtype=np.float64)
         probabilities = projection.reshape(-1)
         total = probabilities.sum()
-        slab_projections[slab_index] = (projection.shape, probabilities / total if total > 0.0 else None)
+        slab_projections[slab_index] = (projection, probabilities / total if total > 0.0 else None)
+
+    # size each local pattern by group coverage and each footprint by XZ component count.
+    columns_per_slab = column_count / len(slab_starts)
+    group_scale = np.clip(abs(init_scale) * 0.5 / np.sqrt(columns_per_slab), 1e-4, 0.5)
+    footprint_scale = np.clip(group_scale / np.sqrt(xz_gaussians_per_group), 1e-4, 0.5)
 
     # Sample column XZ positions and distribute primitives along Y.
     for column_index, slab_index in enumerate(slab_indices):
         lower, upper = int(slab_starts[slab_index]), min(int(slab_starts[slab_index]) + slab_depth, end_y)
-        projection_shape, probabilities = slab_projections[slab_index]
-        pixel = rng.choice(np.prod(projection_shape), p=probabilities)
-        pixel_z, pixel_x = np.unravel_index(pixel, projection_shape)
+        projection, probabilities = slab_projections[slab_index]
+        pixel = rng.choice(projection.size, p=probabilities)
+        pixel_z, pixel_x = np.unravel_index(pixel, projection.shape)
+        pixels_x, pixels_z = [pixel_x], [pixel_z]
 
-        centers_x.append(matrix[0, 0] * ((pixel_x + 0.5) / volume.shape[2]) + matrix[0, 3])
-        centers_z.append(matrix[1, 1] * ((pixel_z + 0.5) / volume.shape[1]) + matrix[1, 3])
+        # sample remaining XZ components from the density near the group anchor.
+        if xz_gaussians_per_group > 1:
+            radius_x = max(1, int(np.ceil(group_scale * volume.shape[2] / abs(matrix[0, 0]))))
+            radius_z = max(1, int(np.ceil(group_scale * volume.shape[1] / abs(matrix[1, 1]))))
+            lower_x, upper_x = max(0, pixel_x - radius_x), min(projection.shape[1], pixel_x + radius_x + 1)
+            lower_z, upper_z = max(0, pixel_z - radius_z), min(projection.shape[0], pixel_z + radius_z + 1)
+            local_projection = projection[lower_z:upper_z, lower_x:upper_x]
+            local_probabilities = local_projection.reshape(-1)
+            local_total = local_probabilities.sum()
+            local_pixels = rng.choice(local_projection.size, size=xz_gaussians_per_group - 1,
+                                      p=local_probabilities / local_total if local_total > 0.0 else None)
+            local_z, local_x = np.unravel_index(local_pixels, local_projection.shape)
+            pixels_x.extend(local_x + lower_x)
+            pixels_z.extend(local_z + lower_z)
+
+        # map sampled pixel centers into the original world XZ coordinates.
+        centers_x.extend(matrix[0, 0] * ((np.asarray(pixels_x) + 0.5) / volume.shape[2]) + matrix[0, 3])
+        centers_z.extend(matrix[1, 1] * ((np.asarray(pixels_z) + 0.5) / volume.shape[1]) + matrix[1, 3])
 
         normalized_y = (lower + (np.arange(primitive_count) + 0.5) * (upper - lower) / primitive_count) / volume.shape[0]
         primitive_center_y.extend(matrix[2, 2] * normalized_y + matrix[2, 3])
         primitive_scale_y.extend([max(1e-4, abs(matrix[2, 2]) * (upper - lower) / volume.shape[0] / primitive_count * 0.65)] * primitive_count)
 
     # Initialize shared column parameters and independent primitive parameters.
-    columns_per_slab = column_count / len(slab_starts)
-    footprint_scale = np.clip(abs(init_scale) * 0.5 / np.sqrt(columns_per_slab), 1e-4, 0.5)
-
     parameters = {
         'column_center_xz': mi.Point2f(centers_x, centers_z),
-        'column_scale_xz': mi.Vector2f(dr.full(mi.Float, footprint_scale, column_count)),
-        'column_quaternions': rng.uniform(-np.pi, np.pi, column_count),
+        'column_scale_xz': mi.Vector2f(dr.full(mi.Float, footprint_scale, column_count * xz_gaussians_per_group)),
+        'column_quaternions': rng.uniform(-np.pi, np.pi, column_count * xz_gaussians_per_group),
         'primitive_center_y': primitive_center_y,
         'primitive_scale_y': primitive_scale_y,
         'primitive_opacity': np.full(column_count * primitive_count, init_opacities)
@@ -639,9 +727,7 @@ def generate_random_columns(
                 values = np.maximum(values, scale_lower_bounds[name])
             parameters[name] = mi.Float(values)
 
-    columns = GaussianColumn(parameters, primitive_count, scale_lower_bounds)
-    columns.init_albedo = float(init_albedo)
-    return columns
+    return parameters, scale_lower_bounds
 
 
 def generate_random_kernels(
@@ -650,22 +736,30 @@ def generate_random_kernels(
     volume: Optional[np.ndarray] = None, volume_config: Optional[VolumeConfig] = None,
     opacity_sampling_grid: Optional[np.ndarray] = None, target_level: int = 0,
     *, init_from_columns: bool = False, primitives_per_column: int = 4,
-    column_slab_depth: int = 0, seed_offset: int = 0,
+    column_slab_depth: int = 0, seed_offset: int = 0, init_from_factorized_columns: bool = False,
+    xz_gaussians_per_group: int = 6, y_gaussians_per_group: int = 8,
 ) -> Dict[str, mi.TensorXf]:
-    if init_from_columns:
+    if init_from_columns or init_from_factorized_columns:
+        if init_from_columns and init_from_factorized_columns:
+            raise ValueError('Choose Column or FGC initialization')
         if level != 0:
             raise ValueError('Column initialization is supported only for Gaussian level 0')
-        if num_kernels <= 0 or primitives_per_column <= 0 or num_kernels % primitives_per_column:
+        components_per_group = xz_gaussians_per_group * y_gaussians_per_group if init_from_factorized_columns else primitives_per_column
+        if num_kernels <= 0 or components_per_group <= 0 or num_kernels % components_per_group:
             raise ValueError('num_kernels must be positive and divisible by primitives_per_column')
         column_volume = opacity_sampling_grid if opacity_sampling_grid is not None else volume
         if column_volume is None or volume_config is None:
             raise ValueError('Volume and volume_config must be provided for column initialization')
         # Generate the shared layout using the existing column initializer.
-        initial_columns = generate_random_columns(
-            num_kernels // primitives_per_column, primitives_per_column, init_opacities, init_scale, init_albedo,
-            volume=column_volume, volume_config=volume_config,
-            column_slab_depth=column_slab_depth, seed_offset=seed_offset,
-        )
+        sampling_kwargs = dict(volume=column_volume, volume_config=volume_config,
+                               column_slab_depth=column_slab_depth, seed_offset=seed_offset)
+        if init_from_factorized_columns:
+            initial_columns = generate_random_factorized_columns(
+                num_kernels // components_per_group, xz_gaussians_per_group, y_gaussians_per_group,
+                init_opacities, init_scale, init_albedo, **sampling_kwargs)
+        else:
+            initial_columns = generate_random_columns(
+                num_kernels // primitives_per_column, primitives_per_column, init_opacities, init_scale, init_albedo, **sampling_kwargs)
 
         # Expand the layout before copying it into independent scene arrays.
         centers, scales, quaternions, opacities = initial_columns.expand()
@@ -940,13 +1034,20 @@ def create_lr_dict(args: argparse.Namespace, global_lr: float, level: int) -> Di
     lr_dict = dict()
 
     # Use shared column parameter names only for the Gaussian level.
-    if getattr(args, 'use_columns_representation', False) and level == 0:
+    use_factorized_columns = getattr(args, 'use_factorized_columns_representation', False)
+    if (getattr(args, 'use_columns_representation', False) or use_factorized_columns) and level == 0:
         lr_dict['column_center_xz']      = global_lr * args.centers_lr
         lr_dict['column_scale_xz']       = global_lr * args.scales_lr
         lr_dict['column_quaternions'] = global_lr * args.quats_lr
         lr_dict['primitive_center_y']    = global_lr * args.centers_lr
         lr_dict['primitive_scale_y']     = global_lr * args.scales_lr
-        lr_dict['primitive_opacity']       = global_lr * args.opacity_lr
+        if use_factorized_columns:
+            # scale group mass updates to the weight represented by J times K Gaussians.
+            lr_dict['group_opacity'] = global_lr * args.opacity_lr * args.xz_gaussians_per_group * args.y_gaussians_per_group
+            lr_dict['xz_logits'] = global_lr * args.mixture_lr
+            lr_dict['y_logits'] = global_lr * args.mixture_lr
+        else:
+            lr_dict['primitive_opacity'] = global_lr * args.opacity_lr
     else:
         lr_dict[f'centers_{level}']      = global_lr * args.centers_lr
         lr_dict[f'scales_{level}']       = global_lr * args.scales_lr
@@ -1014,6 +1115,8 @@ def create_scene_dict_from_primitives(
     # validate the grouped acceleration layout before scene creation.
     if use_column_bvh and (not use_columns_representation or columns is None or level != 0):
         raise ValueError('Column BVH requires Gaussian-level shared column parameters')
+    if use_column_bvh and isinstance(columns, FactorizedGaussianColumn):
+        raise ValueError('FGC requires per-Gaussian geometry without Column BVH grouping')
     if use_column_bvh and np.any(columns.primitive_count_per_column.numpy() != columns.primitives_per_column):
         raise ValueError('Column BVH requires a fixed group size; use per-primitive geometry for variable column counts')
 
@@ -1095,6 +1198,30 @@ def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optim
         if columns is None:
             raise ValueError('Gaussian column layout is required for column optimization')
 
+        # recover FGC geometry and marginal weights from its Cartesian expansion.
+        if isinstance(columns, FactorizedGaussianColumn):
+            r, j, k = columns.group_count, columns.xz_gaussians_per_group, columns.y_gaussians_per_group
+            if dr.width(ellipsoids.center) != r * j * k:
+                raise ValueError('Scene primitive count does not match the FGC layout')
+            xz_indices = dr.arange(mi.UInt32, r * j) * k
+            y_indices = dr.arange(mi.UInt32, r * k)
+            y_indices = (y_indices // k) * j * k + y_indices % k
+            opt['column_center_xz'] = dr.gather(mi.Point2f, mi.Point2f(ellipsoids.center[0], ellipsoids.center[2]), xz_indices)
+            opt['column_scale_xz'] = dr.gather(mi.Vector2f, mi.Vector2f(ellipsoids.scale[0], ellipsoids.scale[2]), xz_indices)
+            angles = 2.0 * dr.atan2(ellipsoids.quat.y, ellipsoids.quat.w)
+            opt['column_quaternions'] = dr.gather(mi.Float, angles, xz_indices)
+            opt['primitive_center_y'] = dr.gather(mi.Float, ellipsoids.center[1], y_indices)
+            opt['primitive_scale_y'] = dr.gather(mi.Float, ellipsoids.scale[1], y_indices)
+
+            # group normalization removes the common mass from either marginal.
+            weights = mi.TensorXf(params[f'{primitive_name}.opacities'], shape=(r, j, k))
+            xz_weights, y_weights = dr.sum(weights, axis=2), dr.sum(weights, axis=1)
+            opt['group_opacity'] = dr.sum(xz_weights, axis=1).array
+            opt['xz_logits'] = dr.log(dr.maximum(xz_weights.array, 1e-30))
+            opt['y_logits'] = dr.log(dr.maximum(y_weights.array, 1e-30))
+            columns.column_optimizer = opt
+            return
+
         # select the first primitive of each variable-length column.
         primitive_count = dr.width(ellipsoids.center)
         if primitive_count != dr.width(columns.primitive_indices):
@@ -1125,7 +1252,8 @@ def configure_optimizer(opt: mi.ad.Optimizer, args: argparse.Namespace,
                         columns: Optional[GaussianColumn] = None) -> None:
     """Set learning rates and Gaussian parameter bounds for the selected mode."""
     opt.set_learning_rate(lr_dict)
-    if args.use_columns_representation and level == 0:
+    use_factorized_columns = getattr(args, 'use_factorized_columns_representation', False)
+    if (args.use_columns_representation or use_factorized_columns) and level == 0:
         if columns is None:
             raise ValueError('Gaussian column layout is required for column bounds')
 
@@ -1134,7 +1262,10 @@ def configure_optimizer(opt: mi.ad.Optimizer, args: argparse.Namespace,
         opt.set_bounds('column_scale_xz', lower=mi.Vector2f(*columns.scale_lower_bounds['column_scale_xz']), upper=1.0)
         opt.set_bounds('primitive_center_y', lower=-1.0, upper=1.0)
         opt.set_bounds('primitive_scale_y', lower=float(columns.scale_lower_bounds['primitive_scale_y']), upper=1.0)
-        opt.set_bounds('primitive_opacity', lower=1e-8, upper=1.0)
+        if use_factorized_columns:
+            opt.set_bounds('group_opacity', lower=0.0)
+        else:
+            opt.set_bounds('primitive_opacity', lower=1e-8, upper=1.0)
     else:
         # Constrain independent Gaussian geometry and freeze its frequency.
         opt.set_bounds(f'scales_{level}', lower=1e-8, upper=1.0)
@@ -1183,17 +1314,22 @@ def write_optimizer_params_to_scene(opt: mi.ad.Optimizer, params: mi.SceneParame
 
 # region I/O
 
-def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_representation=False, columns=None) -> None:
-    """Save a scene asset, optionally storing its Gaussian level as shared columns."""
-    if use_columns_representation and (columns is None or level != 0):
+def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_representation=False, columns=None,
+               use_factorized_columns_representation=False) -> None:
+    """Save a scene asset with independent Gaussians, shared Columns, or FGC factors."""
+    if use_columns_representation and use_factorized_columns_representation:
+        raise ValueError('Choose either Column or FGC PLY representation')
+    if (use_columns_representation or use_factorized_columns_representation) and (columns is None or level != 0):
         raise ValueError('Column PLY export requires shared column parameters at Gaussian level 0')
+    if use_factorized_columns_representation != isinstance(columns, FactorizedGaussianColumn):
+        raise ValueError('FGC parameters require use_factorized_columns_representation=True')
 
     # reuse scene traversal and the existing asset directory layout.
     asset_dir = output_path / f'optimized_asset_pyr{level}'
     (asset_dir / 'npy_data').mkdir(parents=True, exist_ok=True)
     final_asset = gfields.io.object_to_dict(scene)
 
-    if use_columns_representation:
+    if use_columns_representation or use_factorized_columns_representation:
         # replace expanded geometry with the original shared parameter arrays.
         primitive = final_asset[f'primitives_pyr{level}']
         parameters = columns.parameters
@@ -1204,13 +1340,25 @@ def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_repre
 
         # carry the remaining column data through the same primitive dictionary.
         primitive['column_rotation_angle'] = np.asarray(parameters['column_quaternions'], dtype=np.float32).reshape(-1).copy()
-        for name in ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity'):
+        for name in ('primitive_center_y', 'primitive_scale_y'):
             primitive[name] = np.asarray(parameters[name], dtype=np.float32).reshape(-1).copy()
-        primitive['primitives_per_column'] = columns.primitives_per_column
-        primitive['primitive_count_per_column'] = columns.primitive_count_per_column.numpy().copy()
+
+        # save normalized factors for FGC or preserve the existing Column layout.
+        if use_factorized_columns_representation:
+            primitive['group_count'] = columns.group_count
+            primitive['xz_gaussians_per_group'] = columns.xz_gaussians_per_group
+            primitive['y_gaussians_per_group'] = columns.y_gaussians_per_group
+            for axis, count in (('xz', columns.xz_gaussians_per_group), ('y', columns.y_gaussians_per_group)):
+                primitive[f'{axis}_weight'] = columns._group_softmax(parameters[f'{axis}_logits'], count).numpy().copy()
+            primitive['group_opacity'] = parameters['group_opacity'].numpy().copy()
+        else:
+            primitive['primitive_opacity'] = parameters['primitive_opacity'].numpy().copy()
+            primitive['primitives_per_column'] = columns.primitives_per_column
+            primitive['primitive_count_per_column'] = columns.primitive_count_per_column.numpy().copy()
 
     # select the output representation without passing columns to the ply writer.
-    gfields.io.dict_to_asset(final_asset, str(asset_dir), use_columns_representation=use_columns_representation)
+    gfields.io.dict_to_asset(final_asset, str(asset_dir), use_columns_representation=use_columns_representation,
+                             use_factorized_columns_representation=use_factorized_columns_representation)
 
 
 
@@ -1336,6 +1484,12 @@ def load_model(path: Path, max_depth: int, integrator_type: str = 'gfields_tomog
 # region Densify, Prune and Regularize
 
 
+def _require_adaptive_column_layout(columns):
+    # factorized mixtures need joint factor updates rather than independent primitive edits.
+    if isinstance(columns, FactorizedGaussianColumn):
+        raise ValueError('FGC does not support adaptive Column splitting or pruning; disable --use_adaptive_columns')
+
+
 def _reset_column_y_gradient_stats(columns):
     # start a fresh observation window for the current primitive layout.
     primitive_count = dr.width(columns.parameters['primitive_center_y'])
@@ -1346,6 +1500,7 @@ def _reset_column_y_gradient_stats(columns):
 def accumulate_column_y_gradients(columns):
     """Collect detached absolute Y gradients after backward and before opt.step()."""
     # initialize observations and reject stale statistics after external resizing.
+    _require_adaptive_column_layout(columns)
     primitive_count = dr.width(columns.parameters['primitive_center_y'])
     if not hasattr(columns, 'y_gradient_sum'):
         _reset_column_y_gradient_stats(columns)
@@ -1377,6 +1532,7 @@ def _remap_column_primitive_optimizer(opt, source_indices, values, retained=True
 
 def _read_column_primitive_parameters(columns):
     # read independent Y parameters and their contiguous column layout.
+    _require_adaptive_column_layout(columns)
     opt = columns.column_optimizer
     names = ('primitive_center_y', 'primitive_scale_y', 'primitive_opacity')
     values = {name: opt[name].numpy().astype(np.float64) for name in names}
@@ -1409,6 +1565,7 @@ def split_column_primitives_y(columns, *, gradient_threshold: float, max_primiti
                               split_offset_ratio: float = 0.5) -> int:
     """Split ranked Y primitives after opt.step(); consume the current gradient window."""
     # read current parameters and consume the accumulated gradient observations.
+    _require_adaptive_column_layout(columns)
     if not hasattr(columns, 'y_gradient_sum'):
         return 0
     opt, values, counts, parents = _read_column_primitive_parameters(columns)
@@ -1530,7 +1687,10 @@ def adapt_column_primitives(columns, args, iteration: int):
     """Run pruning before splitting at the configured checks; scene writing belongs to the caller."""
     # keep ordinary and fixed-layout training unchanged outside the adaptation window.
     result = {'pruned': 0, 'split': 0}
-    if not args.use_adaptive_columns or not args.column_adapt_from <= iteration <= args.column_adapt_until:
+    if not args.use_adaptive_columns:
+        return result
+    _require_adaptive_column_layout(columns)
+    if not args.column_adapt_from <= iteration <= args.column_adapt_until:
         return result
     if iteration % args.column_adapt_every:
         return result
@@ -1763,9 +1923,11 @@ def prune(opt: mi.ad.Optimizer, scene_params: mi.SceneParameters, level: int, ru
 def opacity_scale_regularization(opt: mi.ad.Optimizer, args: argparse.Namespace,
                                  level: int) -> Tuple[mi.Float, mi.Float]:
     """Compute opacity and scale penalties for the selected representation."""
-    if args.use_columns_representation and level == 0:
-        # Count shared XZ scales once per column and Y scales per primitive.
-        opacity_penalty = dr.sum(dr.abs(opt['primitive_opacity'])) * args.lambda_opacity
+    use_factorized_columns = getattr(args, 'use_factorized_columns_representation', False)
+    if (args.use_columns_representation or use_factorized_columns) and level == 0:
+        # count factor scales once and penalize physical weights without normalized mixture weights.
+        opacity_sum = dr.sum(opt['group_opacity']) if use_factorized_columns else dr.sum(dr.abs(opt['primitive_opacity']))
+        opacity_penalty = opacity_sum * args.lambda_opacity
         scale_penalty = (dr.sum(opt['column_scale_xz'], axis=None) + dr.sum(opt['primitive_scale_y'])) * args.lambda_scale
     else:
         # Penalize independent Gaussian or Gabor primitive parameters.

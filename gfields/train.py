@@ -166,7 +166,8 @@ effect_dim(f'Volume sum: {np.sum(ref_volume) * volume_config.opacity_scale * ( 8
 
 gaussian_prims_ckpt: Optional[Dict[str, Union[np.ndarray, mi.TensorXf]]] = None
 gaussian_columns = None
-if not args.use_columns_representation and args.from_gaussian_checkpoint:
+use_shared_columns = args.use_columns_representation or args.use_factorized_columns_representation
+if not use_shared_columns and args.from_gaussian_checkpoint:
     ckpt_path = Path(args.from_gaussian_checkpoint)
     if ckpt_path.exists():
         gaussian_prims_ckpt = load_single_level(ckpt_path, level=0)
@@ -182,19 +183,23 @@ if not args.use_columns_representation and args.from_gaussian_checkpoint:
         yellow(f'Gaussian checkpoint not found at {ckpt_path}; optimizing Gaussian level from scratch.')
 
 if not args.skip_gaussian_optim:
-    representation_name = 'Gaussian Column' if args.use_columns_representation else 'Gaussian'
+    representation_name = 'Factorized Gaussian Column' if args.use_factorized_columns_representation else ('Gaussian Column' if args.use_columns_representation else 'Gaussian')
     blue(f'\n{Effect.BOLD}Starting {representation_name} Level Regression{Effect.BOLD_OFF}')  # for better readability in the console
     # Scene Creation
 
     # initialize volumetric primitive scene ----------------------------------------
     # Select column primitives or independent kernels for the scene.
-    if args.use_columns_representation:
-        # Generate fresh shared column parameters.
-        gaussian_columns = generate_random_columns(
-            args.column_count, args.primitives_per_column, args.init_opacity, args.init_scale, args.init_albedo,
-            volume=gauss_ref_volume, volume_config=volume_config,
-            column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset
-        )
+    if use_shared_columns:
+        # generate the selected factor layout with the common volume sampling settings.
+        sampling_kwargs = dict(volume=gauss_ref_volume, volume_config=volume_config,
+                               column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset)
+        if args.use_factorized_columns_representation:
+            gaussian_columns = generate_random_factorized_columns(
+                args.group_count, args.xz_gaussians_per_group, args.y_gaussians_per_group,
+                args.init_opacity, args.init_scale, args.init_albedo, **sampling_kwargs)
+        else:
+            gaussian_columns = generate_random_columns(
+                args.column_count, args.primitives_per_column, args.init_opacity, args.init_scale, args.init_albedo, **sampling_kwargs)
 
         # Column parameters are expanded inside scene creation.
         gaussian_prims = {}
@@ -209,11 +214,13 @@ if not args.skip_gaussian_optim:
                 level=GAUSS_LVL, target_level=args.gauss_target_level, importance_sample_means=args.importance_sample_means, volume=ref_volume, volume_config=volume_config, opacity_sampling_grid=gauss_ref_volume,
                 init_from_columns=args.init_from_columns, primitives_per_column=args.primitives_per_column,
                 column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset,
+                init_from_factorized_columns=args.init_from_factorized_columns,
+                xz_gaussians_per_group=args.xz_gaussians_per_group, y_gaussians_per_group=args.y_gaussians_per_group,
             )
 
     scene_dict = create_scene_dict_from_primitives(
         args.max_depth, GAUSS_LVL,
-        use_columns_representation=args.use_columns_representation, columns=gaussian_columns,
+        use_columns_representation=use_shared_columns, columns=gaussian_columns,
         use_column_bvh=args.use_column_bvh,
         **_integrator_scene_kwargs(), **gaussian_prims)
 
@@ -247,7 +254,7 @@ if not args.skip_gaussian_optim:
 
     # render initial scene
     init_image = mi.render(scene, sensor=camera_array, spp=args.ref_kernel_spp)
-    if args.use_columns_representation:
+    if use_shared_columns:
         initial_render_metrics = column_render_metrics(ref_image, init_image)
 
     effect_dim(f"- Saving initial images...")
@@ -257,18 +264,18 @@ if not args.skip_gaussian_optim:
 
 
     # Setup Optimizer
-    gaussian_lr = args.column_lr if args.use_columns_representation else args.global_lr_gaussian
+    gaussian_lr = args.column_lr if use_shared_columns else args.global_lr_gaussian
     lr_dict = create_lr_dict(args, gaussian_lr, level=GAUSS_LVL)
 
-    if args.use_columns_representation:
+    if use_shared_columns or args.init_from_factorized_columns:
         opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
     else:
         opt = gfields.optimizers.BoundedAdam()
 
     # Read scene parameters and configure the selected optimizer mode.
-    write_scene_params_to_optimizer(scene_params, opt, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
+    write_scene_params_to_optimizer(scene_params, opt, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
     configure_optimizer(opt, args, lr_dict, level=GAUSS_LVL, columns=gaussian_columns)
-    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
+    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
 
     # Optimization Loop
 
@@ -349,13 +356,13 @@ if not args.skip_gaussian_optim:
                     adaptation = adapt_column_primitives(gaussian_columns, args, training_iteration)
                     for name, count in adaptation.items():
                         adaptation_since_log[name] += count
-                write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
+                write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
 
-            relocate_now = not args.use_columns_representation and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
+            relocate_now = not use_shared_columns and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
             deletable = 0
             if do_log or relocate_now:
-                opacity_key = 'primitive_opacity' if args.use_columns_representation else f'opacities_{GAUSS_LVL}'
-                deletable = (dr.abs(opt[opacity_key]).numpy() < 1e-6).sum()
+                # count weak expanded primitives consistently across all representations.
+                deletable = (dr.abs(scene_params[f'primitives_pyr{GAUSS_LVL}.opacities']).numpy() < 1e-6).sum()
             if relocate_now:
                 print(f"Relocating dead primitives at it={it}...")
                 relocate_dead_primitives(opt, scene_params, GAUSS_LVL)
@@ -389,7 +396,8 @@ if not args.skip_gaussian_optim:
 
                 # Frequent checkpoint (resumable via --from_gaussian_checkpoint).
                 if (it + 1) % args.checkpoint_every == 0:
-                    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
+                    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns,
+                               use_factorized_columns_representation=args.use_factorized_columns_representation)
 
             pbar.update(1)
             if do_log:
@@ -406,22 +414,23 @@ if not args.skip_gaussian_optim:
     # Final degenerate cleanup (see the Gabor-phase counterpart): recycle
     # loops handle collapse during optimization; any scale-collapsed
     # survivor is dropped here so it never reaches the saved asset.
-    n_collapsed = prune(opt, scene_params, GAUSS_LVL, rule='opacity', custom_th=0.0) if not args.use_columns_representation else 0
+    n_collapsed = prune(opt, scene_params, GAUSS_LVL, rule='opacity', custom_th=0.0) if not use_shared_columns and not args.init_from_factorized_columns else 0
     if n_collapsed > 0:
         yellow(f'Removed {n_collapsed} scale-collapsed primitives from level {GAUSS_LVL}.')
 
     # Save Results
 
-    if args.use_columns_representation:
-        write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
+    if use_shared_columns:
+        write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
     optimized = mi.render(scene, sensor=camera_array, spp=args.ref_kernel_spp)
     green("- Saving optimized images...")
     # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mi.util.write_bitmap(str(args.output / f'optimized_pyr0.exr'), optimized)
 
     green("- Saving optimized model...")
-    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns)
-    if args.use_columns_representation:
+    save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns,
+                               use_factorized_columns_representation=args.use_factorized_columns_representation)
+    if use_shared_columns:
         render_metrics = {'initial': initial_render_metrics, 'final': column_render_metrics(ref_image, optimized), 'render_spp': args.ref_kernel_spp, 'render_seed': 0, 'parameters': gaussian_columns.parameter_stats()}
         (args.output / 'column_render_metrics.json').write_text(json.dumps(render_metrics, indent=2), encoding='utf-8')
 

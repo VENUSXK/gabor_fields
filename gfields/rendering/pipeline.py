@@ -62,6 +62,8 @@ class AssetInfo:
     use_columns_representation: bool = False
     primitives_per_column: Dict[int, int] = field(default_factory=dict)
     primitive_count_per_column: Dict[int, Any] = field(default_factory=dict)
+    use_factorized_columns_representation: bool = False
+    factorized_group_shapes: Dict[int, tuple[int, int, int]] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
         extent_summary: Dict[int, Any] = {}
@@ -73,7 +75,8 @@ class AssetInfo:
         return (
             f"AssetInfo(path={self.path}, levels={self.num_levels}, "
             f"primitives={self.num_primitives}, extents={extent_summary}, "
-            f"use_columns_representation={self.use_columns_representation}, primitives_per_column={self.primitives_per_column})"
+            f"use_columns_representation={self.use_columns_representation}, primitives_per_column={self.primitives_per_column}, "
+            f"use_factorized_columns_representation={self.use_factorized_columns_representation}, factorized_group_shapes={self.factorized_group_shapes})"
         )
 
 
@@ -100,7 +103,8 @@ class SteerableAssetInfo:
         )
 
 
-def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False) -> AssetInfo:
+def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False,
+                       use_factorized_columns_representation=False) -> AssetInfo:
     """Auto-detect a pyramid asset's structure (num levels, primitive counts, extents).
 
     Reads the unified per-level store ``<asset>/data/root.primitives_pyr*.ply``.
@@ -109,6 +113,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
     """
     asset_path = str(asset_path)
     import gfields.io
+    if use_columns_representation and use_factorized_columns_representation:
+        raise ValueError('Choose either Column or FGC representation')
 
     # Canonical layout: one .ply per pyramid level under <asset>/data/ (written
     # by gfields.io.dict_to_asset). Preferred over the legacy per-array npy.
@@ -119,11 +125,17 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
         num_levels = 1 + max(ply_levels)
         has_omega, has_albedo, num_primitives, extents, primitives_per_column = {}, {}, {}, {}, {}
         primitive_count_per_column = {}
+        factorized_group_shapes = {}
         for level in range(num_levels):
             a = gfields.io.load_ellipsoid_ply(
-                os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation)
+                os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation,
+                use_factorized_columns_representation=use_factorized_columns_representation)
             # count expanded primitives without discarding their column layout.
-            if use_columns_representation:
+            if use_factorized_columns_representation:
+                shape = tuple(a[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+                factorized_group_shapes[level] = shape
+                num_primitives[level] = int(np.prod(shape))
+            elif use_columns_representation:
                 num_primitives[level] = len(a['primitive_center_y'])
                 primitives_per_column[level] = a['primitives_per_column']
                 primitive_count_per_column[level] = a['primitive_count_per_column']
@@ -139,14 +151,15 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             ply_folder=ply_folder, num_levels=num_levels, has_omega=has_omega,
             has_albedo=has_albedo, num_primitives=num_primitives, extents=extents,
             use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column,
-            primitive_count_per_column=primitive_count_per_column)
+            primitive_count_per_column=primitive_count_per_column,
+            use_factorized_columns_representation=use_factorized_columns_representation, factorized_group_shapes=factorized_group_shapes)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
     npy_levels = (gfields.io.npy_asset_levels(npy_folder)
                   if os.path.isdir(npy_folder) else [])
-    if npy_levels and use_columns_representation:
-        raise ValueError('Column representation requires a PLY with metadata, column, and primitive elements')
+    if npy_levels and (use_columns_representation or use_factorized_columns_representation):
+        raise ValueError('Column and FGC representations require their compact PLY tables')
     if npy_levels:
         num_levels = 1 + max(npy_levels)
         has_omega, has_albedo, num_primitives, extents = {}, {}, {}, {}
@@ -314,36 +327,53 @@ def load_pyramid_level(
     """Build mesh or grouped analytic geometry for one pyramid level."""
     num_prims = asset_info.num_primitives[level]
     use_columns_representation = asset_info.use_columns_representation
+    use_factorized_columns = asset_info.use_factorized_columns_representation
     primitives_per_column = asset_info.primitives_per_column.get(level, 1)
     grouped_columns = use_columns_representation
     import gfields.io
     if getattr(asset_info, "ply_folder", None):
         a = gfields.io.load_ellipsoid_ply(
-            os.path.join(asset_info.ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation)
+            os.path.join(asset_info.ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation,
+            use_factorized_columns_representation=use_factorized_columns)
     elif getattr(asset_info, "npy_folder", None):
         # Deprecated legacy per-array npy_data/ layout (emits a DeprecationWarning).
         a = gfields.io.load_ellipsoid_npy_level(asset_info.npy_folder, level)
     else:
         raise ValueError(
             f"Asset {asset_info.path} has no data/*.ply store or legacy npy_data/ dir.")
-    if use_columns_representation:
+    if use_columns_representation or use_factorized_columns:
         import mitsuba as mi
-        from gfields.integrators.common import GaussianColumn
+        from gfields.integrators.common import GaussianColumn, FactorizedGaussianColumn
 
         # restore the shared parameter layout without creating an optimizer.
-        parameters = {name: mi.Float(a[name]) for name in ('column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'primitive_opacity')}
+        parameters = {name: mi.Float(a[name]) for name in ('column_quaternions', 'primitive_center_y', 'primitive_scale_y')}
         parameters['column_center_xz'] = mi.Point2f(a['column_center_xz'].T)
         parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
-        if a['primitives_per_column'] != primitives_per_column or len(a['primitive_center_y']) != num_prims:
-            raise ValueError('Column PLY layout changed after asset detection')
-        counts = a['primitive_count_per_column']
-        if level in asset_info.primitive_count_per_column and not np.array_equal(counts, asset_info.primitive_count_per_column[level]):
-            raise ValueError('Column PLY counts changed after asset detection')
-        columns = GaussianColumn(parameters, primitives_per_column, primitive_count_per_column=counts)
 
-        # variable-length columns use the existing per-primitive geometry path.
-        grouped_columns = bool(np.all(counts == counts[0]))
-        primitives_per_column = int(counts[0]) if grouped_columns else 1
+        # reconstruct normalized FGC factors and keep rendering strictly per Gaussian.
+        if use_factorized_columns:
+            shape = tuple(a[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+            if shape != asset_info.factorized_group_shapes[level]:
+                raise ValueError('FGC PLY layout changed after asset detection')
+            parameters['group_opacity'] = mi.Float(a['group_opacity'])
+            for axis in ('xz', 'y'):
+                weights = a[f'{axis}_weight']
+                logits = np.log(weights, out=np.full_like(weights, -np.inf), where=weights > 0)
+                parameters[f'{axis}_logits'] = mi.Float(logits)
+            columns = FactorizedGaussianColumn(parameters, shape[1], shape[2])
+            grouped_columns = False
+            primitives_per_column = 1
+        else:
+            # preserve fixed and variable-length Column rendering behavior.
+            parameters['primitive_opacity'] = mi.Float(a['primitive_opacity'])
+            if a['primitives_per_column'] != primitives_per_column or len(a['primitive_center_y']) != num_prims:
+                raise ValueError('Column PLY layout changed after asset detection')
+            counts = a['primitive_count_per_column']
+            if level in asset_info.primitive_count_per_column and not np.array_equal(counts, asset_info.primitive_count_per_column[level]):
+                raise ValueError('Column PLY counts changed after asset detection')
+            columns = GaussianColumn(parameters, primitives_per_column, primitive_count_per_column=counts)
+            grouped_columns = bool(np.all(counts == counts[0]))
+            primitives_per_column = int(counts[0]) if grouped_columns else 1
 
         # reuse column expansion before the common rendering transformations.
         centers, scales, quaternions, opacities = columns.expand()
