@@ -1,4 +1,4 @@
-"""Plot translucent Gaussian ellipsoid projections and export column counts without Mitsuba.
+"""Plot Gaussian, Column and FGC geometry, group connections and slices without Mitsuba.
 
 Usage: python examples/visualize_result.py results/checkpoints/my_result
 """
@@ -44,6 +44,8 @@ def load_result_geometry(filename):
     # read compact columns without starting a rendering backend.
     ply = PlyData.read(str(filename), mmap=False)
     elements = {element.name for element in ply.elements}
+    if {'metadata', 'group', 'xz', 'y'} <= elements:
+        return load_factorized_geometry(ply)
     if {'metadata', 'column', 'primitive'} <= elements:
         columns, primitives = ply['column'].data, ply['primitive'].data
         metadata = ply['metadata'].data[0]
@@ -64,6 +66,8 @@ def load_result_geometry(filename):
                 'covariances': gaussian_covariances(scales, quaternions), 'extent': float(metadata['extent'])}
 
     # decode physical scales and xyzw rotations from independent gaussian records.
+    if 'vertex' not in elements:
+        raise ValueError('Expected Gaussian vertex records, Column tables, or FGC factor tables')
     vertices = ply['vertex'].data
     centers = np.column_stack((vertices['x'], vertices['y'], vertices['z']))
     scales = np.exp(np.column_stack([vertices[f'scale_{axis}'] for axis in range(3)]).astype(np.float64))
@@ -73,6 +77,115 @@ def load_result_geometry(filename):
     extent = vertices['extent_0'].astype(np.float64) if 'extent_0' in vertices.dtype.names else 3.0
     return {'centers': centers, 'weights': weights, 'counts': None,
             'covariances': gaussian_covariances(scales, quaternions), 'extent': extent}
+
+
+def load_factorized_geometry(ply):
+    # read fixed factor dimensions and keep the original group membership.
+    if len(ply['metadata'].data) != 1:
+        raise ValueError('FGC requires one metadata record')
+    metadata = ply['metadata'].data[0]
+    if int(metadata['format_version']) != 3:
+        raise ValueError('FGC visualization requires format_version 3')
+    r, j, k = (int(metadata[name]) for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+    groups, xz, y = (ply[name].data for name in ('group', 'xz', 'y'))
+    if min(r, j, k) <= 0 or (len(groups), len(xz), len(y)) != (r, r * j, r * k):
+        raise ValueError('FGC table lengths must match R, R * J, R * K')
+
+    # expand Cartesian pairs in group, XZ component, Y component order on the CPU.
+    indices = np.arange(r * j * k)
+    parents = indices // (j * k)
+    xz_indices = indices // k
+    y_indices = parents * k + indices % k
+    centers = np.column_stack((xz['center_x'][xz_indices], y['center_y'][y_indices], xz['center_z'][xz_indices]))
+    scales = np.column_stack((xz['scale_x'][xz_indices], y['scale_y'][y_indices], xz['scale_z'][xz_indices])).astype(np.float64)
+
+    # preserve physical rotations, factor weights and world-space dimensions.
+    angles = xz['rotation_angle'][xz_indices].astype(np.float64)
+    quaternions = np.column_stack((np.zeros(len(indices)), np.sin(angles / 2), np.zeros(len(indices)), np.cos(angles / 2)))
+    weights = groups['opacity'][parents].astype(np.float64) * xz['weight'][xz_indices] * y['weight'][y_indices]
+    if not np.isfinite(scales).all() or np.any(scales <= 0) or not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError('FGC requires finite positive scales and finite nonnegative weights')
+    return {'centers': centers, 'weights': weights, 'counts': None, 'group_ids': parents,
+            'factorized_shape': (r, j, k), 'group_opacity': groups['opacity'].astype(np.float64),
+            'covariances': gaussian_covariances(scales, quaternions), 'extent': float(metadata['extent'])}
+
+
+def minimum_spanning_edges(points):
+    # connect nearby centers with a deterministic Prim tree, including coincident points.
+    points = np.asarray(points, dtype=np.float64)
+    count = len(points)
+    if count < 2:
+        return np.empty((0, 2), dtype=np.int64)
+    distances = np.sum((points[:, None] - points[None, :]) ** 2, axis=2)
+    visited = np.zeros(count, dtype=bool)
+    visited[0] = True
+    costs, parents, edges = distances[0].copy(), np.zeros(count, dtype=np.int64), []
+
+    # retain the first parent on ties so repeated visualizations use the same edges.
+    for _ in range(count - 1):
+        index = int(np.argmin(np.where(visited, np.inf, costs)))
+        edges.append((parents[index], index))
+        visited[index] = True
+        closer = ~visited & (distances[index] < costs)
+        costs[closer], parents[closer] = distances[index, closer], index
+    return np.asarray(edges, dtype=np.int64)
+
+
+def factorized_geometry_edges(geometry):
+    # build each group's XZ tree once and reuse it for every Y layer and slice.
+    r, j, k = geometry['factorized_shape']
+    centers = geometry['centers'].reshape(r, j, k, 3)
+    axial, transverse = [], []
+    for group in range(r):
+        base = group * j * k
+        tree = minimum_spanning_edges(centers[group, :, 0][:, (0, 2)])
+        layers = np.argsort(centers[group, 0, :, 1], kind='stable')
+
+        # replicate XZ edges at each Y center and connect identical footprints along Y.
+        transverse.append((base + tree[:, None, :] * k + np.arange(k)[None, :, None]).reshape(-1, 2))
+        starts = base + np.arange(j)[:, None] * k
+        axial.append(np.stack((starts + layers[:-1], starts + layers[1:]), axis=-1).reshape(-1, 2))
+    return tuple(np.concatenate(edges) for edges in (axial, transverse))
+
+
+def factorized_geometry_segments(geometry, selected, project_xz=False):
+    # hide edges whose endpoints leave the slice without rebuilding its group tree.
+    visible = np.zeros(len(geometry['centers']), dtype=bool)
+    visible[selected] = True
+    segments, group_ids = [], []
+    k = geometry['factorized_shape'][2]
+    for axis, edges in enumerate(geometry['factorized_edges']):
+        edges = edges[np.all(visible[edges], axis=1)]
+
+        # show each XZ tree only once and omit collapsed axial lines in top views.
+        if project_xz:
+            if axis == 0:
+                edges = edges[:0]
+            elif len(edges):
+                _, first = np.unique(edges // k, axis=0, return_index=True)
+                edges = edges[np.sort(first)]
+        segments.append(geometry['centers'][edges])
+        group_ids.append(geometry['group_ids'][edges[:, 0]])
+    return tuple(segments), tuple(group_ids)
+
+
+def projection_geometry(geometry, selected, axes, extent, column_lines):
+    # reuse ordinary Column outlines or select factor-aware FGC center connections.
+    segments, segment_groups = None, None
+    if 'factorized_shape' in geometry:
+        if column_lines:
+            segments, segment_groups = factorized_geometry_segments(geometry, selected, project_xz=axes == (0, 2))
+        if axes == (0, 2):
+            _, first = np.unique(selected // geometry['factorized_shape'][2], return_index=True)
+            selected = selected[np.sort(first)]
+    elif geometry['counts'] is not None and column_lines:
+        segments = column_geometry_segments(geometry['centers'], geometry['covariances'], extent, geometry['counts'], selected)
+    return selected, segments, segment_groups
+
+
+def factorized_colors(group_ids):
+    # keep each original group color identical across projections and filtered exports.
+    return plt.get_cmap('hsv')((np.asarray(group_ids) * 0.618033988749895) % 1.0)
 
 
 def projected_ellipses(covariances, axes, extent):
@@ -165,7 +278,8 @@ def primitive_slices(centers, axis, width):
         yield edges[index], edges[index + 1], np.flatnonzero(groups == index)
 
 
-def save_projection(centers, covariances, extent, colors, norm, axes, filename, dpi, alpha, center_size=2.0, limits=None, segments=None):
+def save_projection(centers, covariances, extent, colors, norm, axes, filename, dpi, alpha, center_size=2.0,
+                    limits=None, segments=None, group_ids=None, segment_group_ids=None):
     # fill the entire image with equal-scale projected content and no plot decorations.
     first, second = axes
     if limits is None:
@@ -182,6 +296,8 @@ def save_projection(centers, covariances, extent, colors, norm, axes, filename, 
         # batch translucent ellipses in data units to preserve their physical sizes.
         widths, heights, angles = projected_ellipses(covariances, axes, extent)
         rgba = plt.get_cmap('magma')(norm(colors)) if colors is not None else np.tile([0.22, 0.49, 0.67, 1.0], (len(centers), 1))
+        if group_ids is not None:
+            rgba = factorized_colors(group_ids)
         rgba[:, 3] = alpha
         outlines = rgba.copy()
         outlines[:, 3] = min(2 * alpha, 1.0)
@@ -191,12 +307,17 @@ def save_projection(centers, covariances, extent, colors, norm, axes, filename, 
 
         # show each column envelope and its own axial centers below center markers.
         if segments is not None:
-            for lines, color, opacity, linewidth in zip(segments, ('#245e72', '#407b92'), (0.7, 0.18), (0.45, 0.22)):
+            for index, (lines, color, opacity, linewidth) in enumerate(zip(segments, ('#245e72', '#407b92'), (0.7, 0.18), (0.45, 0.22))):
+                if segment_group_ids is not None:
+                    color = factorized_colors(segment_group_ids[index])
+                    color[:, :3] *= 0.7
+                    opacity, linewidth = 0.55, 0.55
                 ax.add_collection(LineCollection(lines[:, :, axes], colors=color, alpha=opacity, linewidths=linewidth, zorder=2))
 
         # emphasize physical primitive centers above the translucent projected supports.
         if center_size > 0:
-            ax.scatter(centers[:, first], centers[:, second], s=center_size, c='#17324d', edgecolors='white',
+            center_colors = factorized_colors(group_ids)[:, :3] * 0.55 if group_ids is not None else '#17324d'
+            ax.scatter(centers[:, first], centers[:, second], s=center_size, c=center_colors, edgecolors='white',
                        linewidths=0.15, alpha=0.9, zorder=3, rasterized=True)
     ax.set(xlim=limits[0], ylim=limits[1], aspect='equal')
     ax.set_axis_off()
@@ -206,11 +327,13 @@ def save_projection(centers, covariances, extent, colors, norm, axes, filename, 
 
 def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01, extent=None,
                      slice_axis='x', slice_width=None, center_size=2.0, slice_3d=False,
-                     view_elevation=25.0, view_azimuth=-60.0, column_lines=True):
+                     view_elevation=25.0, view_azimuth=-60.0, column_lines=True, group_ids=None):
     # resolve the saved model and prepare a standalone output directory.
     ply_path = find_result_ply(result_path, level)
     base = Path(result_path) if Path(result_path).is_dir() else ply_path.parent
     output = Path(output_path) if output_path else base / 'visualizations' / f'pyr{level}'
+    if group_ids is not None and output_path is None:
+        output /= 'groups_' + '_'.join(map(str, sorted(set(group_ids))))
     output.mkdir(parents=True, exist_ok=True)
 
     # remove only obsolete k-group images produced by earlier script versions.
@@ -226,17 +349,30 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
         raise ValueError('Visualization requires nonempty finite primitive geometry')
     if not 0 < alpha <= 1 or not np.all(np.isfinite(extent) & (np.asarray(extent) > 0)):
         raise ValueError('Use alpha in (0, 1] and positive finite extent')
+    visible = np.arange(len(centers))
+    factor_groups = geometry.get('group_ids')
+    if group_ids is not None:
+        if factor_groups is None:
+            raise ValueError('--group_id requires an FGC PLY with group membership')
+        if len(group_ids) == 0 or any(group < 0 or group >= geometry['factorized_shape'][0] for group in group_ids):
+            raise ValueError('group_id must contain valid zero-based FGC group indices')
+        visible = np.flatnonzero(np.isin(factor_groups, group_ids))
+    if factor_groups is not None and column_lines:
+        geometry['factorized_edges'] = factorized_geometry_edges(geometry)
     colors = np.log10(np.maximum(np.abs(weights), 1e-12)) if weights is not None else None
     norm = Normalize(float(colors.min()), max(float(colors.max()), float(colors.min()) + 1e-6)) if colors is not None else None
+    extents = np.broadcast_to(extent, (len(centers),))
 
     files = []
     if slice_width is None:
         # write three full projections with visible centers when slicing is disabled.
         views = [('front_xy.png', (0, 1)), ('side_zy.png', (2, 1)), ('top_xz.png', (0, 2))]
-        segments = column_geometry_segments(centers, covariances, extent, counts, np.arange(len(centers))) if counts is not None and column_lines else None
         for name, axes in tqdm(views, desc='Export projections', unit='view'):
+            selected, segments, segment_groups = projection_geometry(geometry, visible, axes, extent, column_lines)
             filename = output / name
-            save_projection(centers, covariances, extent, colors, norm, axes, filename, dpi, alpha, center_size, segments=segments)
+            save_projection(centers[selected], covariances[selected], extents[selected], colors[selected] if colors is not None else None,
+                            norm, axes, filename, dpi, alpha, center_size, segments=segments,
+                            group_ids=factor_groups[selected] if factor_groups is not None else None, segment_group_ids=segment_groups)
             files.append(filename)
     else:
         # project each center-selected slab along its normal using consistent world bounds.
@@ -249,21 +385,22 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
         for filename in folder.glob('slice_*.png'):
             if re.fullmatch(r'slice_\d+(?:_3d)?', filename.stem):
                 filename.unlink()
-        limits = projection_limits(centers, covariances, axes, extent)
-        extents = np.broadcast_to(extent, (len(centers),))
+        limits = projection_limits(centers[visible], covariances[visible], axes, extents[visible])
         rows = ['index\taxis\tstart\tend\tprimitive_count\tfilename' + ('\tfilename_3d' if slice_3d else '')]
         if slice_3d:
             view_centers, view_covariances = oblique_geometry(centers, covariances, view_elevation, view_azimuth)
-            view_limits = projection_limits(view_centers, view_covariances, (0, 1), extent)
+            view_limits = projection_limits(view_centers[visible], view_covariances[visible], (0, 1), extents[visible])
             camera = oblique_camera(view_elevation, view_azimuth)
 
         # export empty slices as blank images so no interval silently disappears.
-        slices = list(primitive_slices(centers, axis, slice_width))
-        for index, (lower, upper, selected) in enumerate(tqdm(slices, desc=f'Export {slice_axis.upper()} slices', unit='slice')):
-            segments = column_geometry_segments(centers, covariances, extent, counts, selected) if counts is not None and column_lines else None
+        slices = list(primitive_slices(centers[visible], axis, slice_width))
+        for index, (lower, upper, local_selected) in enumerate(tqdm(slices, desc=f'Export {slice_axis.upper()} slices', unit='slice')):
+            selected = visible[local_selected]
+            plotted, segments, segment_groups = projection_geometry(geometry, selected, axes, extent, column_lines)
             filename = folder / f'slice_{index:04d}.png'
-            save_projection(centers[selected], covariances[selected], extents[selected],
-                            colors[selected] if colors is not None else None, norm, axes, filename, dpi, alpha, center_size, limits, segments)
+            save_projection(centers[plotted], covariances[plotted], extents[plotted],
+                            colors[plotted] if colors is not None else None, norm, axes, filename, dpi, alpha, center_size, limits, segments,
+                            factor_groups[plotted] if factor_groups is not None else None, segment_groups)
             row = f'{index}\t{slice_axis}\t{lower:.12g}\t{upper:.12g}\t{len(selected)}\t{filename.name}'
             files.append(filename)
 
@@ -271,10 +408,12 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
             if slice_3d:
                 filename_3d = folder / f'slice_{index:04d}_3d.png'
                 ordered = selected[np.argsort(view_centers[selected, 2], kind='stable')]
+                _, segments, segment_groups = projection_geometry(geometry, selected, (0, 1), extent, column_lines)
                 view_segments = tuple(lines @ camera.T for lines in segments) if segments is not None else None
                 save_projection(view_centers[ordered], view_covariances[ordered], extents[ordered],
                                 colors[ordered] if colors is not None else None, norm, (0, 1), filename_3d,
-                                dpi, alpha, center_size, view_limits, view_segments)
+                                dpi, alpha, center_size, view_limits, view_segments,
+                                factor_groups[ordered] if factor_groups is not None else None, segment_groups)
                 row += f'\t{filename_3d.name}'
                 files.append(filename_3d)
             rows.append(row)
@@ -283,8 +422,13 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
         files.append(summary)
 
     # export a simple tab-separated distribution for later mermaid conversion.
-    distribution = output / 'column_k_distribution.txt'
-    if counts is not None:
+    distribution = output / ('fgc_group_distribution.txt' if factor_groups is not None else 'column_k_distribution.txt')
+    if factor_groups is not None:
+        r, j, k = geometry['factorized_shape']
+        rows = ['group_id\txz_gaussians\ty_gaussians\texpanded_gaussians\tgroup_opacity']
+        rows.extend(f'{group}\t{j}\t{k}\t{j * k}\t{geometry["group_opacity"][group]:.12g}' for group in np.unique(factor_groups[visible]))
+        distribution.write_bytes(('\r\n'.join(rows) + '\r\n').encode('utf-8'))
+    elif counts is not None:
         unique_k, frequencies = np.unique(counts, return_counts=True)
         rows = ['k\tcolumn_count\tprimitive_count']
         rows.extend(f'{int(k)}\t{int(frequency)}\t{int(k * frequency)}' for k, frequency in zip(unique_k, frequencies))
@@ -309,11 +453,12 @@ def main():
     parser.add_argument('--slice_3d', action='store_true', help='Also save an oblique orthographic ellipsoid view for every slice')
     parser.add_argument('--view_elevation', type=float, default=25.0, help='Elevation of oblique views in degrees')
     parser.add_argument('--view_azimuth', type=float, default=-60.0, help='Azimuth of oblique views in degrees')
-    parser.add_argument('--no_column_lines', action='store_true', help='Hide each column bounding outline and its internal y center connections')
+    parser.add_argument('--no_column_lines', action='store_true', help='Hide Column outlines or FGC group trees and axial center connections')
+    parser.add_argument('--group_id', type=int, nargs='+', default=None, help='Visualize only these zero-based FGC group indices')
     args = parser.parse_args()
     for filename in visualize_result(args.result, args.output, args.level, args.dpi, args.alpha, args.extent,
                                      args.slice_axis, args.slice_width, args.center_size, args.slice_3d,
-                                     args.view_elevation, args.view_azimuth, not args.no_column_lines):
+                                     args.view_elevation, args.view_azimuth, not args.no_column_lines, args.group_id):
         print(filename)
 
 
