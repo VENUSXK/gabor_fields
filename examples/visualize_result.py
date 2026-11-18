@@ -4,6 +4,7 @@ Usage: python examples/visualize_result.py results/checkpoints/my_result
 """
 import argparse
 import re
+from hashlib import sha256
 from pathlib import Path
 
 import matplotlib
@@ -428,26 +429,25 @@ def primitive_slices(centers, axis, width):
 
 def save_projection(centers, covariances, extent, colors, norm, axes, filename, dpi, alpha, center_size=2.0,
                     limits=None, segments=None, group_ids=None, segment_group_ids=None,
-                    center_markers=None, marker_group_ids=None):
+                    center_markers=None, marker_group_ids=None, figure_size=None):
     # fill the entire image with equal-scale projected content and no plot decorations.
     first, second = axes
     if limits is None:
         limits = projection_limits(centers, covariances, axes, extent)
         limits = include_segment_limits(limits, segments, axes)
-    spans = limits[:, 1] - limits[:, 0]
-    side_view = 1 in axes
-    width = 12 if side_view else 8
-    height = width * spans[1] / spans[0]
-    if height > 12:
-        width, height = width * 12 / height, 12
-    fig = plt.figure(figsize=(max(width, 2 / dpi), max(height, 2 / dpi)))
+    if figure_size is None:
+        spans = limits[:, 1] - limits[:, 0]
+        width = 12 if 1 in axes else 8
+        height = width * spans[1] / spans[0]
+        if height > 12:
+            width, height = width * 12 / height, 12
+        figure_size = (max(width, 2 / dpi), max(height, 2 / dpi))
+    fig = plt.figure(figsize=figure_size)
     ax = fig.add_axes([0, 0, 1, 1])
     if len(centers):
         # batch translucent ellipses in data units to preserve their physical sizes.
         widths, heights, angles = projected_ellipses(covariances, axes, extent)
         rgba = plt.get_cmap('magma')(norm(colors)) if colors is not None else np.tile([0.22, 0.49, 0.67, 1.0], (len(centers), 1))
-        if group_ids is not None:
-            rgba = factorized_colors(group_ids)
         rgba[:, 3] = alpha
         outlines = rgba.copy()
         outlines[:, 3] = min(2 * alpha, 1.0)
@@ -474,7 +474,8 @@ def save_projection(centers, covariances, extent, colors, norm, axes, filename, 
                        linewidths=0.15, alpha=0.9, zorder=3, rasterized=True)
     ax.set(xlim=limits[0], ylim=limits[1], aspect='equal')
     ax.set_axis_off()
-    fig.savefig(filename, dpi=dpi, pad_inches=0)
+    # save the full canvas even if matplotlib is configured to crop its output.
+    fig.savefig(filename, dpi=dpi, bbox_inches=fig.bbox_inches, pad_inches=0)
     plt.close(fig)
 
 
@@ -485,8 +486,15 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
     ply_path = find_result_ply(result_path, level)
     base = Path(result_path) if Path(result_path).is_dir() else ply_path.parent
     output = Path(output_path) if output_path else base / 'visualizations' / f'pyr{level}'
+    group_label = 'all'
+    if group_ids is not None:
+        ids = sorted(set(group_ids))
+        group_label = '_'.join(map(str, ids))
+        if len(group_label) > 48:
+            digest = sha256(group_label.encode('ascii')).hexdigest()[:12]
+            group_label = f'{len(ids)}ids_{digest}'
     if group_ids is not None and output_path is None:
-        output /= 'groups_' + '_'.join(map(str, sorted(set(group_ids))))
+        output /= 'groups_' + group_label
     output.mkdir(parents=True, exist_ok=True)
 
     # remove only obsolete k-group images produced by earlier script versions.
@@ -513,7 +521,18 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
     if factor_groups is not None and column_lines:
         geometry['factorized_edges'] = factorized_geometry_edges(geometry)
     colors = np.log10(np.maximum(np.abs(weights), 1e-12)) if weights is not None else None
-    norm = Normalize(float(colors.min()), max(float(colors.max()), float(colors.min()) + 1e-6)) if colors is not None else None
+    top_colors = colors
+    if factor_groups is not None:
+        # sum the weights of all y components represented by each top-view ellipse.
+        k = geometry['factorized_shape'][2]
+        xz_weights = weights.reshape(-1, k).sum(axis=1)
+        top_colors = np.repeat(np.log10(np.maximum(xz_weights, 1e-12)), k)
+    norm = None
+    if colors is not None:
+        # use one color scale across views and slices of the same model.
+        lo = float(colors.min())
+        hi = max(float(colors.max()), float(top_colors.max()), lo + 1e-6)
+        norm = Normalize(lo, hi)
     extents = np.broadcast_to(extent, (len(centers),))
 
     files = []
@@ -523,8 +542,9 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
         for name, axes in tqdm(views, desc='Export projections', unit='view'):
             selected, segments, segment_groups = projection_geometry(geometry, visible, axes, extent, column_lines)
             markers, marker_groups = factorized_center_markers(geometry, visible, axes == (0, 2)) if factor_groups is not None else (None, None)
+            view_colors = top_colors if axes == (0, 2) else colors
             filename = output / name
-            save_projection(centers[selected], covariances[selected], extents[selected], colors[selected] if colors is not None else None,
+            save_projection(centers[selected], covariances[selected], extents[selected], view_colors[selected] if view_colors is not None else None,
                             norm, axes, filename, dpi, alpha, center_size, segments=segments,
                             group_ids=factor_groups[selected] if factor_groups is not None else None, segment_group_ids=segment_groups,
                             center_markers=markers, marker_group_ids=marker_groups)
@@ -535,11 +555,19 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
             raise ValueError('slice_width must be positive and finite in world-space units')
         axis = 'xyz'.index(slice_axis)
         axes = {0: (2, 1), 1: (0, 2), 2: (0, 1)}[axis]
-        folder = output / f'slices_{slice_axis}_width_{slice_width:g}'
-        folder.mkdir(parents=True, exist_ok=True)
-        for filename in folder.glob('slice_*.png'):
-            if re.fullmatch(r'slice_\d+(?:_3d)?', filename.stem):
-                filename.unlink()
+        # record the drawing settings in both sibling directory names.
+        extent_label = repr(float(extent)) if np.ndim(extent) == 0 else 'ply'
+        name = (f'slices_{slice_axis}_width_{float(slice_width)!r}__pyr{level}_dpi{dpi}_alpha{float(alpha)!r}'
+                f'_extent{extent_label}_center{float(center_size)!r}_lines{int(column_lines)}_groups{group_label}')
+        if slice_3d:
+            name += f'_el{float(view_elevation)!r}_az{float(view_azimuth)!r}'
+        folder = output / name
+        folder_3d = output / f'{name}_3d'
+        for destination in (folder, folder_3d) if slice_3d else (folder,):
+            destination.mkdir(parents=True, exist_ok=True)
+            for filename in destination.glob('slice_*.png'):
+                if re.fullmatch(r'slice_\d+(?:_3d)?', filename.stem):
+                    filename.unlink()
         limits = projection_limits(centers[visible], covariances[visible], axes, extents[visible])
         _, full_segments, _ = projection_geometry(geometry, visible, axes, extent, column_lines)
         limits = include_segment_limits(limits, full_segments, axes)
@@ -554,19 +582,20 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
 
         # export entire groups in their center's slab and retain empty intervals.
         slices = list(geometry_slices(geometry, visible, axis, slice_width))
+        slice_colors = top_colors if axes == (0, 2) else colors
         for index, (lower, upper, selected) in enumerate(tqdm(slices, desc=f'Export {slice_axis.upper()} slices', unit='slice')):
             plotted, segments, segment_groups = projection_geometry(geometry, selected, axes, extent, column_lines)
             markers, marker_groups = factorized_center_markers(geometry, selected, axes == (0, 2)) if factor_groups is not None else (None, None)
             filename = folder / f'slice_{index:04d}.png'
             save_projection(centers[plotted], covariances[plotted], extents[plotted],
-                            colors[plotted] if colors is not None else None, norm, axes, filename, dpi, alpha, center_size, limits, segments,
+                            slice_colors[plotted] if slice_colors is not None else None, norm, axes, filename, dpi, alpha, center_size, limits, segments,
                             factor_groups[plotted] if factor_groups is not None else None, segment_groups, markers, marker_groups)
             row = f'{index}\t{slice_axis}\t{lower:.12g}\t{upper:.12g}\t{len(selected)}\t{filename.name}'
             files.append(filename)
 
             # reuse projected ellipsoids for an exact orthographic oblique view without surface meshes.
             if slice_3d:
-                filename_3d = folder / f'slice_{index:04d}_3d.png'
+                filename_3d = folder_3d / filename.name
                 ordered = selected[np.argsort(view_centers[selected, 2], kind='stable')]
                 _, segments, segment_groups = projection_geometry(geometry, selected, (0, 1), extent, column_lines)
                 view_segments = tuple(lines @ camera.T for lines in segments) if segments is not None else None
@@ -575,8 +604,9 @@ def visualize_result(result_path, output_path=None, level=0, dpi=300, alpha=0.01
                 save_projection(view_centers[ordered], view_covariances[ordered], extents[ordered],
                                 colors[ordered] if colors is not None else None, norm, (0, 1), filename_3d,
                                 dpi, alpha, center_size, view_limits, view_segments,
-                                factor_groups[ordered] if factor_groups is not None else None, segment_groups, view_markers, marker_groups)
-                row += f'\t{filename_3d.name}'
+                                factor_groups[ordered] if factor_groups is not None else None, segment_groups, view_markers, marker_groups,
+                                figure_size=(12, 9))
+                row += f'\t../{folder_3d.name}/{filename_3d.name}'
                 files.append(filename_3d)
             rows.append(row)
         summary = folder / 'slice_distribution.txt'

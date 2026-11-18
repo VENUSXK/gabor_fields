@@ -94,7 +94,9 @@ class FactorizedVisualizationTests(unittest.TestCase):
         # preserve original group ids and colors while exporting only the requested group.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_factors(root / 'optimized_asset_pyr0/data/root.primitives_pyr0.ply')
+            path = root / 'optimized_asset_pyr0/data/root.primitives_pyr0.ply'
+            write_factors(path)
+            weights = load_result_geometry(path)['weights'][6:]
             from examples import visualize_result as module
             with patch.object(module, 'save_projection', wraps=module.save_projection) as save:
                 files = visualize_result(root, dpi=40, alpha=0.05, center_size=12, group_ids=[1])
@@ -103,6 +105,9 @@ class FactorizedVisualizationTests(unittest.TestCase):
             for call in save.call_args_list:
                 np.testing.assert_array_equal(call.kwargs['group_ids'], 1)
                 self.assertTrue(np.all(call.args[0][:, 0] >= 10))
+                # use primitive opacity for side views and summed opacity for xz footprints.
+                expected = weights.reshape(3, 2).sum(axis=1) if call.args[5] == (0, 2) else weights
+                np.testing.assert_allclose(call.args[3], np.log10(expected))
             with files[-1].open() as stream:
                 rows = list(csv.DictReader(stream, delimiter='\t'))
             self.assertEqual(rows[0]['group_id'], '1')
