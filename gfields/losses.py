@@ -16,6 +16,7 @@ from __future__ import annotations  # Delayed parsing of type annotations
 
 import drjit as dr
 import mitsuba as mi
+import numpy as np
 
 
 # ------------------------------------------------------------------------------
@@ -203,6 +204,43 @@ def gradient_l1(reference, image, num_cams: int = 1) -> mi.TensorXf:
         horizontal = dr.mean(dr.abs(error[:, :, 1:, :] - error[:, :, :-1, :]), axis=None) if camera_width > 1 else mi.TensorXf(0.0)
         vertical = dr.mean(dr.abs(error[1:, :, :, :] - error[:-1, :, :, :]), axis=None) if height > 1 else mi.TensorXf(0.0)
         return (horizontal + vertical) * 0.5
+
+
+def reference_edge_mask(reference, num_cams: int) -> mi.TensorXb:
+    """Select the strongest 1% of reference gradients across the packed cameras."""
+    height, width, _ = reference.shape
+    camera_width = width // num_cams
+    with dr.suspend_grad():
+        brightness = dr.mean(reference, axis=2).numpy().reshape(height, num_cams, camera_width)
+    # rank forward differences within each view and exclude flat pixels and camera seams.
+    core = brightness[:-1, :, :-1]
+    strength = np.hypot(brightness[1:, :, :-1] - core, brightness[:-1, :, 1:] - core)
+    flat = strength.ravel()
+    count = min((flat.size + 99) // 100, np.count_nonzero(flat > 0))
+    selected = np.zeros(flat.shape, dtype=bool)
+    if count:
+        threshold = np.partition(flat, flat.size - count)[flat.size - count]
+        selected = flat > threshold
+        remaining = count - np.count_nonzero(selected)
+        selected[np.flatnonzero(flat == threshold)[:remaining]] = True
+    mask = np.zeros(brightness.shape, dtype=bool)
+    mask[:-1, :, :-1] = selected.reshape(strength.shape)
+    return mi.TensorXb(mask.reshape(height, width, 1))
+
+
+def edge_squared_error(reference, image, mask):
+    """Return squared brightness error and pixel count for a fixed edge mask."""
+    with dr.suspend_grad():
+        delta = dr.mean(reference - dr.clip(image, 0.0, 1.0), axis=2).array
+        return dr.sum(dr.select(mask.array, dr.square(delta), 0.0)), dr.sum(mi.UInt32(mask.array))
+
+
+def edge_psnr(squared_error, pixel_count) -> float:
+    # an image without selected edges has no edge psnr.
+    count = int(pixel_count[0])
+    if count == 0:
+        return float('nan')
+    return float(-10.0 * np.log10(max(float(squared_error[0]) / count, 1e-12)))
 
 
 def l2(reference, image) -> mi.Float:

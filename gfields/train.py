@@ -89,10 +89,11 @@ def _batched_render_loss(
     l1_weight: float,
     ssim_weight: float,
     compute_gradient_metric: bool = False,
-) -> Tuple[mi.TensorXf, mi.Float, mi.Float, mi.Float, mi.Float, Optional[mi.TensorXf]]:
+    edge_mask: Optional[mi.TensorXb] = None,
+) -> Tuple[mi.TensorXf, mi.Float, mi.Float, mi.Float, mi.Float, Optional[mi.TensorXf], Optional[float]]:
     '''Render camera batches and average L1/SSIM loss (reduces peak ray count).
 
-    Returns ``(last_batch_image, loss, l1, ssim, mse, gradient_l1)`` where ``loss``, ``l1``,
+    Returns ``(last_batch_image, loss, l1, ssim, mse, gradient_l1, edge_psnr)`` where ``loss``, ``l1``,
     ``ssim`` and ``mse`` are full-image averages over every camera batch.  The
     MSE is returned so a full-image PSNR can be logged even when
     ``opt_cam_batch`` renders only a subset of cameras per pass (the returned
@@ -105,6 +106,7 @@ def _batched_render_loss(
     ssim_acc: mi.Float | None = None
     mse_acc: mi.Float | None = None
     gradient_l1_acc: mi.TensorXf | None = None
+    edge_error, edge_count = mi.Float(0), mi.UInt32(0)
     last_image: mi.TensorXf | None = None
     for sensor, sl in cam_batches:
         image = mi.render(
@@ -128,13 +130,20 @@ def _batched_render_loss(
             with dr.suspend_grad():
                 batch_gradient_l1 = gfields.losses.gradient_l1(batch_ref, image, n_cams)
                 gradient_l1_acc = batch_gradient_l1 * n_cams if gradient_l1_acc is None else gradient_l1_acc + batch_gradient_l1 * n_cams
+        if edge_mask is not None:
+            # pool squared errors by selected pixel count across camera batches.
+            mask = slice_batched_ref_image(edge_mask, args.cam_res_x, sl)
+            batch_error, batch_count = gfields.losses.edge_squared_error(batch_ref, image, mask)
+            edge_error += batch_error
+            edge_count += batch_count
         last_image = image
     assert (loss is not None and last_image is not None and l1_acc is not None
             and ssim_acc is not None and mse_acc is not None)
     inv = 1.0 / float(total_cameras)
     with dr.suspend_grad():
         gradient_metric = gradient_l1_acc * inv if gradient_l1_acc is not None else None
-    return last_image, loss * inv, l1_acc * inv, ssim_acc * inv, mse_acc * inv, gradient_metric
+    edge_metric = gfields.losses.edge_psnr(edge_error, edge_count) if edge_mask is not None else None
+    return last_image, loss * inv, l1_acc * inv, ssim_acc * inv, mse_acc * inv, gradient_metric, edge_metric
 
 
 # Optimization Setup
@@ -250,6 +259,7 @@ if not args.skip_gaussian_optim:
     )
     mi.util.write_bitmap(str(args.output / 'reference_pyr0.exr'), gfields.utils.concatenate_tensors(ref_images))
     ref_image = gfields.utils.concatenate_tensors(ref_images)
+    edge_mask = gfields.losses.reference_edge_mask(ref_image, args.cam_count)
 
 
     # render initial scene
@@ -324,10 +334,11 @@ if not args.skip_gaussian_optim:
                       or (it + 1) == args.iterations_gaussian
                       or (it + 1) in inspect_iters)
             with timer.track('forward'):
-                image, img_loss, l1, ssim, img_mse, gradient_l1 = _batched_render_loss(
+                image, img_loss, l1, ssim, img_mse, gradient_l1, edge_psnr = _batched_render_loss(
                     scene, scene_params, ref_image, opt_cam_batches,
                     spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
                     l1_weight=0.75, ssim_weight=0.25, compute_gradient_metric=do_log,
+                    edge_mask=edge_mask if do_log else None,
                 )
 
             with timer.track('loss'):
@@ -382,6 +393,7 @@ if not args.skip_gaussian_optim:
                     metrics: Dict[str, float] = {
                         "loss": loss.array[0], "L1": l1.array[0],
                         "SSIM": ssim.array[0], "PSNR": psnr.array[0], "gradient_l1": float(gradient_l1.array[0]),
+                        "edge_psnr": edge_psnr,
                         "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0],
                         "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                     }
@@ -435,6 +447,8 @@ if not args.skip_gaussian_optim:
         (args.output / 'column_render_metrics.json').write_text(json.dumps(render_metrics, indent=2), encoding='utf-8')
 
     print(f'\nFinal PSNR: {gfields.losses.psnr(ref_image, dr.clip(optimized, 0.0, 1.0)).array[0]}')
+    final_edge_psnr = gfields.losses.edge_psnr(*gfields.losses.edge_squared_error(ref_image, optimized, edge_mask))
+    print(f'Final edge PSNR (top 1%): {final_edge_psnr}')
     print(f'Final SSIM: {ssim_loss_fn(ref_image, dr.clip(optimized, 0.0, 1.0), args.cam_count).array[0]}')
     print(f'Final L1: {gfields.losses.l1(ref_image, dr.clip(optimized, 0.0, 1.0)).array[0]}')
     print(f'Final gradient L1: {gfields.losses.gradient_l1(ref_image, dr.clip(optimized, 0.0, 1.0), args.cam_count).array[0]}')
@@ -508,6 +522,7 @@ ref_images = render_reference_images(
 mi.util.write_bitmap(str(args.output / f'reference_pyr{GABOR_LVL}.exr'), dr.concat(ref_images, axis=1))
 
 ref_image = gfields.utils.concatenate_tensors(ref_images)
+edge_mask = gfields.losses.reference_edge_mask(ref_image, args.cam_count)
 del ref_images  # free memory
 
 
@@ -656,10 +671,11 @@ try:
                   or (it + 1) == args.iterations_gabor
                   or (it + 1) in inspect_iters)
         with gabor_timer.track('forward'):
-            image, img_loss, l1, ssim, img_mse, gradient_l1 = _batched_render_loss(
+            image, img_loss, l1, ssim, img_mse, gradient_l1, edge_psnr = _batched_render_loss(
                 scene, scene_params, ref_image, iter_batches,
                 spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
                 l1_weight=0.80, ssim_weight=0.20, compute_gradient_metric=do_log,
+                edge_mask=edge_mask if do_log else None,
             )
 
         if dr.any(dr.isnan(image)):
@@ -727,6 +743,7 @@ try:
                 metrics: Dict[str, float] = {
                     "loss": loss.array[0], "L1": l1.array[0],
                     "SSIM": ssim.array[0], "PSNR": psnr.array[0], "gradient_l1": float(gradient_l1.array[0]),
+                    "edge_psnr": edge_psnr,
                     "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0], "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                 }
                 callbacks.on_suspend_grad(it, opt, metrics)
@@ -805,6 +822,8 @@ if args.save_best and best_gabor_psnr > final_gabor_psnr:
 shutil.rmtree(best_ckpt_dir, ignore_errors=True)  # tidy the scratch stash
 
 print(f'\nFinal PSNR: {final_gabor_psnr}')
+final_edge_psnr = gfields.losses.edge_psnr(*gfields.losses.edge_squared_error(ref_image, optimized, edge_mask))
+print(f'Final edge PSNR (top 1%): {final_edge_psnr}')
 
 callbacks.on_optim_end()
 

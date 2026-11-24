@@ -155,6 +155,8 @@ def _render_volumes(
         'max_depth': max_depth,
         'rr_depth': rr_depth,
     }
+    # map the cube's [-1, 1] coordinates to the density grid's [0, 1] domain.
+    boundary_to_world = to_world @ T().translate(0.5).scale(0.5)
     scene_ref = mi.load_dict({
         'type': 'scene',
         'integrator': integrator_dict,
@@ -162,7 +164,7 @@ def _render_volumes(
             'type': 'cube',
             'bsdf': { 'type': 'null' },
             'interior': medium_dict,
-            'to_world': T().scale([1.5, 1.5, 1.5]),
+            'to_world': boundary_to_world,
         },
         'environment': {'type': 'constant'} if not multiple_scattering else {'type': 'envmap', 'filename': envmap, 'scale': envmap_scale},
     })
