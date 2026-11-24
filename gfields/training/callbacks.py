@@ -158,12 +158,20 @@ class PlotCallback(CallbackABC):
         parameters = self.columns.parameters
         shared_scales = parameters['column_scale_xz'].numpy()
         axial_scales = parameters['primitive_scale_y'].numpy()
-        opacity = parameters['primitive_opacity'].numpy()
-        area = np.prod(shared_scales, axis=0)[self.columns.primitive_indices.numpy()]
-        density = opacity / ((2.0 * np.pi) ** 1.5 * area * axial_scales)
-        before = {'opacities': opacity, 'scales': np.concatenate((shared_scales.reshape(-1), axial_scales)),
-                  'column_scale_xz': shared_scales.reshape(-1), 'primitive_scale_y': axial_scales,
-                  'density': density}
+        before = {'scales': np.concatenate((shared_scales.reshape(-1), axial_scales)),
+                  'column_scale_xz': shared_scales.reshape(-1), 'primitive_scale_y': axial_scales}
+
+        # inspect normalized FGC factors or the existing independent Column weights.
+        if 'group_opacity' in parameters:
+            xz_weights = self.columns._group_softmax(parameters['xz_logits'], self.columns.xz_gaussians_per_group).numpy()
+            y_weights = self.columns._group_softmax(parameters['y_logits'], self.columns.y_gaussians_per_group).numpy()
+            before.update(group_opacity=parameters['group_opacity'].numpy(), xz_weight=xz_weights, y_weight=y_weights,
+                          xz_density=xz_weights / (2.0 * np.pi * np.prod(shared_scales, axis=0)),
+                          y_density=y_weights / (np.sqrt(2.0 * np.pi) * axial_scales))
+        else:
+            opacity = parameters['primitive_opacity'].numpy()
+            area = np.prod(shared_scales, axis=0)[self.columns.primitive_indices.numpy()]
+            before.update(opacities=opacity, density=opacity / ((2.0 * np.pi) ** 1.5 * area * axial_scales))
 
         # Use expanded primitive geometry for the matching Gaussian histograms.
         _, scales, _, expanded_opacity = self.columns.expand()
@@ -187,7 +195,7 @@ class PlotCallback(CallbackABC):
         if (epoch + 1) % 10 != 0 and epoch != 0:
             return
 
-        if getattr(self.args, 'use_columns_representation', False) and self.level == 0:
+        if (getattr(self.args, 'use_columns_representation', False) or getattr(self.args, 'use_factorized_columns_representation', False)) and self.level == 0:
             for stage, values in zip(('before_expansion', 'after_expansion'), self._column_histogram_data()):
                 for name, data in values.items():
                     self._make_histogram(epoch + 1, name, data, stage=stage, bins=100)
@@ -214,7 +222,7 @@ class PlotCallback(CallbackABC):
         import matplotlib.pyplot as plt
         import numpy as np
 
-        data = np.asarray(data).reshape(-1)
+        data = np.asarray(data, dtype=np.float64).reshape(-1)
         data = data[np.isfinite(data)]
         if not data.size:
             return

@@ -63,7 +63,8 @@ def get_plugin_type(obj):
         return class_to_plugin[cname]
     return cname.lower()  # e.g. 'EllipsoidsMesh' -> 'ellipsoidsmesh'
 
-def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False, use_columns_representation=False):
+def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False, use_columns_representation=False,
+                  use_factorized_columns_representation=False):
     '''
     Generate a Python asset that contains a dictionary that represents a Mitsuba
     scene.
@@ -114,13 +115,18 @@ def dict_to_asset(scene_dict: dict, output_folder: str, verbose=False, use_colum
             filename = join(output_folder, 'data', f'{path}.ply')
             # choose the ply layout from the dictionary without passing a column object.
             save_as_columns = use_columns_representation and 'column_center_xz' in d
-            ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=save_as_columns)
+            save_as_fgc = use_factorized_columns_representation and 'group_opacity' in d
+            ellipsoid_dict_to_ply(d, extras_keys, filename, use_columns_representation=save_as_columns,
+                                  use_factorized_columns_representation=save_as_fgc)
 
             # remove serialized arrays from the generated asset dictionary.
             for k in extras_keys + ['centers', 'scales', 'quaternions']:
                 d.pop(k, None)
             if save_as_columns:
                 d.pop('primitives_per_column', None)
+            if save_as_fgc:
+                for key in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'):
+                    d.pop(key, None)
             d['filename'] = filename
 
         for k, v in d.items():
@@ -372,13 +378,63 @@ def object_to_dict(root):
     return cb._dict['root']
 
 
-def load_ellipsoid_ply(filename, use_columns_representation=False):
-    """Read shared column parameters or decode the existing Gaussian vertex layout."""
+def _load_factorized_ellipsoid_ply(ply):
+    # validate the compact factor tables before reconstructing any rendering arrays.
+    required = {
+        'metadata': ('format_version', 'group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group', 'extent', 'albedo_r', 'albedo_g', 'albedo_b'),
+        'group': ('opacity',), 'xz': ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle', 'weight'),
+        'y': ('center_y', 'scale_y', 'weight'),
+    }
+    element_names = {element.name for element in ply.elements}
+    for name, fields in required.items():
+        if name not in element_names or not set(fields).issubset(ply[name].data.dtype.names):
+            raise ValueError(f'FGC PLY requires a complete {name!r} element')
+    if len(ply['metadata'].data) != 1:
+        raise ValueError('FGC PLY must contain exactly one metadata record')
+
+    # preserve fixed group dimensions and reject inconsistent record counts.
+    metadata = ply['metadata'].data[0]
+    if int(metadata['format_version']) != 3:
+        raise ValueError('FGC PLY requires format_version 3')
+    group_count, xz_count, y_count = (int(metadata[name]) for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+    groups, xz, y = (ply[name].data for name in ('group', 'xz', 'y'))
+    if min(group_count, xz_count, y_count) <= 0 or (len(groups), len(xz), len(y)) != (group_count, group_count * xz_count, group_count * y_count):
+        raise ValueError('FGC table lengths must match R, R * J, R * K')
+    out = {
+        'column_center_xz': np.stack((xz['center_x'], xz['center_z']), axis=-1).astype(np.float32),
+        'column_scale_xz': np.stack((xz['scale_x'], xz['scale_z']), axis=-1).astype(np.float32),
+        'column_quaternions': xz['rotation_angle'].astype(np.float32), 'xz_weight': xz['weight'].astype(np.float32),
+        'primitive_center_y': y['center_y'].astype(np.float32), 'primitive_scale_y': y['scale_y'].astype(np.float32),
+        'y_weight': y['weight'].astype(np.float32), 'group_opacity': groups['opacity'].astype(np.float32),
+    }
+
+    # require physical scales, normalized factor weights, and valid rendering settings.
+    if not all(np.isfinite(values).all() for values in out.values()):
+        raise ValueError('FGC PLY parameters must be finite')
+    if np.any(out['column_scale_xz'] <= 0) or np.any(out['primitive_scale_y'] <= 0) or np.any(out['group_opacity'] < 0):
+        raise ValueError('FGC requires positive scales and nonnegative group opacity')
+    for name, count in (('xz_weight', xz_count), ('y_weight', y_count)):
+        if np.any(out[name] < 0) or not np.allclose(out[name].reshape(group_count, count).sum(axis=1), 1.0, rtol=1e-5, atol=1e-6):
+            raise ValueError('FGC mixture weights must be nonnegative and normalized within each group')
+    extent = float(metadata['extent'])
+    albedo = np.array([metadata['albedo_r'], metadata['albedo_g'], metadata['albedo_b']], dtype=np.float32)
+    if not np.isfinite(extent) or extent <= 0 or not np.isfinite(albedo).all():
+        raise ValueError('FGC PLY requires a finite positive extent and finite RGB albedo')
+    out.update(group_count=group_count, xz_gaussians_per_group=xz_count, y_gaussians_per_group=y_count, extent=extent, albedo=albedo)
+    return out
+
+
+def load_ellipsoid_ply(filename, use_columns_representation=False, use_factorized_columns_representation=False):
+    """Read compact Column or FGC factors, or decode the Gaussian vertex layout."""
     import plyfile
 
     # read the file once and select the requested representation.
     ply = plyfile.PlyData.read(str(filename))
     element_names = {element.name for element in ply.elements}
+    if use_columns_representation and use_factorized_columns_representation:
+        raise ValueError('Choose either Column or FGC PLY representation')
+    if use_factorized_columns_representation:
+        return _load_factorized_ellipsoid_ply(ply)
     if use_columns_representation:
         required_fields = {
             'metadata': ('format_version', 'primitives_per_column', 'extent', 'albedo_r', 'albedo_g', 'albedo_b'),
@@ -438,7 +494,7 @@ def load_ellipsoid_ply(filename, use_columns_representation=False):
 
     # keep gaussian log-scale and quaternion decoding unchanged.
     if 'vertex' not in element_names:
-        raise ValueError('Gaussian PLY requires a vertex element; use use_columns_representation=True for a column PLY')
+        raise ValueError('Gaussian PLY requires a vertex element; enable the matching Column or FGC representation flag')
     v = ply['vertex'].data
     names = set(v.dtype.names)
 

@@ -212,6 +212,106 @@ class GaussianColumn:
         return centers, scales, quaternions, primitive_opacity
 
 
+class FactorizedGaussianColumn:
+    """Groups of XZ Gaussian mixtures sharing normalized Y Gaussian mixtures."""
+    parameter_names = ('column_center_xz', 'column_scale_xz', 'column_quaternions', 'xz_logits',
+                       'primitive_center_y', 'primitive_scale_y', 'y_logits', 'group_opacity')
+
+    def __init__(self, parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds=None):
+        # define the fixed factor layout and keep initial or live parameters.
+        counts = (xz_gaussians_per_group, y_gaussians_per_group)
+        if any(isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count <= 0 for count in counts):
+            raise ValueError('XZ and Y Gaussian counts per group must be positive integers')
+        self.xz_gaussians_per_group = int(xz_gaussians_per_group)
+        self.y_gaussians_per_group = int(y_gaussians_per_group)
+        self.group_count = dr.width(parameters['group_opacity'])
+        self._parameters = parameters
+        self._column_optimizer = None
+
+        # validate factor widths and nonnegative initial group weights.
+        self._validate_parameter_counts()
+        if self.group_count == 0 or not dr.all(dr.isfinite(parameters['group_opacity']) & (parameters['group_opacity'] >= 0)):
+            raise ValueError('FGC requires nonempty groups with finite nonnegative opacity')
+        self.scale_lower_bounds = scale_lower_bounds or {
+            'column_scale_xz': [1e-5, 1e-5], 'primitive_scale_y': 1e-5
+        }
+        if hasattr(parameters, 'state'):
+            self.column_optimizer = parameters
+
+        # index Cartesian products in group, XZ component, Y component order.
+        primitive_count = self.group_count * self.xz_gaussians_per_group * self.y_gaussians_per_group
+        indices = dr.arange(mi.UInt32, primitive_count)
+        self.group_indices = indices // (self.xz_gaussians_per_group * self.y_gaussians_per_group)
+        self.xz_indices = indices // self.y_gaussians_per_group
+        self.y_indices = self.group_indices * self.y_gaussians_per_group + indices % self.y_gaussians_per_group
+
+    @property
+    def column_optimizer(self):
+        return self._column_optimizer
+
+    @column_optimizer.setter
+    def column_optimizer(self, optimizer):
+        # constrain total group weights when binding an optimizer.
+        if optimizer is not None:
+            optimizer.set_bounds('group_opacity', lower=0.0)
+        self._column_optimizer = optimizer
+
+    @property
+    def parameters(self):
+        return self.column_optimizer if self.column_optimizer is not None else self._parameters
+
+    def _validate_parameter_counts(self):
+        # check the three parameter families against the fixed group layout.
+        for name in self.parameter_names:
+            count = self.xz_gaussians_per_group if name.startswith('column_') or name == 'xz_logits' else self.y_gaussians_per_group
+            expected_count = self.group_count if name == 'group_opacity' else self.group_count * count
+            if dr.width(self.parameters[name]) != expected_count:
+                raise ValueError(f'{name} must contain {expected_count} entries for the FGC layout')
+
+    def _group_softmax(self, logits, components_per_group):
+        # normalize each mixture independently with a stable differentiable softmax.
+        values = mi.TensorXf(logits, shape=(self.group_count, components_per_group))
+        maximum = dr.reshape(mi.TensorXf, dr.detach(dr.max(values, axis=1)), (self.group_count, 1))
+        weights = dr.exp(values - maximum)
+        total = dr.reshape(mi.TensorXf, dr.sum(weights, axis=1), (self.group_count, 1))
+        return (weights / total).array
+
+    def expand(self):
+        # read live factors and normalize weights within each group.
+        self._validate_parameter_counts()
+        parameters = self.parameters
+        xz_weights = self._group_softmax(parameters['xz_logits'], self.xz_gaussians_per_group)
+        y_weights = self._group_softmax(parameters['y_logits'], self.y_gaussians_per_group)
+
+        # gather shared geometry for each pair of XZ and Y components.
+        center_xz = dr.gather(mi.Point2f, parameters['column_center_xz'], self.xz_indices)
+        scale_xz = dr.gather(mi.Vector2f, parameters['column_scale_xz'], self.xz_indices)
+        center_y = dr.gather(mi.Float, parameters['primitive_center_y'], self.y_indices)
+        scale_y = dr.gather(mi.Float, parameters['primitive_scale_y'], self.y_indices)
+        angles = dr.gather(mi.Float, parameters['column_quaternions'], self.xz_indices)
+
+        # combine factors into the existing three-dimensional Gaussian format.
+        centers = mi.Point3f(center_xz[0], center_y, center_xz[1])
+        scales = mi.Vector3f(scale_xz[0], scale_y, scale_xz[1])
+        quaternions = dr.euler_to_quat(mi.Point3f(0.0, angles, 0.0))
+        opacities = dr.gather(mi.Float, parameters['group_opacity'], self.group_indices)
+        opacities *= dr.gather(mi.Float, xz_weights, self.xz_indices) * dr.gather(mi.Float, y_weights, self.y_indices)
+        return centers, scales, quaternions, opacities
+
+    def parameter_stats(self):
+        # report stored factors separately from expanded rendering primitives.
+        parameter_count = sum(prod(dr.shape(self.parameters[name])) for name in self.parameter_names)
+        return {
+            'group_count': self.group_count,
+            'xz_gaussians_per_group': self.xz_gaussians_per_group,
+            'y_gaussians_per_group': self.y_gaussians_per_group,
+            'expanded_gaussian_count': self.group_count * self.xz_gaussians_per_group * self.y_gaussians_per_group,
+            'trainable_parameter_count': parameter_count,
+            'trainable_parameter_bytes': 4 * parameter_count,
+            'rendering_uses_expanded_gaussians': True
+        }
+
+
 class Kernel:
     @staticmethod
     def factory(props: mi.Properties):

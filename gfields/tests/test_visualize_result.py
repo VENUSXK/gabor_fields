@@ -4,6 +4,7 @@ import csv
 import unittest
 from pathlib import Path
 import numpy as np
+from matplotlib import rc_context
 from PIL import Image
 from plyfile import PlyData, PlyElement
 from examples.visualize_result import find_result_ply, load_result_geometry, gaussian_covariances, projected_ellipses, primitive_slices, oblique_geometry, column_geometry_segments, visualize_result
@@ -157,15 +158,27 @@ class ResultVisualizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_columns(root / 'optimized_asset_pyr0/data/root.primitives_pyr0.ply', [2, 3])
-            files = visualize_result(root, dpi=40, slice_axis='y', slice_width=0.1, slice_3d=True)
+            with rc_context({'savefig.bbox': 'tight'}):
+                files = visualize_result(root, dpi=40, alpha=0.03, extent=2.5, center_size=6,
+                                         slice_axis='y', slice_width=0.02, slice_3d=True,
+                                         view_elevation=30, view_azimuth=-45)
             summary = next(file for file in files if file.name == 'slice_distribution.txt')
+            name = 'slices_y_width_0.02__pyr0_dpi40_alpha0.03_extent2.5_center6.0_lines1_groupsall_el30.0_az-45.0'
+            self.assertEqual(summary.parent.name, name)
             with summary.open(newline='') as stream:
                 rows = list(csv.DictReader(stream, delimiter='\t'))
             self.assertEqual(sum(int(row['primitive_count']) for row in rows), 5)
+            self.assertTrue(any(int(row['primitive_count']) == 0 for row in rows))
             for row in rows:
                 self.assertEqual(row['axis'], 'y')
                 self.assertTrue((summary.parent / row['filename']).exists())
-                self.assertTrue((summary.parent / row['filename_3d']).exists())
+                oblique = (summary.parent / row['filename_3d']).resolve()
+                self.assertEqual(oblique.parent, summary.parent.parent / f'{name}_3d')
+                self.assertEqual(oblique.name, row['filename'])
+                with Image.open(oblique) as image:
+                    self.assertEqual(image.size, (480, 360))
+                    blank = np.all(np.asarray(image)[:, :, :3] == 255)
+                    self.assertEqual(blank, int(row['primitive_count']) == 0)
             self.assertEqual(len([file for file in files if file.suffix == '.png']), 2 * len(rows))
 
     def test_column_outline_and_center_lines_preserve_membership(self):
