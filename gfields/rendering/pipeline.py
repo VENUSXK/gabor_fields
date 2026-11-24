@@ -63,6 +63,7 @@ class AssetInfo:
     primitives_per_column: Dict[int, int] = field(default_factory=dict)
     primitive_count_per_column: Dict[int, Any] = field(default_factory=dict)
     use_factorized_columns_representation: bool = False
+    use_fgc_bvh: bool = False
     factorized_group_shapes: Dict[int, tuple[int, int, int]] = field(default_factory=dict)
 
     def __repr__(self) -> str:  # noqa: D401
@@ -104,7 +105,7 @@ class SteerableAssetInfo:
 
 
 def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representation=False,
-                       use_factorized_columns_representation=False) -> AssetInfo:
+                       use_factorized_columns_representation=False, use_fgc_bvh=False) -> AssetInfo:
     """Auto-detect a pyramid asset's structure (num levels, primitive counts, extents).
 
     Reads the unified per-level store ``<asset>/data/root.primitives_pyr*.ply``.
@@ -113,6 +114,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
     """
     asset_path = str(asset_path)
     import gfields.io
+    if use_fgc_bvh and not use_factorized_columns_representation:
+        raise ValueError("FGC BVH requires use_factorized_columns_representation")
     if use_columns_representation and use_factorized_columns_representation:
         raise ValueError('Choose either Column or FGC representation')
 
@@ -152,7 +155,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             has_albedo=has_albedo, num_primitives=num_primitives, extents=extents,
             use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column,
             primitive_count_per_column=primitive_count_per_column,
-            use_factorized_columns_representation=use_factorized_columns_representation, factorized_group_shapes=factorized_group_shapes)
+            use_factorized_columns_representation=use_factorized_columns_representation, use_fgc_bvh=use_fgc_bvh,
+            factorized_group_shapes=factorized_group_shapes)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
@@ -312,6 +316,23 @@ def load_steerable_asset(
     )
 
 
+def _fgc_bvh_properties(factors, world_scale, group_indices):
+    import mitsuba as mi
+
+    # pack the geometry factors in the same group order as the expanded ellipsoids.
+    group_count = factors['group_count']
+    j, k = factors['xz_gaussians_per_group'], factors['y_gaussians_per_group']
+    xz = np.column_stack((factors['column_center_xz'] * world_scale, factors['column_scale_xz'] * world_scale,
+                          factors['column_quaternions'])).reshape(group_count, j, 5)
+    y = np.column_stack((factors['primitive_center_y'] * world_scale, factors['primitive_scale_y'] * world_scale,
+                         factors['y_weight'])).reshape(group_count, k, 3)
+    if group_indices is not None:
+        xz, y = xz[group_indices], y[group_indices]
+
+    # send compact geometry and normalized y weights to optix.
+    return {'fgc_xz_count': j, 'fgc_y_count': k, 'fgc_xz': mi.TensorXf(xz.reshape(-1, 5)), 'fgc_y': mi.TensorXf(y.reshape(-1, 3))}
+
+
 def load_pyramid_level(
     asset_info: AssetInfo,
     level: int,
@@ -330,6 +351,7 @@ def load_pyramid_level(
     use_factorized_columns = asset_info.use_factorized_columns_representation
     primitives_per_column = asset_info.primitives_per_column.get(level, 1)
     grouped_columns = use_columns_representation
+    fgc_factors, group_indices = None, None
     import gfields.io
     if getattr(asset_info, "ply_folder", None):
         a = gfields.io.load_ellipsoid_ply(
@@ -350,7 +372,7 @@ def load_pyramid_level(
         parameters['column_center_xz'] = mi.Point2f(a['column_center_xz'].T)
         parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
 
-        # reconstruct normalized FGC factors and keep rendering strictly per Gaussian.
+        # reconstruct normalized fgc factors and optionally group their bvh bounds.
         if use_factorized_columns:
             shape = tuple(a[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
             if shape != asset_info.factorized_group_shapes[level]:
@@ -361,8 +383,10 @@ def load_pyramid_level(
                 logits = np.log(weights, out=np.full_like(weights, -np.inf), where=weights > 0)
                 parameters[f'{axis}_logits'] = mi.Float(logits)
             columns = FactorizedGaussianColumn(parameters, shape[1], shape[2])
-            grouped_columns = False
-            primitives_per_column = 1
+            grouped_columns = asset_info.use_fgc_bvh
+            if grouped_columns:
+                fgc_factors = a
+                primitives_per_column = shape[1] * shape[2]
         else:
             # preserve fixed and variable-length Column rendering behavior.
             parameters['primitive_opacity'] = mi.Float(a['primitive_opacity'])
@@ -410,6 +434,7 @@ def load_pyramid_level(
         expected = (groups[:, :1] // primitives_per_column) * primitives_per_column + np.arange(primitives_per_column)
         if not np.array_equal(groups, expected):
             raise ValueError('Primitive selection splits or reorders children inside a column; select complete columns')
+        group_indices = groups[:, 0] // primitives_per_column
 
     if primitive_subset is not None:
         centers = np.ascontiguousarray(centers[primitive_subset])
@@ -438,11 +463,14 @@ def load_pyramid_level(
     else:
         extent_out = float(extent)
 
-    return _ellipsoids_entry(
-        centers=centers, scales=scales, quaternions=quaternions,
-        opacities=opacities * opacity_scale, omega=omega,
-        albedo=albedo * albedo_scale, extent=extent_out,
-        visibility_mask=2 ** level, use_columns_representation=grouped_columns, primitives_per_column=primitives_per_column)
+    # reuse the existing analytic shape and attach fgc factors only for the opt-in path.
+    entry = _ellipsoids_entry(
+        centers=centers, scales=scales, quaternions=quaternions, opacities=opacities * opacity_scale, omega=omega,
+        albedo=albedo * albedo_scale, extent=extent_out, visibility_mask=2 ** level,
+        use_columns_representation=grouped_columns, primitives_per_column=primitives_per_column)
+    if fgc_factors is not None:
+        entry.update(_fgc_bvh_properties(fgc_factors, ws, group_indices))
+    return entry
 
 
 # ---------------------------------------------------------------------------

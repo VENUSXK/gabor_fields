@@ -179,6 +179,7 @@ def parse_args():
                         help='Render Laplacian pyramid of the asset')
     parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY; variable column counts use per-primitive geometry')
     parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Read compact FGC PLY and expand into per-Gaussian geometry')
+    parser.add_argument('--use_fgc_bvh', action='store_true', help='Use one analytic BVH bound per FGC group')
     parser.add_argument('--multiple_scattering', action='store_true',
                         help='Enable multiple scattering rendering')
     parser.add_argument('--no_nee', action='store_true',
@@ -395,6 +396,7 @@ def _video_parse_args() -> argparse.Namespace:
     p.add_argument('asset', help='Optimized asset directory (unified data/root.primitives_pyr*.ply layout)')
     p.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY; variable column counts use per-primitive geometry')
     p.add_argument('--use_factorized_columns_representation', action='store_true', help='Read compact FGC PLY and expand into per-Gaussian geometry')
+    p.add_argument('--use_fgc_bvh', action='store_true', help='Use one analytic BVH bound per FGC group')
     p.add_argument('--motion', choices=['turntable', 'envmap'],
                    default='turntable', help='Camera orbit or rotating env map')
     p.add_argument('--envmap', default=str(default_envmap),
@@ -450,7 +452,7 @@ def _video_build_scene_dict(args, asset_dir) -> dict:
         detect_asset_info, load_pyramid_level, create_integrator_config,
         create_environment_config)
     info = detect_asset_info(str(asset_dir), use_columns_representation=args.use_columns_representation,
-                             use_factorized_columns_representation=args.use_factorized_columns_representation)
+                             use_factorized_columns_representation=args.use_factorized_columns_representation, use_fgc_bvh=args.use_fgc_bvh)
     scene_dict: dict = {
         'type': 'scene',
         'integrator': create_integrator_config(
@@ -573,7 +575,7 @@ def main():
 
     # Check if this is a steerable asset
     if is_steerable_asset(args.asset):
-        if args.use_columns_representation or args.use_factorized_columns_representation:
+        if args.use_columns_representation or args.use_factorized_columns_representation or args.use_fgc_bvh:
             raise ValueError('Column representation cannot be used with a steerable asset')
         print("=" * 60)
         print("Steerable Asset Detected")
@@ -583,7 +585,7 @@ def main():
     
     # Detect pyramid asset structure
     asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation,
-                                   use_factorized_columns_representation=args.use_factorized_columns_representation)
+                                   use_factorized_columns_representation=args.use_factorized_columns_representation, use_fgc_bvh=args.use_fgc_bvh)
     print(f"Detected asset: {asset_info}")
     
     # One-shot pre-render refinement (opt-in, non-destructive): adaptively clamp

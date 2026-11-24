@@ -76,6 +76,78 @@ class FactorizedColumnPlyTests(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(geometry['opacities']).ravel(), weights.numpy()[1:7] * 3, rtol=2e-6)
             np.testing.assert_allclose(np.asarray(geometry['albedo']), np.tile([0.1, 0.2, 0.3], (6, 1)))
 
+    @unittest.skipUnless(mi.variant().startswith('cuda'), 'FGC BVH requires CUDA')
+    def test_grouped_render_preserves_factor_order_and_transmission(self):
+        # compare an fgc asset through the default and grouped render paths.
+        with tempfile.TemporaryDirectory() as directory:
+            factors, original, asset, _ = save_factors(directory)
+            default = detect_asset_info(asset, use_factorized_columns_representation=True)
+            grouped = detect_asset_info(asset, use_factorized_columns_representation=True, use_fgc_bvh=True)
+            original['sensor'] = {'type': 'orthographic', 'to_world': mi.ScalarTransform4f().look_at(
+                origin=[0, 0, -3], target=[0, 0, 0], up=[0, 1, 0]),
+                'film': {'type': 'hdrfilm', 'width': 8, 'height': 8, 'rfilter': {'type': 'box'}}}
+
+            # check the compact buffers and the expanded integration attributes.
+            baseline = load_pyramid_level(default, 0, extent=2.5, world_scale=2)
+            geometry = load_pyramid_level(grouped, 0, extent=2.5, world_scale=2)
+            self.assertEqual((geometry['type'], geometry['primitives_per_column']), ('ellipsoids', 6))
+            self.assertEqual((geometry['fgc_xz_count'], geometry['fgc_y_count']), (2, 3))
+            self.assertEqual((geometry['fgc_xz'].shape, geometry['fgc_y'].shape), ((4, 5), (6, 3)))
+            y_factors = np.asarray(geometry['fgc_y'])
+            np.testing.assert_allclose(y_factors[:, 0], factors.parameters['primitive_center_y'].numpy() * 2)
+            np.testing.assert_allclose(y_factors[:, 1], factors.parameters['primitive_scale_y'].numpy() * 2)
+            y_logits = factors.parameters['y_logits'].numpy().reshape(2, 3)
+            weights = np.exp(y_logits)
+            np.testing.assert_allclose(y_factors[:, 2].reshape(2, 3), weights / weights.sum(axis=1, keepdims=True))
+            np.testing.assert_allclose(np.asarray(geometry['opacities']), np.asarray(baseline['opacities']))
+            second_group = load_pyramid_level(grouped, 0, world_scale=2, primitive_subset=slice(6, 12))
+            np.testing.assert_allclose(np.asarray(second_group['fgc_xz']), np.asarray(geometry['fgc_xz'])[2:])
+            np.testing.assert_allclose(np.asarray(second_group['fgc_y']), y_factors[3:])
+
+            # compare the same analytic support with one bound per primitive or group.
+            baseline['type'] = 'ellipsoids'
+            baseline.pop('shell')
+            scenes = [mi.load_dict(dict(original, primitives_pyr0=entry)) for entry in (baseline, geometry)]
+            self.assertEqual([scene.shapes()[0].primitive_count() for scene in scenes], [12, 2])
+            images = [np.asarray(mi.render(scene, seed=0, spp=1)) for scene in scenes]
+            np.testing.assert_allclose(images[1], images[0], rtol=4e-5, atol=4e-6)
+
+    @unittest.skipUnless(mi.variant().startswith('cuda'), 'FGC BVH requires CUDA')
+    def test_grouped_free_flight_matches_expanded_gaussians(self):
+        # compare identical expanded primitive ids with one analytic bound per primitive or group.
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, asset, _ = save_factors(directory)
+            options = {'use_factorized_columns_representation': True}
+            info = detect_asset_info(asset, **options)
+            grouped = detect_asset_info(asset, use_fgc_bvh=True, **options)
+            extents = np.linspace(2.4, 3.6, info.num_primitives[0], dtype=np.float32)
+            baseline, optimized = (load_pyramid_level(layout, 0, extent=extents) for layout in (info, grouped))
+            baseline['type'] = 'ellipsoids'
+            baseline.pop('shell')
+            scenes = [mi.load_dict({'type': 'scene', 'primitives': geometry}) for geometry in (baseline, optimized)]
+
+            # cover vertical, oblique, side, interior, restarted and clipped rays.
+            seeds = mi.UInt32(np.arange(256, dtype=np.uint32) + 17)
+            cases = (
+                ((-0.3, -2, -0.2), (0, 1, 0), 10., 0., True),
+                ((-0.48, -2, -0.11), (0.10, 1, -0.05), 10., 0., True),
+                ((0.2, 0.2, -2), (0, 0, 1), 10., 0., True),
+                ((-0.3, -0.2, -0.2), (0, 1, 0), 10., 0., True),
+                ((-0.3, -2, -0.2), (0, 1, 0), 10., 2.02, True),
+                ((-0.3, -2, -0.2), (0, 1, 0), 0.5, 0., False),
+                ((2, -2, 0), (0, 1, 0), 10., 0., False),
+            )
+            for origin, direction, maxt, restart, has_events in cases:
+                with self.subTest(origin=origin, direction=direction, maxt=maxt, restart=restart):
+                    direction = np.asarray(direction, dtype=np.float32) / np.linalg.norm(direction)
+                    ray = mi.Ray3f(mi.Point3f(*origin), mi.Vector3f(*direction.tolist()))
+                    ray.maxt = maxt
+                    expected, actual = (scene.ray_sample_ellipsoids(ray, seeds, mi.Float(restart)) for scene in scenes)
+                    valid = np.isfinite(expected[0].numpy())
+                    self.assertEqual(bool(valid.any()), has_events)
+                    np.testing.assert_allclose(actual[0].numpy(), expected[0].numpy(), rtol=4e-5, atol=4e-6)
+                    np.testing.assert_array_equal(actual[2].numpy()[valid], expected[2].numpy()[valid])
+
     def test_zero_weights(self):
         # represent exact zero factors with negative infinity logits when loading.
         with tempfile.TemporaryDirectory() as directory:
