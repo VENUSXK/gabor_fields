@@ -133,6 +133,8 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--use_column_bvh', action='store_true', help='Trace one analytic BVH bound per column while retaining per-primitive integration')
     parser.add_argument('--init_from_columns', action='store_true', help='Initialize independent Gaussians from expanded columns without sharing their optimization parameters')
     parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Fit fixed FGC groups using per-Gaussian rendering')
+    parser.add_argument('--fit_density', action='store_true', help='Train FGC on sampled voxel densities and render only for evaluation')
+    parser.add_argument('--density_batch_size', type=int, default=256, help='Number of voxel samples per density training step')
     parser.add_argument('--init_from_factorized_columns', action='store_true', help='Initialize independent Gaussians from the same expanded FGC layout')
     parser.add_argument('--group_count', type=int, default=512, help='Number of FGC groups')
     parser.add_argument('--xz_gaussians_per_group', type=int, default=6, help='XZ Gaussian components per FGC group')
@@ -216,6 +218,12 @@ def setup() -> argparse.Namespace:
         if args.column_count <= 0 or args.primitives_per_column <= 0 or args.column_slab_depth < 0:
             parser.error('Column counts must be positive; column_slab_depth must be non-negative')
         args.gauss_count = args.column_count * args.primitives_per_column
+
+    # restrict density supervision to the factorized model.
+    if args.fit_density and not args.use_factorized_columns_representation:
+        parser.error('--fit_density requires --use_factorized_columns_representation')
+    if args.fit_density and args.density_batch_size <= 0:
+        parser.error('--density_batch_size must be positive')
 
     # keep factorized training and its matched independent baseline mutually exclusive.
     fgc_mode = args.use_factorized_columns_representation or args.init_from_factorized_columns

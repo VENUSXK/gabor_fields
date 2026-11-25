@@ -298,6 +298,37 @@ class FactorizedGaussianColumn:
         opacities *= dr.gather(mi.Float, xz_weights, self.xz_indices) * dr.gather(mi.Float, y_weights, self.y_indices)
         return centers, scales, quaternions, opacities
 
+    def eval_density(self, points: mi.Point3f) -> mi.Float:
+        """Evaluate the normalized, untruncated density at world-space points."""
+        parameters = self.parameters
+        point_count = dr.width(points)
+        j, k = self.xz_gaussians_per_group, self.y_gaussians_per_group
+        xz_count, y_count = self.group_count * j, self.group_count * k
+
+        # evaluate normalized xz mixtures in the local frame of each gaussian.
+        centers = dr.tile(parameters['column_center_xz'], point_count)
+        scales = dr.tile(parameters['column_scale_xz'], point_count)
+        dx = dr.repeat(points[0], xz_count) - centers[0]
+        dz = dr.repeat(points[2], xz_count) - centers[1]
+        sin_angle, cos_angle = dr.sincos(dr.tile(parameters['column_quaternions'], point_count))
+        x = (cos_angle * dx - sin_angle * dz) / scales[0]
+        z = (sin_angle * dx + cos_angle * dz) / scales[1]
+        xz_weights = self._group_softmax(parameters['xz_logits'], j)
+        xz_density = dr.tile(xz_weights, point_count) * dr.exp(-0.5 * (dr.square(x) + dr.square(z)))
+        xz_density /= 2.0 * dr.pi * scales[0] * scales[1]
+        xz_mixture = dr.sum(mi.TensorXf(xz_density, shape=(point_count, self.group_count, j)), axis=2)
+
+        # evaluate normalized y mixtures independently of the xz factors.
+        scale_y = dr.tile(parameters['primitive_scale_y'], point_count)
+        y = (dr.repeat(points[1], y_count) - dr.tile(parameters['primitive_center_y'], point_count)) / scale_y
+        y_weights = self._group_softmax(parameters['y_logits'], k)
+        y_density = dr.tile(y_weights, point_count) * dr.exp(-0.5 * dr.square(y)) / (dr.sqrt(2.0 * dr.pi) * scale_y)
+        y_mixture = dr.sum(mi.TensorXf(y_density, shape=(point_count, self.group_count, k)), axis=2)
+
+        # sum the weighted density products from all groups for each point.
+        group_weights = mi.TensorXf(parameters['group_opacity'], shape=(1, self.group_count))
+        return dr.sum(xz_mixture * y_mixture * group_weights, axis=1).array
+
     def parameter_stats(self):
         # report stored factors separately from expanded rendering primitives.
         parameter_count = sum(prod(dr.shape(self.parameters[name])) for name in self.parameter_names)

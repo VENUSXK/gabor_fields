@@ -291,6 +291,11 @@ if not args.skip_gaussian_optim:
 
     # precompute the reference image portion for the SSIM loss function
     ssim_loss_fn.precompute_reference_convs(ref_image, args.cam_count)
+    if args.fit_density:
+        # keep a reproducible density batch for comparing logged iterations.
+        density_rng = np.random.default_rng(args.seed_offset % (2**32))
+        eval_rng = np.random.default_rng([0, 1])
+        eval_points, eval_density = sample_density_batch(gauss_ref_volume, volume_config, args.density_batch_size, eval_rng)
 
     fine_tune_period = args.iterations_gaussian - args.densify_until
     
@@ -308,7 +313,8 @@ if not args.skip_gaussian_optim:
     callbacks.setup()
 
 
-    green(f'\nRun optimization (level 0: Gaussians Only) {Effect.DIM}[Send KeyboardInterrupt to save the model and skip this level]{Effect.DIM_OFF}')
+    objective = 'voxel density' if args.fit_density else 'image loss'
+    green(f'\nRun optimization (level 0: {objective}) {Effect.DIM}[Send KeyboardInterrupt to save the model and skip this level]{Effect.DIM_OFF}')
 
     # Initialize benchmark timer
     timer = gfields.benchmark.OptimizationTimer(log_every=9999, log_level=1)
@@ -333,17 +339,24 @@ if not args.skip_gaussian_optim:
             do_log = ((it + 1) % args.log_every == 0
                       or (it + 1) == args.iterations_gaussian
                       or (it + 1) in inspect_iters)
+            img_write_modulo = (it + 1) % args.write_image_every
+            write_image = img_write_modulo == 0 or (it + 1) in inspect_iters
+            save_checkpoint = (it + 1) % args.checkpoint_every == 0
             with timer.track('forward'):
-                image, img_loss, l1, ssim, img_mse, gradient_l1, edge_psnr = _batched_render_loss(
-                    scene, scene_params, ref_image, opt_cam_batches,
-                    spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
-                    l1_weight=0.75, ssim_weight=0.25, compute_gradient_metric=do_log,
-                    edge_mask=edge_mask if do_log else None,
-                )
+                if args.fit_density:
+                    # supervise the factored density at sampled voxel centers.
+                    points, density = sample_density_batch(gauss_ref_volume, volume_config, args.density_batch_size, density_rng)
+                    loss = mi.TensorXf(dr.mean(dr.square(gaussian_columns.eval_density(points) - density)))
+                else:
+                    # optimize the existing camera-batched image loss.
+                    image, loss, l1, ssim, img_mse, gradient_l1, edge_psnr = _batched_render_loss(
+                        scene, scene_params, ref_image, opt_cam_batches,
+                        spp=args.opt_spp, spp_grad=args.grad_spp, seed=it + args.seed_offset,
+                        l1_weight=0.75, ssim_weight=0.25, compute_gradient_metric=do_log,
+                        edge_mask=edge_mask if do_log else None,
+                    )
 
             with timer.track('loss'):
-                loss = img_loss
-
                 regularization = frequency_regularization(opt, ref_volume, volume_config, GAUSS_LVL, weight=args.lambda_frequency)
                 opacity_penalty, scale_penalty = opacity_scale_regularization(opt, args, GAUSS_LVL)
 
@@ -367,7 +380,13 @@ if not args.skip_gaussian_optim:
                     adaptation = adapt_column_primitives(gaussian_columns, args, training_iteration)
                     for name, count in adaptation.items():
                         adaptation_since_log[name] += count
-                write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
+                if not args.fit_density:
+                    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
+
+            # synchronize density-trained factors only when scene outputs are needed.
+            if args.fit_density and (do_log or write_image or save_checkpoint):
+                with dr.suspend_grad():
+                    write_optimizer_params_to_scene(opt, scene_params, level=GAUSS_LVL, use_columns_representation=use_shared_columns, columns=gaussian_columns)
 
             relocate_now = not use_shared_columns and (it + 1) % 30 == 0 and (it + 1) <= args.relocate_until
             deletable = 0
@@ -385,7 +404,14 @@ if not args.skip_gaussian_optim:
 
 
             with dr.suspend_grad():
-                img_write_modulo = (it + 1) % args.write_image_every
+                # render density checkpoints for evaluation with a fixed seed and spp.
+                if args.fit_density and (do_log or write_image):
+                    image, _, l1, ssim, img_mse, gradient_l1, edge_psnr = _batched_render_loss(
+                        scene, scene_params, ref_image, opt_cam_batches,
+                        spp=args.ref_kernel_spp, spp_grad=args.grad_spp, seed=0,
+                        l1_weight=0.75, ssim_weight=0.25, compute_gradient_metric=do_log,
+                        edge_mask=edge_mask if do_log else None,
+                    )
                 if do_log:
                     # Full-image PSNR from batch-averaged MSE (image is only the
                     # last camera batch when opt_cam_batch>0).
@@ -397,17 +423,19 @@ if not args.skip_gaussian_optim:
                         "Regu": regularization.array[0], "OpRegu": opacity_penalty.array[0],
                         "ScaleRegu": scale_penalty.array[0], "deletable": float(deletable),
                     }
+                    if args.fit_density:
+                        metrics['density_mse'] = float(dr.mean(dr.square(gaussian_columns.eval_density(eval_points) - eval_density))[0])
                     if args.use_adaptive_columns:
                         metrics.update(primitive_count=float(dr.width(opt['primitive_center_y'])),
                                        column_splits=float(adaptation_since_log['split']), column_pruned=float(adaptation_since_log['pruned']))
                         adaptation_since_log = {'split': 0, 'pruned': 0}
                     callbacks.on_suspend_grad(it, opt, metrics)
 
-                if img_write_modulo == 0 or (it + 1) in inspect_iters:
+                if write_image:
                     mi.util.write_bitmap(str(args.output / f'frames_pyr{GAUSS_LVL}' / f'image_{it+1:04d}.exr'), image)
 
                 # Frequent checkpoint (resumable via --from_gaussian_checkpoint).
-                if (it + 1) % args.checkpoint_every == 0:
+                if save_checkpoint:
                     save_model(args.output, scene, level=GAUSS_LVL, use_columns_representation=args.use_columns_representation, columns=gaussian_columns,
                                use_factorized_columns_representation=args.use_factorized_columns_representation)
 

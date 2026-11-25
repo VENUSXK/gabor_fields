@@ -87,6 +87,33 @@ class FactorizedGaussianColumnTests(unittest.TestCase):
         np.testing.assert_allclose(scene_params['primitives_pyr0.opacities'].numpy(), independent['primitive_opacity'].numpy())
         self.assertEqual(dr.width(scene_params['primitives_pyr0.albedo']), 18)
 
+    def test_density_matches_the_expanded_gaussians_and_backpropagates(self):
+        # use rotated, anisotropic xz kernels and sample off center in both groups.
+        parameters = make_parameters()
+        parameters['column_quaternions'] = mi.Float([0.4, -0.3, 0.6, -0.5])
+        for value in parameters.values():
+            dr.enable_grad(value)
+        columns = FactorizedGaussianColumn(parameters, 2, 3)
+        points = mi.Point3f([0.03, 2.08], [0.08, 0.35], [10.06, 11.91])
+        centers, scales, quaternions, weights = columns.expand()
+        rotation = dr.quat_to_matrix(mi.Matrix3f, quaternions)
+
+        # compare against the normalized sum over the expanded 3d kernels.
+        expected = []
+        for x, y, z in points.numpy().T.tolist():
+            local = (rotation.T * (mi.Point3f(x, y, z) - centers)) / scales
+            pdf = dr.exp(-0.5 * dr.squared_norm(local)) / ((2.0 * np.pi) ** 1.5 * dr.prod(scales))
+            expected.append(float(dr.sum(weights * pdf)[0]))
+        actual = columns.eval_density(points)
+        np.testing.assert_allclose(actual.numpy(), expected, rtol=2e-6)
+
+        # every parameter family should receive a finite density gradient.
+        dr.backward(dr.sum(dr.square(actual - 1.0)))
+        for name, value in parameters.items():
+            gradient = dr.grad(value).numpy()
+            self.assertTrue(np.isfinite(gradient).all(), name)
+            self.assertTrue(np.any(gradient != 0), name)
+
     def test_optimizer_binding(self):
         # preserve live optimizer updates and constrain total group weights.
         opt = gfields.optimizers.BoundedAdam(noise_init=0.0)
