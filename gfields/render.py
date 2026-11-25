@@ -717,7 +717,7 @@ def render_fgc_lut(args, asset_info, cameras, output_config):
     tables = load_fgc_luts(ply_path, cache_dir, args.fgc_lut_xz_res, args.fgc_lut_y_res)
     volume = FgcLutVolume(tables, args.asset_scale, args.opacity_scaler)
     texture_bytes = tables['xz'].nbytes + tables['y'].nbytes
-    print(f'FGC LUT: {volume.group_count} groups, {texture_bytes / 2**20:.3f} MiB of FP16 texels')
+    print(f'Level 0: {volume.group_count} groups (FGC LUT, {texture_bytes / 2**20:.3f} MiB of FP16 texels)')
 
     # reuse the render settings for isotropic scattering and the environment emitter.
     settings = {}
@@ -737,20 +737,8 @@ def render_fgc_lut(args, asset_info, cameras, output_config):
 
     # cap working memory by limiting ray and group pairs per tile.
     batch_pixels = max(1, (1 << 19) // (volume.group_count * args.spp))
-    render = volume.render
-    benchmark = args.benchmark_run_count > 0
-    if benchmark:
-        render = vp.benchmark.wrap_function('FGC LUT', nb_runs=args.benchmark_run_count,
-                                            nb_dry_runs=args.benchmark_dry_runs, log_level=2)(render)
-
-    # reuse the standard camera selection and image naming.
-    indices = range(len(cameras)) if args.render_all_cams else (args.cam_index,)
-    for index in indices:
-        image = render(cameras[index], args.spp, args.fgc_lut_step, batch_pixels, **settings)
-        path = output_config.get_frame_path(cam_idx=index if args.render_all_cams else None,
-                                            suffix='benchmark' if benchmark else '')
-        mi.util.write_bitmap(path, image)
-        print(f'Saved: {path}')
+    render_frames(args, cameras, output_config,
+                  lambda camera: volume.render(camera, args.spp, args.fgc_lut_step, batch_pixels, **settings))
 
 
 def render_pyramid_mode(args, asset_info: AssetInfo, cameras: List, output_config: OutputConfig):
@@ -927,22 +915,9 @@ def render_full_asset(args, asset_info: AssetInfo, cameras: List, output_config:
             extent_str = f"{level_extent:.3f}"
         print(f"Level {level}: {actual_count} primitives (visibility_mask={vis_bit}, extent={extent_str})")
 
-    # Render and save based on mode
-    if args.benchmark_run_count > 0:
-        render_with_benchmark(args, scene_dict, cameras, output_config)
-    elif args.render_all_cams:
-        scene = mi.load_dict(scene_dict)
-        for cam_idx, cam in enumerate(cameras):
-            img = render_single_frame(scene, cam, args.spp)
-            output_path = output_config.get_frame_path(cam_idx=cam_idx)
-            mi.util.write_bitmap(output_path, img)
-            print(f"Saved: {os.path.basename(output_path)}")
-    else:
-        scene = mi.load_dict(scene_dict)
-        img = render_single_frame(scene, cameras[args.cam_index], args.spp)
-        output_path = output_config.get_frame_path()
-        mi.util.write_bitmap(output_path, img)
-        print(f"Saved: {os.path.basename(output_path)}")
+    # use the same frame timing and output as the lut renderer.
+    scene = mi.load_dict(scene_dict)
+    render_frames(args, cameras, output_config, lambda camera: mi.render(scene, sensor=camera, spp=args.spp, seed=0))
 
     gc.collect()
     dr.flush_kernel_cache()
@@ -1107,36 +1082,26 @@ def render_steerable_asset(args):
     dr.flush_kernel_cache()
 
 
-def render_with_benchmark(args, scene_dict: Dict, cameras: List, output_config: OutputConfig):
-    """Render with benchmarking enabled."""
-    
-    df = []
-    
-    @vp.benchmark.wrap_function(
-        label='Render',
-        nb_runs=args.benchmark_run_count,
-        nb_dry_runs=args.benchmark_dry_runs,
-        dataframes=df,
-        log_level=2
-    )
-    def render_asset(spp, sensor, scene, label=None):
-        return mi.render(scene, sensor=sensor, spp=spp, seed=0)
-    
-    scene = mi.load_dict(scene_dict)
-    
-    if args.render_all_cams:
-        for cam_idx, cam in enumerate(cameras):
-            img = render_asset(spp=args.spp, sensor=cam, scene=scene, label=f'cam_{cam_idx}')
-            output_path = output_config.get_frame_path(cam_idx=cam_idx, suffix="benchmark")
-            mi.util.write_bitmap(output_path, img)
-            print(f"Saved: {os.path.basename(output_path)}")
-    else:
-        img = render_asset(
-            spp=args.spp, sensor=cameras[args.cam_index], scene=scene, label='single_cam'
-        )
-        output_path = output_config.get_frame_path(suffix="benchmark")
-        mi.util.write_bitmap(output_path, img)
-        print(f"Saved: {os.path.basename(output_path)}")
+def render_frames(args, cameras: List, output_config: OutputConfig, render_frame):
+    # select single-run timing or the standard repeated benchmark.
+    benchmark = args.benchmark_run_count > 0
+    if benchmark:
+        render_frame = vp.benchmark.wrap_function('Render', nb_runs=args.benchmark_run_count,
+                                                   nb_dry_runs=args.benchmark_dry_runs, log_level=2)(render_frame)
+
+    # time and save each selected camera using the standard output names.
+    indices = range(len(cameras)) if args.render_all_cams else (args.cam_index,)
+    for index in indices:
+        if benchmark:
+            label = f'cam_{index}' if args.render_all_cams else 'single_cam'
+            image = render_frame(cameras[index], label=label)
+        else:
+            with vp.benchmark.single_run('Rendering'):
+                image = render_frame(cameras[index])
+        path = output_config.get_frame_path(cam_idx=index if args.render_all_cams else None,
+                                            suffix='benchmark' if benchmark else '')
+        mi.util.write_bitmap(path, image)
+        print(f'Saved: {os.path.basename(path)}')
 
 
 if __name__ == '__main__':
