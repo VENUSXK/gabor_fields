@@ -98,7 +98,8 @@ def build_flags_summary(args, render_mode: str, scattering_mode: str) -> str:
         tokens.append(mode_token)
     tokens.append('ms' if scattering_mode == 'multi' else 'tomography')
     if getattr(args, 'use_fgc_lut', False):
-        tokens.append(f'fgc_lut_xz{args.fgc_lut_xz_res}_y{args.fgc_lut_y_res}_step{args.fgc_lut_step:g}')
+        source = 'fit_lut' if args.fgc_lut_file else 'fgc_lut'
+        tokens.append(f'{source}_xz{args.fgc_lut_xz_res}_y{args.fgc_lut_y_res}_step{args.fgc_lut_step:g}')
     if getattr(args, 'stochastic_sampling', False):
         tokens.append('stochastic')
     tokens.append(f'spp{args.spp}')
@@ -183,6 +184,7 @@ def parse_args():
     parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Read compact FGC PLY and expand into per-Gaussian geometry')
     parser.add_argument('--use_fgc_bvh', action='store_true', help='Use one analytic BVH bound per FGC group')
     parser.add_argument('--use_fgc_lut', action='store_true', help='Render FGC transmittance or multiple scattering using baked XZ and Y textures')
+    parser.add_argument('--fgc_lut_file', type=Path, help='Use a directly fitted .npz texture archive instead of baking the FGC asset')
     parser.add_argument('--fgc_lut_xz_res', type=int, default=64, help='Texture resolution on each XZ axis per FGC group')
     parser.add_argument('--fgc_lut_y_res', type=int, default=128, help='Texture resolution along Y per FGC group')
     parser.add_argument('--fgc_lut_step', type=float, default=0.005, help='Maximum FGC LUT marching step in world units')
@@ -567,6 +569,8 @@ def main():
             sys.argv[1:1] = RENDER_MODES[_mode]  # before user args -> user wins
     args = parse_args()
     apply_asset_render_defaults(args)
+    if args.fgc_lut_file and not args.use_fgc_lut:
+        raise ValueError('--fgc_lut_file requires --use_fgc_lut')
     if args.use_fgc_lut:
         # select the level-zero lut path and exclude incompatible geometry modes.
         if not args.use_factorized_columns_representation or args.use_columns_representation:
@@ -608,6 +612,14 @@ def main():
     asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation,
                                    use_factorized_columns_representation=args.use_factorized_columns_representation, use_fgc_bvh=args.use_fgc_bvh)
     print(f"Detected asset: {asset_info}")
+
+    # use the fitted archive's texture sizes when naming and rendering outputs.
+    lut_tables = None
+    if args.fgc_lut_file:
+        with np.load(args.fgc_lut_file, allow_pickle=False) as archive:
+            lut_tables = dict(archive)
+        args.fgc_lut_xz_res = lut_tables['xz'].shape[1]
+        args.fgc_lut_y_res = lut_tables['y'].shape[1]
     
     # One-shot pre-render refinement (opt-in, non-destructive): adaptively clamp
     # per-primitive extents and/or prune negligible primitives. --refine turns on
@@ -699,7 +711,7 @@ def main():
     
     # Render based on mode
     if args.use_fgc_lut:
-        render_fgc_lut(args, asset_info, cameras, output_config)
+        render_fgc_lut(args, asset_info, cameras, output_config, tables=lut_tables)
     elif args.render_pyramid_gaussian or args.render_pyramid_laplacian:
         render_pyramid_mode(args, asset_info, cameras, output_config)
     else:
@@ -708,13 +720,14 @@ def main():
     print(f"Rendering complete. Output saved to: {output_config.experiment_dir}")
 
 
-def render_fgc_lut(args, asset_info, cameras, output_config):
-    # load baked factors before the regular rendering path expands the gaussians.
+def render_fgc_lut(args, asset_info, cameras, output_config, tables=None):
+    # bake the source factors only when the caller has no directly fitted textures.
     from gfields.rendering.fgc_lut import FgcLutVolume, load_fgc_luts
 
-    ply_path = Path(asset_info.ply_folder) / 'root.primitives_pyr0.ply'
-    cache_dir = Path(args.output) / '.fgc_lut_cache'
-    tables = load_fgc_luts(ply_path, cache_dir, args.fgc_lut_xz_res, args.fgc_lut_y_res)
+    if tables is None:
+        ply_path = Path(asset_info.ply_folder) / 'root.primitives_pyr0.ply'
+        cache_dir = Path(args.output) / '.fgc_lut_cache'
+        tables = load_fgc_luts(ply_path, cache_dir, args.fgc_lut_xz_res, args.fgc_lut_y_res)
     volume = FgcLutVolume(tables, args.asset_scale, args.opacity_scaler)
     texture_bytes = tables['xz'].nbytes + tables['y'].nbytes
     print(f'Level 0: {volume.group_count} groups (FGC LUT, {texture_bytes / 2**20:.3f} MiB of FP16 texels)')

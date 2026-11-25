@@ -88,3 +88,26 @@ class FgcLutTests(unittest.TestCase):
         self.assertTrue(np.all(results[1] > results[0]))
         self.assertTrue(np.all(results[2] > results[1]))
         np.testing.assert_allclose(results[2], color, atol=0.006)
+
+    def test_direct_fit_updates_both_factors_and_exports_renderable_density(self):
+        from gfields.training.fit_fgc_lut import FgcLutFit
+
+        # fit independent target densities inside two overlapping boxes from constant texels.
+        lower, upper = np.zeros((2, 3)), np.ones((2, 3))
+        model = FgcLutFit(lower, upper, 8, 8, 1.0, 0.04)
+        points = mi.Point3f([0.2, 0.8, 2.0], [0.3, 0.7, 0.5], [0.4, 0.6, 0.5])
+        target = mi.Float([0.25, 3.0, 0.0])
+        for _ in range(60):
+            dr.backward(dr.mean(dr.square(model.eval_density(points) - target)))
+            model.opt.step()
+        prediction = model.eval_density(points).numpy()
+        np.testing.assert_allclose(prediction, target.numpy(), atol=0.10)
+        for name in ('xz', 'y'):
+            self.assertTrue(np.all(model.opt[name].numpy() >= 0))
+            self.assertTrue(np.any(model.opt[name].numpy() != 1))
+
+        # check conversion to the hardware texture path, including the packed group amplitudes.
+        volume = FgcLutVolume(model.export(np.zeros(3, dtype=np.float32)))
+        density = volume._density(mi.Point3f(0.2, 0.3, 0.4), volume.lower, volume.upper,
+                                  dr.arange(mi.UInt32, 2), volume.weights, True)
+        np.testing.assert_allclose(float(dr.sum(density)[0]), prediction[0], atol=0.005)

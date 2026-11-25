@@ -11,24 +11,39 @@ import numpy as np
 from gfields.io import load_ellipsoid_ply
 
 
-def bake_fgc_luts(factors, xz_resolution, y_resolution):
-    # collect each group's geometry and use the ply extent as the factor cutoff.
-    groups, j, k = (factors[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+def fgc_factor_support(factors):
+    """Return per-group bounds and per-factor splat bounds in asset coordinates."""
+    # project the rotated xz ellipses onto the axes and bound the y intervals.
+    groups = factors['group_count']
     extent = factors['extent']
-    xz_centers = factors['column_center_xz'].reshape(groups, j, 2).astype(np.float64)
-    xz_scales = factors['column_scale_xz'].reshape(groups, j, 2).astype(np.float64)
-    angles = factors['column_quaternions'].reshape(groups, j)
-    y_centers = factors['primitive_center_y'].reshape(groups, k).astype(np.float64)
-    y_scales = factors['primitive_scale_y'].reshape(groups, k).astype(np.float64)
-
-    # bound the rotated xz ellipses and y intervals in asset coordinates.
+    xz_centers = factors['column_center_xz'].reshape(groups, -1, 2).astype(np.float64)
+    xz_scales = factors['column_scale_xz'].reshape(groups, -1, 2).astype(np.float64)
+    angles = factors['column_quaternions'].reshape(groups, -1)
+    y_centers = factors['primitive_center_y'].reshape(groups, -1).astype(np.float64)
+    y_scales = factors['primitive_scale_y'].reshape(groups, -1).astype(np.float64)
     cosine, sine = np.cos(angles), np.sin(angles)
     sx, sz = xz_scales[..., 0], xz_scales[..., 1]
     xz_radius = extent * np.stack((np.hypot(cosine * sx, sine * sz), np.hypot(sine * sx, cosine * sz)), axis=-1)
     xz_min, xz_max = xz_centers - xz_radius, xz_centers + xz_radius
     y_min, y_max = y_centers - extent * y_scales, y_centers + extent * y_scales
+
+    # enclose every factor of a group in a single world-space box.
     lower = np.column_stack((xz_min[..., 0].min(1), y_min.min(1), xz_min[..., 1].min(1)))
     upper = np.column_stack((xz_max[..., 0].max(1), y_max.max(1), xz_max[..., 1].max(1)))
+    return lower, upper, xz_min, xz_max, y_min, y_max
+
+
+def bake_fgc_luts(factors, xz_resolution, y_resolution):
+    # collect factor geometry and its reusable support bounds.
+    groups, j, k = (factors[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+    extent = factors['extent']
+    lower, upper, xz_min, xz_max, y_min, y_max = fgc_factor_support(factors)
+    xz_centers = factors['column_center_xz'].reshape(groups, j, 2).astype(np.float64)
+    sx, sz = factors['column_scale_xz'].reshape(groups, j, 2).astype(np.float64).transpose(2, 0, 1)
+    angles = factors['column_quaternions'].reshape(groups, j)
+    cosine, sine = np.cos(angles), np.sin(angles)
+    y_centers = factors['primitive_center_y'].reshape(groups, k).astype(np.float64)
+    y_scales = factors['primitive_scale_y'].reshape(groups, k).astype(np.float64)
 
     # splat each normalized 2d gaussian into its bounding rectangle in the xz texture.
     xz_lut = np.zeros((groups, xz_resolution, xz_resolution), dtype=np.float32)
@@ -59,13 +74,24 @@ def bake_fgc_luts(factors, xz_resolution, y_resolution):
             distance = (y[ys] - y_centers[group, index]) / scale
             y_lut[group, ys] += y_weights[group, index] * np.exp(-0.5 * distance**2) / (np.sqrt(2 * np.pi) * scale)
 
+    return pack_fgc_luts(xz_lut, y_lut, lower, upper, factors['group_opacity'], factors['albedo'])
+
+
+def pack_fgc_luts(xz_lut, y_lut, lower, upper, group_opacity, albedo):
     # normalize texture values before fp16 conversion and preserve their amplitudes.
     xz_peak, y_peak = xz_lut.max(axis=(1, 2)), y_lut.max(axis=1)
-    xz_lut /= np.where(xz_peak > 0, xz_peak, 1)[:, None, None]
-    y_lut /= np.where(y_peak > 0, y_peak, 1)[:, None]
-    weights = (factors['group_opacity'].astype(np.float64) * xz_peak * y_peak).astype(np.float32)
+    xz_lut = xz_lut / np.where(xz_peak > 0, xz_peak, 1)[:, None, None]
+    y_lut = y_lut / np.where(y_peak > 0, y_peak, 1)[:, None]
+    weights = (group_opacity.astype(np.float64) * xz_peak * y_peak).astype(np.float32)
     return dict(xz=xz_lut.astype(np.float16), y=y_lut.astype(np.float16),
-                lower=lower.astype(np.float32), upper=upper.astype(np.float32), weights=weights, albedo=factors['albedo'])
+                lower=lower.astype(np.float32), upper=upper.astype(np.float32), weights=weights, albedo=albedo)
+
+
+def sample_fgc_lut_factors(xz_texture, y_texture, uvw, layer, active=True):
+    # sample at the center of the group layer while interpolating the spatial axes.
+    xz = xz_texture.eval(mi.Point3f(uvw[0], uvw[2], layer), active)[0]
+    y = y_texture.eval(mi.Point2f(uvw[1], layer), active)[0]
+    return mi.Float(xz) * mi.Float(y)
 
 
 def load_fgc_luts(ply_path, cache_dir, xz_resolution, y_resolution):
@@ -106,9 +132,7 @@ class FgcLutVolume:
         # look up both factors in the selected group and restore their density amplitude.
         uvw = (point - lower) / (upper - lower)
         layer = (mi.Float(group) + 0.5) / self.group_count
-        xz = self.xz.eval(mi.Point3f(uvw[0], uvw[2], layer), active)[0]
-        y = self.y.eval(mi.Point2f(uvw[1], layer), active)[0]
-        return weight * mi.Float(xz) * mi.Float(y)
+        return weight * sample_fgc_lut_factors(self.xz, self.y, uvw, layer, active)
 
     def optical_depth(self, ray, step_size):
         return self._march_groups(ray, step_size, mi.Bool(True))

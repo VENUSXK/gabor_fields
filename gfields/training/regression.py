@@ -804,6 +804,33 @@ def generate_random_kernels(
     }
 
 
+def voxel_centers_to_world(indices: np.ndarray, shape: Tuple[int, ...], volume_config: VolumeConfig) -> mi.Point3f:
+    # convert voxel centers from zyx indices to world xyz using the volume transform.
+    normalized_zyx = (indices + 0.5) / np.asarray(shape)
+    normalized_xyz = np.ascontiguousarray(normalized_zyx[:, ::-1], dtype=np.float32)
+    return mi.Transform4f(volume_config.to_world) @ mi.Point3f(normalized_xyz.T)
+
+
+def sample_density_batch(volume: np.ndarray, volume_config: VolumeConfig, batch_size: int,
+                         rng: np.random.Generator) -> Tuple[mi.Point3f, mi.Float]:
+    """Mix uniform and occupied voxel centers without indexing the entire volume."""
+    # keep a uniform sample for the background and draw foreground candidates.
+    indices = rng.integers(volume.shape, size=(batch_size, 3))
+    uniform_count = (batch_size + 1) // 2
+    foreground_count = batch_size - uniform_count
+    if foreground_count:
+        candidates = rng.integers(volume.shape, size=(foreground_count * 16, 3))
+        occupied = candidates[volume[tuple(candidates.T)] > 0]
+        if occupied.size:
+            selected = rng.choice(len(occupied), size=foreground_count, replace=len(occupied) < foreground_count)
+            indices[uniform_count:] = occupied[selected]
+
+    # match the coordinates and extinction units of the reference renderer.
+    points = voxel_centers_to_world(indices, volume.shape, volume_config)
+    density = volume[tuple(indices.T)] * volume_config.opacity_scale
+    return points, mi.Float(density)
+
+
 def importance_sample_positions(volume: np.ndarray, volume_config: VolumeConfig, n_gmm: int = 1_000, threshold: float = 1e-6) -> np.ndarray:
     """Sample occupied voxel centers and return an (n_gmm, 3) array in world xyz order."""
     # validate the volume and requested number of primitive centers
@@ -819,15 +846,8 @@ def importance_sample_positions(volume: np.ndarray, volume_config: VolumeConfig,
     if occupied_count < n_gmm:
         extra_indices = np.random.choice(occupied_count, n_gmm - occupied_count, replace=True)
         indices = np.concatenate((indices, extra_indices))
-    sampled_indices = occupied_indices[indices]
-
-    # convert voxel centers from zyx indices to normalized xyz coordinates
-    normalized_zyx = (sampled_indices + 0.5) / np.asarray(volume.shape)
-    normalized_xyz = np.ascontiguousarray(normalized_zyx[:, ::-1], dtype=np.float32)
-    points = mi.Point3f(normalized_xyz.T)
-
-    # use the reference volume transform for both scaling and translation
-    world_points = mi.Transform4f(volume_config.to_world) @ points
+    # use the reference volume transform for both scaling and translation.
+    world_points = voxel_centers_to_world(occupied_indices[indices], volume.shape, volume_config)
     return np.ascontiguousarray(world_points.numpy().T, dtype=np.float32)
 
 # endregion Initialization
