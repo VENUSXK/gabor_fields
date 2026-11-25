@@ -182,7 +182,7 @@ def parse_args():
     parser.add_argument('--use_columns_representation', action='store_true', help='Read compact column PLY; variable column counts use per-primitive geometry')
     parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Read compact FGC PLY and expand into per-Gaussian geometry')
     parser.add_argument('--use_fgc_bvh', action='store_true', help='Use one analytic BVH bound per FGC group')
-    parser.add_argument('--use_fgc_lut', action='store_true', help='March FGC transmittance using baked 2D XZ and 1D Y textures')
+    parser.add_argument('--use_fgc_lut', action='store_true', help='Render FGC transmittance or multiple scattering using baked XZ and Y textures')
     parser.add_argument('--fgc_lut_xz_res', type=int, default=64, help='Texture resolution on each XZ axis per FGC group')
     parser.add_argument('--fgc_lut_y_res', type=int, default=128, help='Texture resolution along Y per FGC group')
     parser.add_argument('--fgc_lut_step', type=float, default=0.005, help='Maximum FGC LUT marching step in world units')
@@ -568,21 +568,20 @@ def main():
     args = parse_args()
     apply_asset_render_defaults(args)
     if args.use_fgc_lut:
-        # select the level-zero transmittance path and exclude incompatible geometry modes.
+        # select the level-zero lut path and exclude incompatible geometry modes.
         if not args.use_factorized_columns_representation or args.use_columns_representation:
             raise ValueError('--use_fgc_lut requires --use_factorized_columns_representation')
         if args.kernel not in ('gaussian', 'gabor_gaussian_mixture'):
             raise ValueError('--use_fgc_lut requires a Gaussian kernel')
-        if (args.multiple_scattering or args.use_fgc_bvh
+        if (args.use_fgc_bvh
                 or args.render_pyramid_gaussian or args.render_pyramid_laplacian or args.max_level > 0
                 or args.adaptive_extent or args.refine or args.prune_threshold is not None):
-            raise ValueError('--use_fgc_lut renders level-zero transmittance without grouped BVH or per-primitive refinement')
+            raise ValueError('--use_fgc_lut renders level zero without grouped BVH or per-primitive refinement')
         if (min(args.fgc_lut_xz_res, args.fgc_lut_y_res) < 2 or args.spp < 1
                 or not np.isfinite(args.fgc_lut_step) or args.fgc_lut_step <= 0
                 or not np.isfinite(args.asset_scale) or args.asset_scale <= 0
                 or not np.isfinite(args.opacity_scaler) or args.opacity_scaler < 0):
             raise ValueError('FGC LUT needs texture resolutions >= 2, positive step, asset scale and spp, and nonnegative opacity')
-
 
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
@@ -720,6 +719,22 @@ def render_fgc_lut(args, asset_info, cameras, output_config):
     texture_bytes = tables['xz'].nbytes + tables['y'].nbytes
     print(f'FGC LUT: {volume.group_count} groups, {texture_bytes / 2**20:.3f} MiB of FP16 texels')
 
+    # reuse the render settings for isotropic scattering and the environment emitter.
+    settings = {}
+    if args.multiple_scattering:
+        rgb = args.albedo_rgb if args.albedo_rgb is not None else (tables['albedo'] if args.use_asset_albedo else [1.0] * 3)
+        albedo = np.asarray(rgb) * args.albedo
+        if not np.isfinite(albedo).all() or np.any((albedo < 0) | (albedo > 1)):
+            raise ValueError('FGC LUT scattering albedo must be between zero and one')
+        if min(args.max_depth, args.rr_depth) < -1:
+            raise ValueError('FGC LUT scattering depths must be nonnegative or -1')
+        environment = create_environment_config(
+            multiple_scattering=True, envmap_path=args.envmap or None, envmap_scale=args.envmap_scale,
+            envmap_rotation_x=args.envmap_rotation_x, envmap_rotation_y=args.envmap_rotation_y,
+            envmap_rotation_z=args.envmap_rotation_z)
+        settings = dict(environment=mi.load_dict(environment), albedo=mi.Color3f(*albedo.tolist()),
+                        max_depth=args.max_depth, rr_depth=args.rr_depth)
+
     # cap working memory by limiting ray and group pairs per tile.
     batch_pixels = max(1, (1 << 19) // (volume.group_count * args.spp))
     render = volume.render
@@ -731,7 +746,7 @@ def render_fgc_lut(args, asset_info, cameras, output_config):
     # reuse the standard camera selection and image naming.
     indices = range(len(cameras)) if args.render_all_cams else (args.cam_index,)
     for index in indices:
-        image = render(cameras[index], args.spp, args.fgc_lut_step, batch_pixels)
+        image = render(cameras[index], args.spp, args.fgc_lut_step, batch_pixels, **settings)
         path = output_config.get_frame_path(cam_idx=index if args.render_all_cams else None,
                                             suffix='benchmark' if benchmark else '')
         mi.util.write_bitmap(path, image)

@@ -1,4 +1,4 @@
-"""Bake FGC factors into local textures and march their extinction on the GPU."""
+"""Bake FGC factors into local textures for GPU transmittance and scattering."""
 
 import hashlib
 import tempfile
@@ -65,13 +65,13 @@ def bake_fgc_luts(factors, xz_resolution, y_resolution):
     y_lut /= np.where(y_peak > 0, y_peak, 1)[:, None]
     weights = (factors['group_opacity'].astype(np.float64) * xz_peak * y_peak).astype(np.float32)
     return dict(xz=xz_lut.astype(np.float16), y=y_lut.astype(np.float16),
-                lower=lower.astype(np.float32), upper=upper.astype(np.float32), weights=weights)
+                lower=lower.astype(np.float32), upper=upper.astype(np.float32), weights=weights, albedo=factors['albedo'])
 
 
 def load_fgc_luts(ply_path, cache_dir, xz_resolution, y_resolution):
     # key the cache on the source asset and texture dimensions.
     digest = hashlib.sha256(Path(ply_path).read_bytes()).hexdigest()[:20]
-    cache_path = Path(cache_dir) / f'fgc_lut_v1_{digest}_{xz_resolution}_{y_resolution}.npz'
+    cache_path = Path(cache_dir) / f'fgc_lut_v2_{digest}_{xz_resolution}_{y_resolution}.npz'
     if cache_path.is_file():
         with np.load(cache_path, allow_pickle=False) as cached:
             return dict(cached)
@@ -111,7 +111,15 @@ class FgcLutVolume:
         return weight * mi.Float(xz) * mi.Float(y)
 
     def optical_depth(self, ray, step_size):
+        return self._march_groups(ray, step_size, mi.Bool(True))
+
+    def sample_free_flight(self, ray, step_size, seed, active=True):
+        # the nearest event from independent groups samples their summed extinction.
+        return self._march_groups(ray, step_size, mi.Bool(active), mi.UInt32(seed))
+
+    def _march_groups(self, ray, step_size, active, seed=None):
         # find the overlapping ray and group bounds before evaluating any density.
+        sample_distance = seed is not None
         ray_count = dr.width(ray.o)
         pairs = dr.arange(mi.UInt32, ray_count * self.group_count)
         group, ray_index = pairs % self.group_count, pairs // self.group_count
@@ -125,35 +133,87 @@ class FgcLutVolume:
         t0, t1 = (lower - origin) / safe_direction, (upper - origin) / safe_direction
         near = dr.maximum(0.0, dr.max(dr.select(parallel, -dr.inf, dr.minimum(t0, t1))))
         far = dr.minimum(dr.gather(mi.Float, ray.maxt, ray_index), dr.min(dr.select(parallel, dr.inf, dr.maximum(t0, t1))))
-        hit = (near < far) & (weight > 0) & ~dr.any(parallel & ((origin < lower) | (origin > upper)))
+        hit = dr.gather(mi.Bool, active, ray_index) & (near < far) & (weight > 0)
+        hit &= ~dr.any(parallel & ((origin < lower) | (origin > upper)))
 
         # compact misses and integrate each surviving group with midpoint steps.
         indices = dr.compress(hit)
         if dr.width(indices) == 0:
-            return dr.zeros(mi.Float, ray_count)
+            return dr.full(mi.Float, dr.inf if sample_distance else 0.0, ray_count)
         origin, direction, lower, upper, group, weight, near, far = (
             dr.gather(type(value), value, indices) for value in (origin, direction, lower, upper, group, weight, near, far))
         count = mi.UInt32(dr.ceil((far - near) / step_size))
         spacing = (far - near) / count
 
-        def march(index, integrated):
+        # sample an exponential optical depth independently for every candidate group.
+        if sample_distance:
+            ray_seed = dr.gather(mi.UInt32, seed, indices // self.group_count)
+            rng = mi.PCG32(dr.width(indices), initstate=mi.UInt64(ray_seed), initseq=mi.UInt64(group))
+            threshold = -dr.log(dr.maximum(1.0 - rng.next_float32(), 1e-38))
+            threshold = dr.maximum(threshold, 1e-8)
+
+        def march(index, integrated, distance):
             active = index < count
-            point = origin + direction * (near + (mi.Float(index) + 0.5) * spacing)
+            start = near + mi.Float(index) * spacing
+            point = origin + direction * (start + 0.5 * spacing)
             density = self._density(point, lower, upper, group, weight, active)
-            return index + 1, integrated + dr.select(active, density * spacing, 0.0)
+            mass = dr.select(active, density * spacing, 0.0)
+            if sample_distance:
+                # invert the constant density in the step that crosses the threshold.
+                crosses = (mass > 0) & (integrated + mass >= threshold)
+                fraction = (threshold - integrated) / dr.select(crosses, mass, 1.0)
+                distance = dr.select(crosses, start + fraction * spacing, distance)
+            return index + 1, integrated + mass, distance
 
-        _, integrated = dr.while_loop((mi.UInt32(0), mi.Float(0)),
-                                     lambda index, _: index < count, march, label='fgc LUT transmittance')
+        _, integrated, distance = dr.while_loop(
+            (mi.UInt32(0), mi.Float(0), mi.Float(dr.inf)),
+            lambda index, _, distance: (index < count) & (distance == dr.inf), march, label='fgc LUT optical depth')
 
-        # sum optical depths of all additive groups before applying exponential attenuation.
+        # reduce the independent group results back to one value per ray.
+        if sample_distance:
+            # unsigned float bits preserve the order of nonnegative distances for cuda atomic min.
+            first = dr.full(mi.UInt32, 0x7f800000, ray_count)
+            dr.scatter_reduce(dr.ReduceOp.Min, first, dr.reinterpret_array(mi.UInt32, distance), indices // self.group_count)
+            return dr.reinterpret_array(mi.Float, first)
         depth = dr.zeros(mi.Float, ray_count)
         dr.scatter_reduce(dr.ReduceOp.Add, depth, integrated, indices // self.group_count)
         return depth
 
-    def render(self, sensor, spp, step_size, batch_pixels):
+    def _scatter(self, ray, rng, step_size, environment, albedo, max_depth, rr_depth):
+        # start every path with unit throughput and accumulate escaping environment light.
+        active = dr.full(mi.Bool, True, dr.width(ray.o))
+        throughput, radiance = mi.Color3f(1.0), mi.Color3f(0.0)
+        depth = 0
+        while dr.any(active):
+            distance = self.sample_free_flight(ray, step_size, rng.next_uint32(), active)
+            escaped = active & ~dr.isfinite(distance)
+            si = mi.SurfaceInteraction3f()
+            si.wi = -ray.d
+            radiance += dr.select(escaped, throughput * environment.eval(si, escaped), 0.0)
+            if depth == max_depth:
+                break
+
+            # scatter isotropically and use throughput roulette for later bounces.
+            active &= ~escaped
+            throughput *= albedo
+            active &= dr.max(throughput) > 0
+            depth += 1
+            if 0 <= rr_depth <= depth:
+                survival = dr.minimum(dr.max(throughput), 0.95)
+                active &= rng.next_float32() < survival
+                throughput /= dr.select(active, survival, 1.0)
+
+            # advance continuing paths to their sampled scattering locations.
+            origin = ray.o + ray.d * dr.select(active, distance, 0.0)
+            direction = mi.warp.square_to_uniform_sphere(mi.Point2f(rng.next_float32(), rng.next_float32()))
+            ray = mi.Ray3f(origin, direction)
+        return radiance
+
+    def render(self, sensor, spp, step_size, batch_pixels, *, environment=None, albedo=None, max_depth=10, rr_depth=10):
         # reuse the mitsuba camera and sample each pixel with independent subpixel offsets.
         width, height = map(int, sensor.film().crop_size())
-        image = dr.zeros(mi.Float, width * height)
+        channels = 3 if environment is not None else 1
+        image = dr.zeros(mi.Float, width * height * channels)
         for start in range(0, width * height, batch_pixels):
             size = min(batch_pixels, width * height - start)
             samples = dr.arange(mi.UInt32, size * spp)
@@ -163,9 +223,12 @@ class FgcLutVolume:
             uv = (mi.Point2f(pixels % width, pixels // width) + offset) / mi.Vector2f(width, height)
             ray, _ = sensor.sample_ray(0.0, 0.5, uv, mi.Point2f(0.5))
 
-            # average transmittance over samples and keep working memory bounded per tile.
-            transmission = dr.exp(-self.optical_depth(ray, step_size))
-            averaged = dr.mean(mi.TensorXf(transmission, shape=(size, spp)), axis=1)
-            dr.scatter(image, averaged.array, dr.arange(mi.UInt32, size) + start)
+            # average pixel samples and keep working memory bounded per tile.
+            if environment is None:
+                values = dr.exp(-self.optical_depth(ray, step_size))
+            else:
+                values = dr.ravel(self._scatter(ray, rng, step_size, environment, albedo, max_depth, rr_depth))
+            averaged = dr.mean(mi.TensorXf(values, shape=(size, spp, channels)), axis=1)
+            dr.scatter(image, averaged.array, dr.arange(mi.UInt32, size * channels) + start * channels)
             dr.eval(image)
-        return mi.TensorXf(image, shape=(height, width, 1))
+        return mi.TensorXf(image, shape=(height, width, channels))

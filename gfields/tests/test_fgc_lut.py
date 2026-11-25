@@ -55,3 +55,36 @@ class FgcLutTests(unittest.TestCase):
         rays = mi.Ray3f(mi.Point3f([1, 4, 1], [-1, -1, 1], 1), mi.Vector3f(0, 1, 0))
         transmission = dr.exp(-volume.optical_depth(rays, 0.08))
         np.testing.assert_allclose(transmission.numpy(), np.exp([-2, 0, -1]), rtol=1e-6)
+
+    def test_free_flight_samples_summed_extinction(self):
+        # overlapping homogeneous groups have an analytic piecewise exponential cdf.
+        tables = dict(xz=np.ones((2, 4, 4), np.float16), y=np.ones((2, 4), np.float16),
+                      lower=np.array([[0, 0, 0], [0, 0.25, 0]], np.float32),
+                      upper=np.array([[1, 1, 1], [1, 0.75, 1]], np.float32), weights=np.array([1, 2], np.float32))
+        volume = FgcLutVolume(tables)
+        count = 16_384
+        rays = mi.Ray3f(mi.Point3f(0.5, dr.full(mi.Float, -1, count), 0.5), mi.Vector3f(0, 1, 0))
+        seed = mi.PCG32(count, initseq=dr.arange(mi.UInt64, count)).next_uint32()
+        distance = volume.sample_free_flight(rays, 0.17, seed).numpy()
+        self.assertTrue(np.all(distance >= 1.0))
+        for t, depth in [(1.125, 0.125), (1.5, 1.0), (2.0, 2.0)]:
+            self.assertAlmostEqual(np.mean(distance >= t), np.exp(-depth), delta=0.012)
+
+    def test_multiple_bounces_restore_energy_in_conservative_medium(self):
+        # compare direct transmission and scattering under constant colored illumination.
+        tables = dict(xz=np.ones((1, 4, 4), np.float16), y=np.ones((1, 4), np.float16),
+                      lower=np.zeros((1, 3), np.float32), upper=np.ones((1, 3), np.float32), weights=np.ones(1, np.float32))
+        volume = FgcLutVolume(tables)
+        count = 8192
+        rays = mi.Ray3f(mi.Point3f(0.5, dr.full(mi.Float, -1, count), 0.5), mi.Vector3f(0, 1, 0))
+        color = np.array([0.25, 0.5, 0.75])
+        environment = mi.load_dict({'type': 'constant', 'radiance': {'type': 'rgb', 'value': color.tolist()}})
+        results = []
+        for max_depth in (0, 1, 12):
+            rng = mi.PCG32(count, initseq=dr.arange(mi.UInt64, count))
+            image = volume._scatter(rays, rng, 0.17, environment, mi.Color3f(1), max_depth, -1)
+            results.append(image.numpy().mean(axis=1))
+        np.testing.assert_allclose(results[0], color * np.exp(-1), atol=0.012)
+        self.assertTrue(np.all(results[1] > results[0]))
+        self.assertTrue(np.all(results[2] > results[1]))
+        np.testing.assert_allclose(results[2], color, atol=0.006)
