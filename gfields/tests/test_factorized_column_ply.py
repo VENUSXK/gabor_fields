@@ -14,7 +14,7 @@ from gfields.io import load_ellipsoid_ply, ellipsoid_dict_to_ply
 from gfields.rendering.pipeline import detect_asset_info, load_pyramid_level
 
 
-def save_factors(directory, zero_weights=False):
+def save_factors(directory, zero_weights=False, tilt=False, per_xz_y_weights=False):
     # use nonuniform factors with nonzero rotations and compact world-space geometry.
     parameters = make_parameters()
     parameters['column_center_xz'] = mi.Point2f([-0.3, 0.2, -0.1, 0.4], [-0.2, 0.1, 0.3, -0.1])
@@ -24,7 +24,12 @@ def save_factors(directory, zero_weights=False):
         parameters['xz_logits'] = mi.Float([0, -np.inf, -np.inf, 0])
         parameters['y_logits'] = mi.Float([0, -np.inf, -np.inf, -np.inf, 0, -np.inf])
         parameters['group_opacity'] = mi.Float([0, 0.8])
-    factors = FactorizedGaussianColumn(parameters, 2, 3)
+    if tilt:
+        parameters['group_tilt_x'] = mi.Float([0.11, -0.08])
+        parameters['group_tilt_z'] = mi.Float([0.05, 0.15])
+    if per_xz_y_weights:
+        parameters['y_logits'] = mi.Float([0, 1, 2, 3, 1, 0, 2, 0, 1, 0, 2, 1])
+    factors = FactorizedGaussianColumn(parameters, 2, 3, per_xz_y_weights=per_xz_y_weights)
     factors.init_albedo = 0.4
     scene_dict = create_scene_dict_from_primitives(-1, 0, use_columns_representation=True, columns=factors, extent=2.5)
     save_model(Path(directory), mi.load_dict(scene_dict), 0, columns=factors, use_factorized_columns_representation=True)
@@ -62,6 +67,49 @@ class FactorizedColumnPlyTests(unittest.TestCase):
             np.testing.assert_allclose(np.asarray(geometry['albedo']), 0.4)
             scene = mi.load_dict({'type': 'scene', 'primitives': geometry})
             self.assertEqual(mi.traverse(scene)['primitives.opacities'].shape, (12,))
+
+    def test_tilted_ply_round_trip_and_geometry_restriction(self):
+        # save local angles and reconstruct tilted centers and quaternions.
+        with tempfile.TemporaryDirectory() as directory:
+            factors, _, asset, path = save_factors(directory, tilt=True)
+            ply = plyfile.PlyData.read(path, mmap=False)
+            self.assertEqual(int(ply['metadata'].data['format_version'][0]), 4)
+            self.assertEqual(ply['group'].data.dtype.names, ('opacity', 'tilt_x', 'tilt_z'))
+            info = detect_asset_info(asset, use_factorized_columns_representation=True)
+            self.assertEqual(info.fgc_tilt_levels, {0})
+            geometry = load_pyramid_level(info, 0)
+            centers, _, quaternions, _ = factors.expand()
+            np.testing.assert_allclose(np.asarray(geometry['centers']), centers.numpy().T, atol=1e-7)
+            np.testing.assert_allclose(np.asarray(geometry['quaternions']), quaternions.numpy().T, atol=1e-7)
+            mi.load_dict({'type': 'scene', 'primitives': geometry})
+            with self.assertRaisesRegex(ValueError, 'per-Gaussian traversal'):
+                detect_asset_info(asset, use_factorized_columns_representation=True, use_fgc_bvh=True)
+
+    def test_shared_ply_initializes_identical_per_xz_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shared, _, _, path = save_factors(directory, zero_weights=True, tilt=True)
+            factors = load_ellipsoid_ply(path, use_factorized_columns_representation=True)
+            expanded_weights = FactorizedGaussianColumn.from_ply_factors(factors, per_xz_y_weights=True)
+            for expected, actual in zip(shared.expand(), expanded_weights.expand()):
+                np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=1e-7, rtol=1e-6)
+
+    def test_per_xz_height_weight_ply_round_trip(self):
+        for tilt in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                factors, _, asset, path = save_factors(directory, tilt=tilt, per_xz_y_weights=True)
+                ply = plyfile.PlyData.read(path, mmap=False)
+                self.assertEqual(int(ply['metadata'].data['format_version'][0]), 5)
+                self.assertEqual(len(ply['y'].data), 6)
+                self.assertEqual(len(ply['xz_y'].data), 12)
+                loaded = load_ellipsoid_ply(path, use_factorized_columns_representation=True)
+                np.testing.assert_allclose(loaded['y_weight'].reshape(4, 3).sum(axis=1), 1.0, atol=1e-7)
+                info = detect_asset_info(asset, use_factorized_columns_representation=True)
+                self.assertEqual(info.fgc_per_xz_y_weight_levels, {0})
+                with self.assertRaisesRegex(ValueError, 'per-Gaussian traversal'):
+                    detect_asset_info(asset, use_factorized_columns_representation=True, use_fgc_bvh=True)
+                geometry = load_pyramid_level(info, 0)
+                for key, values in zip(('centers', 'scales', 'quaternions', 'opacities'), factors.expand()):
+                    np.testing.assert_allclose(np.asarray(geometry[key]).ravel(), values.numpy().T.ravel(), atol=1e-7, rtol=1e-6)
 
     def test_common_transforms_and_arbitrary_subset(self):
         # apply existing world, opacity, albedo and subset processing after expansion.

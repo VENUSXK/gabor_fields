@@ -611,6 +611,10 @@ def main():
     # Detect pyramid asset structure
     asset_info = detect_asset_info(args.asset, use_columns_representation=args.use_columns_representation,
                                    use_factorized_columns_representation=args.use_factorized_columns_representation, use_fgc_bvh=args.use_fgc_bvh)
+    if asset_info.fgc_tilt_levels and (getattr(args, 'use_fgc_planar_coverage', False) or args.use_fgc_lut):
+        raise ValueError('Tilted FGC assets require per-Gaussian rendering without planar coverage or LUTs')
+    if asset_info.fgc_per_xz_y_weight_levels and (getattr(args, 'use_fgc_planar_coverage', False) or args.use_fgc_lut):
+        raise ValueError('FGC per-XZ height weights require per-Gaussian rendering without planar coverage or LUTs')
     print(f"Detected asset: {asset_info}")
 
     # use the fitted archive's texture sizes when naming and rendering outputs.

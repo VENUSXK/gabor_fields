@@ -114,6 +114,76 @@ class FactorizedGaussianColumnTests(unittest.TestCase):
             self.assertTrue(np.isfinite(gradient).all(), name)
             self.assertTrue(np.any(gradient != 0), name)
 
+    def test_group_tilt_starts_upright_and_has_gradients(self):
+        # check identity parity while keeping both tilt parameters connected.
+        parameters = make_parameters()
+        upright = FactorizedGaussianColumn(parameters.copy(), 2, 3)
+        for name in FactorizedGaussianColumn.tilt_parameter_names:
+            parameters[name] = dr.zeros(mi.Float, 2)
+            dr.enable_grad(parameters[name])
+        tilted = FactorizedGaussianColumn(parameters, 2, 3)
+        for actual, expected in zip(tilted.expand(), upright.expand()):
+            np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+        self.assertEqual(tilted.parameter_stats()['trainable_parameter_count'],
+                         upright.parameter_stats()['trainable_parameter_count'] + 4)
+        points = mi.Point3f([0.03, 2.08], [0.08, 0.35], [10.06, 11.91])
+        density = tilted.eval_density(points)
+        np.testing.assert_array_equal(density.numpy(), upright.eval_density(points).numpy())
+        dr.backward(dr.sum(density))
+        for name in tilted.tilt_parameter_names:
+            gradient = dr.grad(parameters[name]).numpy()
+            self.assertTrue(np.isfinite(gradient).all(), name)
+            self.assertTrue(np.all(gradient != 0), name)
+
+    def test_tilted_density_matches_expansion(self):
+        # combine distinct group tilts over rotated anisotropic xz factors.
+        parameters = make_parameters()
+        parameters['column_quaternions'] = mi.Float([0.4, -0.3, 0.6, -0.5])
+        parameters['group_tilt_x'] = mi.Float([0.1, -0.2])
+        parameters['group_tilt_z'] = mi.Float([-0.05, 0.15])
+        columns = FactorizedGaussianColumn(parameters, 2, 3)
+        centers, scales, quaternions, weights = columns.expand()
+        rotation = dr.quat_to_matrix(mi.Matrix3f, quaternions)
+        points = mi.Point3f([0.03, 2.08], [0.08, 0.35], [10.06, 11.91])
+
+        # independently evaluate all expanded kernels at each world-space point.
+        expected = []
+        for x, y, z in points.numpy().T.tolist():
+            local = (rotation.T * (mi.Point3f(x, y, z) - centers)) / scales
+            pdf = dr.exp(-0.5 * dr.squared_norm(local)) / ((2.0 * np.pi) ** 1.5 * dr.prod(scales))
+            expected.append(float(dr.sum(weights * pdf)[0]))
+        np.testing.assert_allclose(columns.eval_density(points).numpy(), expected, rtol=2e-5)
+
+    def test_per_xz_height_weights(self):
+        # duplicate nonuniform shared weights before allowing each xz factor to vary.
+        parameters = make_parameters()
+        shared = FactorizedGaussianColumn(parameters.copy(), 2, 3)
+        y_logits = np.repeat(parameters['y_logits'].numpy().reshape(2, 1, 3), 2, axis=1)
+        parameters['y_logits'] = mi.Float(y_logits.ravel())
+        columns = FactorizedGaussianColumn(parameters, 2, 3, per_xz_y_weights=True)
+        for actual, expected in zip(columns.expand(), shared.expand()):
+            np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+        points = mi.Point3f([0.03, 2.08], [0.08, 0.35], [10.06, 11.91])
+        np.testing.assert_allclose(columns.eval_density(points).numpy(), shared.eval_density(points).numpy(), rtol=1e-6)
+
+        # change only one horizontal factor and compare the density against expanded gaussians.
+        y_logits[0, 0] = [2.0, -0.5, 0.1]
+        parameters['y_logits'] = mi.Float(y_logits.ravel())
+        dr.enable_grad(parameters['y_logits'])
+        centers, scales, quaternions, weights = columns.expand()
+        np.testing.assert_array_equal(weights.numpy()[3:], shared.expand()[3].numpy()[3:])
+        expected = []
+        rotation = dr.quat_to_matrix(mi.Matrix3f, quaternions)
+        for x, y, z in points.numpy().T.tolist():
+            local = (rotation.T * (mi.Point3f(x, y, z) - centers)) / scales
+            pdf = dr.exp(-0.5 * dr.squared_norm(local)) / ((2.0 * np.pi) ** 1.5 * dr.prod(scales))
+            expected.append(float(dr.sum(weights * pdf)[0]))
+        density = columns.eval_density(points)
+        np.testing.assert_allclose(density.numpy(), expected, rtol=2e-6)
+        dr.backward(dr.sum(density))
+        self.assertTrue(np.all(np.isfinite(dr.grad(parameters['y_logits']).numpy())))
+        self.assertTrue(np.all(dr.grad(parameters['y_logits']).numpy().reshape(4, 3)[0] != 0))
+
     def test_optimizer_binding(self):
         # preserve live optimizer updates and constrain total group weights.
         opt = gfields.optimizers.BoundedAdam(noise_init=0.0)

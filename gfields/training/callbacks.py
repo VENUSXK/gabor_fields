@@ -165,6 +165,8 @@ class PlotCallback(CallbackABC):
         if 'group_opacity' in parameters:
             xz_weights = self.columns._group_softmax(parameters['xz_logits'], self.columns.xz_gaussians_per_group).numpy()
             y_weights = self.columns._group_softmax(parameters['y_logits'], self.columns.y_gaussians_per_group).numpy()
+            if self.columns.per_xz_y_weights:
+                axial_scales = axial_scales[self.columns.y_indices.numpy()]
             before.update(group_opacity=parameters['group_opacity'].numpy(), xz_weight=xz_weights, y_weight=y_weights,
                           xz_density=xz_weights / (2.0 * np.pi * np.prod(shared_scales, axis=0)),
                           y_density=y_weights / (np.sqrt(2.0 * np.pi) * axial_scales))

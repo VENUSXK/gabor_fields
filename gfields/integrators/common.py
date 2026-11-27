@@ -213,11 +213,12 @@ class GaussianColumn:
 
 
 class FactorizedGaussianColumn:
-    """Groups of XZ Gaussian mixtures sharing normalized Y Gaussian mixtures."""
+    """Groups of XZ Gaussians sharing Y geometry with group or per-XZ weights."""
     parameter_names = ('column_center_xz', 'column_scale_xz', 'column_quaternions', 'xz_logits',
                        'primitive_center_y', 'primitive_scale_y', 'y_logits', 'group_opacity')
+    tilt_parameter_names = ('group_tilt_x', 'group_tilt_z')
 
-    def __init__(self, parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds=None):
+    def __init__(self, parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds=None, *, per_xz_y_weights=False):
         # define the fixed factor layout and keep initial or live parameters.
         counts = (xz_gaussians_per_group, y_gaussians_per_group)
         if any(isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count <= 0 for count in counts):
@@ -225,6 +226,10 @@ class FactorizedGaussianColumn:
         self.xz_gaussians_per_group = int(xz_gaussians_per_group)
         self.y_gaussians_per_group = int(y_gaussians_per_group)
         self.group_count = dr.width(parameters['group_opacity'])
+        self.per_xz_y_weights = per_xz_y_weights
+        self.use_group_tilt = any(name in parameters for name in self.tilt_parameter_names)
+        if self.use_group_tilt:
+            self.parameter_names = self.parameter_names + self.tilt_parameter_names
         self._parameters = parameters
         self._column_optimizer = None
 
@@ -244,6 +249,7 @@ class FactorizedGaussianColumn:
         self.group_indices = indices // (self.xz_gaussians_per_group * self.y_gaussians_per_group)
         self.xz_indices = indices // self.y_gaussians_per_group
         self.y_indices = self.group_indices * self.y_gaussians_per_group + indices % self.y_gaussians_per_group
+        self.y_weight_indices = indices if per_xz_y_weights else self.y_indices
 
     @property
     def column_optimizer(self):
@@ -264,17 +270,52 @@ class FactorizedGaussianColumn:
         # check the three parameter families against the fixed group layout.
         for name in self.parameter_names:
             count = self.xz_gaussians_per_group if name.startswith('column_') or name == 'xz_logits' else self.y_gaussians_per_group
-            expected_count = self.group_count if name == 'group_opacity' else self.group_count * count
+            expected_count = self.group_count if name.startswith('group_') else self.group_count * count
+            if name == 'y_logits' and self.per_xz_y_weights:
+                expected_count *= self.xz_gaussians_per_group
             if dr.width(self.parameters[name]) != expected_count:
                 raise ValueError(f'{name} must contain {expected_count} entries for the FGC layout')
 
     def _group_softmax(self, logits, components_per_group):
         # normalize each mixture independently with a stable differentiable softmax.
-        values = mi.TensorXf(logits, shape=(self.group_count, components_per_group))
-        maximum = dr.reshape(mi.TensorXf, dr.detach(dr.max(values, axis=1)), (self.group_count, 1))
+        rows = dr.width(logits) // components_per_group
+        values = mi.TensorXf(logits, shape=(rows, components_per_group))
+        maximum = dr.reshape(mi.TensorXf, dr.detach(dr.max(values, axis=1)), (rows, 1))
         weights = dr.exp(values - maximum)
-        total = dr.reshape(mi.TensorXf, dr.sum(weights, axis=1), (self.group_count, 1))
+        total = dr.reshape(mi.TensorXf, dr.sum(weights, axis=1), (rows, 1))
         return (weights / total).array
+
+    @classmethod
+    def from_ply_factors(cls, factors, scale_lower_bounds=None, *, per_xz_y_weights=False):
+        # reconstruct local geometry and logits from normalized ply weights.
+        r, j, k = (factors[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+        names = ('column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'group_opacity', *cls.tilt_parameter_names)
+        parameters = {name: mi.Float(factors[name]) for name in names if name in factors}
+        parameters['column_center_xz'] = mi.Point2f(factors['column_center_xz'].T)
+        parameters['column_scale_xz'] = mi.Vector2f(factors['column_scale_xz'].T)
+        has_per_xz_weights = factors['per_xz_y_weights']
+        for axis in ('xz', 'y'):
+            weights = factors[f'{axis}_weight']
+            if axis == 'y' and per_xz_y_weights and not has_per_xz_weights:
+                weights = np.repeat(weights.reshape(r, 1, k), j, axis=1).ravel()
+            logits = np.log(weights, out=np.full_like(weights, -np.inf), where=weights > 0)
+            parameters[f'{axis}_logits'] = mi.Float(logits)
+        return cls(parameters, j, k, scale_lower_bounds, per_xz_y_weights=per_xz_y_weights or has_per_xz_weights)
+
+    def _group_frame(self):
+        # center the shared tilt on the mean of each group's local factors.
+        parameters = self.parameters
+        xz_shape = (self.group_count, self.xz_gaussians_per_group)
+        y_shape = (self.group_count, self.y_gaussians_per_group)
+        center_xz, center_y = parameters['column_center_xz'], parameters['primitive_center_y']
+        x = dr.mean(mi.TensorXf(center_xz[0], shape=xz_shape), axis=1).array
+        y = dr.mean(mi.TensorXf(center_y, shape=y_shape), axis=1).array
+        z = dr.mean(mi.TensorXf(center_xz[1], shape=xz_shape), axis=1).array
+        pivot = mi.Point3f(x, y, z)
+
+        # use the same differentiable group rotation for expansion and density queries.
+        rotation = dr.euler_to_quat(mi.Point3f(parameters['group_tilt_x'], 0.0, parameters['group_tilt_z']))
+        return pivot, rotation
 
     def expand(self):
         # read live factors and normalize weights within each group.
@@ -294,8 +335,17 @@ class FactorizedGaussianColumn:
         centers = mi.Point3f(center_xz[0], center_y, center_xz[1])
         scales = mi.Vector3f(scale_xz[0], scale_y, scale_xz[1])
         quaternions = dr.euler_to_quat(mi.Point3f(0.0, angles, 0.0))
+        if self.use_group_tilt:
+            # rotate world centers about their group pivot and compose with local yaw.
+            pivot, rotation = self._group_frame()
+            pivot = dr.gather(mi.Point3f, pivot, self.group_indices)
+            rotation = dr.gather(mi.Quaternion4f, rotation, self.group_indices)
+            offset = centers - pivot
+            centers += dr.quat_to_matrix(mi.Matrix3f, rotation) * offset - offset
+            quaternions = rotation * quaternions
+
         opacities = dr.gather(mi.Float, parameters['group_opacity'], self.group_indices)
-        opacities *= dr.gather(mi.Float, xz_weights, self.xz_indices) * dr.gather(mi.Float, y_weights, self.y_indices)
+        opacities *= dr.gather(mi.Float, xz_weights, self.xz_indices) * dr.gather(mi.Float, y_weights, self.y_weight_indices)
         return centers, scales, quaternions, opacities
 
     def eval_density(self, points: mi.Point3f) -> mi.Float:
@@ -303,31 +353,46 @@ class FactorizedGaussianColumn:
         parameters = self.parameters
         point_count = dr.width(points)
         j, k = self.xz_gaussians_per_group, self.y_gaussians_per_group
-        xz_count, y_count = self.group_count * j, self.group_count * k
+        repeat_groups = 1 if self.use_group_tilt else self.group_count
+        if self.use_group_tilt:
+            # inverse-rotate each query once per group, before expanding to individual factors.
+            pivot, rotation = self._group_frame()
+            pivot = dr.tile(pivot, point_count)
+            rotation = dr.quat_to_matrix(mi.Matrix3f, dr.tile(rotation, point_count))
+            points = dr.repeat(points, self.group_count)
+            offset = points - pivot
+            points += rotation.T * offset - offset
 
         # evaluate normalized xz mixtures in the local frame of each gaussian.
         centers = dr.tile(parameters['column_center_xz'], point_count)
         scales = dr.tile(parameters['column_scale_xz'], point_count)
-        dx = dr.repeat(points[0], xz_count) - centers[0]
-        dz = dr.repeat(points[2], xz_count) - centers[1]
+        dx = dr.repeat(points[0], repeat_groups * j) - centers[0]
+        dz = dr.repeat(points[2], repeat_groups * j) - centers[1]
         sin_angle, cos_angle = dr.sincos(dr.tile(parameters['column_quaternions'], point_count))
         x = (cos_angle * dx - sin_angle * dz) / scales[0]
         z = (sin_angle * dx + cos_angle * dz) / scales[1]
         xz_weights = self._group_softmax(parameters['xz_logits'], j)
         xz_density = dr.tile(xz_weights, point_count) * dr.exp(-0.5 * (dr.square(x) + dr.square(z)))
         xz_density /= 2.0 * dr.pi * scales[0] * scales[1]
-        xz_mixture = dr.sum(mi.TensorXf(xz_density, shape=(point_count, self.group_count, j)), axis=2)
+        xz_density = mi.TensorXf(xz_density, shape=(point_count, self.group_count, j))
 
-        # evaluate normalized y mixtures independently of the xz factors.
+        # evaluate each shared y gaussian once per query and group.
         scale_y = dr.tile(parameters['primitive_scale_y'], point_count)
-        y = (dr.repeat(points[1], y_count) - dr.tile(parameters['primitive_center_y'], point_count)) / scale_y
+        y = (dr.repeat(points[1], repeat_groups * k) - dr.tile(parameters['primitive_center_y'], point_count)) / scale_y
         y_weights = self._group_softmax(parameters['y_logits'], k)
-        y_density = dr.tile(y_weights, point_count) * dr.exp(-0.5 * dr.square(y)) / (dr.sqrt(2.0 * dr.pi) * scale_y)
-        y_mixture = dr.sum(mi.TensorXf(y_density, shape=(point_count, self.group_count, k)), axis=2)
+        y_density = dr.exp(-0.5 * dr.square(y)) / (dr.sqrt(2.0 * dr.pi) * scale_y)
+        if self.per_xz_y_weights:
+            # apply a distinct height mixture to each xz gaussian.
+            y_pdf = mi.TensorXf(y_density, shape=(point_count, self.group_count, 1, k))
+            weights = mi.TensorXf(y_weights, shape=(1, self.group_count, j, k))
+            group_density = dr.sum(xz_density * dr.sum(y_pdf * weights, axis=3), axis=2)
+        else:
+            y_density = mi.TensorXf(dr.tile(y_weights, point_count) * y_density, shape=(point_count, self.group_count, k))
+            group_density = dr.sum(xz_density, axis=2) * dr.sum(y_density, axis=2)
 
         # sum the weighted density products from all groups for each point.
         group_weights = mi.TensorXf(parameters['group_opacity'], shape=(1, self.group_count))
-        return dr.sum(xz_mixture * y_mixture * group_weights, axis=1).array
+        return dr.sum(group_density * group_weights, axis=1).array
 
     def parameter_stats(self):
         # report stored factors separately from expanded rendering primitives.

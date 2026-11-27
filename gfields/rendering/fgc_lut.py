@@ -13,6 +13,11 @@ from gfields.io import load_ellipsoid_ply
 
 def fgc_factor_support(factors):
     """Return per-group bounds and per-factor splat bounds in asset coordinates."""
+    if 'group_tilt_x' in factors:
+        raise ValueError('FGC LUT bounds require upright groups')
+    if factors.get('per_xz_y_weights', False):
+        raise ValueError('FGC LUT requires shared height weights within each group')
+
     # project the rotated xz ellipses onto the axes and bound the y intervals.
     groups = factors['group_count']
     extent = factors['extent']

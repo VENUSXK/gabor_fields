@@ -133,6 +133,9 @@ def setup() -> argparse.Namespace:
     parser.add_argument('--use_column_bvh', action='store_true', help='Trace one analytic BVH bound per column while retaining per-primitive integration')
     parser.add_argument('--init_from_columns', action='store_true', help='Initialize independent Gaussians from expanded columns without sharing their optimization parameters')
     parser.add_argument('--use_factorized_columns_representation', action='store_true', help='Fit fixed FGC groups using per-Gaussian rendering')
+    parser.add_argument('--use_fgc_group_tilt', action='store_true', help='Learn a shared X/Z tilt for each FGC group')
+    parser.add_argument('--use_fgc_per_xz_y_weights', action='store_true', help='Learn a separate height weight distribution for each FGC XZ Gaussian')
+    parser.add_argument('--fgc_init_from_asset', default=None, help='Initialize per-XZ height weights from a shared-weight FGC asset or PLY')
     parser.add_argument('--fit_density', action='store_true', help='Train FGC on sampled voxel densities and render only for evaluation')
     parser.add_argument('--density_batch_size', type=int, default=256, help='Number of voxel samples per density training step')
     parser.add_argument('--init_from_factorized_columns', action='store_true', help='Initialize independent Gaussians from the same expanded FGC layout')
@@ -226,6 +229,12 @@ def setup() -> argparse.Namespace:
         parser.error('--density_batch_size must be positive')
 
     # keep factorized training and its matched independent baseline mutually exclusive.
+    if args.use_fgc_group_tilt and not args.use_factorized_columns_representation:
+        parser.error('--use_fgc_group_tilt requires --use_factorized_columns_representation')
+    if args.use_fgc_per_xz_y_weights and not args.use_factorized_columns_representation:
+        parser.error('--use_fgc_per_xz_y_weights requires --use_factorized_columns_representation')
+    if args.fgc_init_from_asset and not args.use_fgc_per_xz_y_weights:
+        parser.error('--fgc_init_from_asset requires --use_fgc_per_xz_y_weights')
     fgc_mode = args.use_factorized_columns_representation or args.init_from_factorized_columns
     if fgc_mode:
         if args.use_factorized_columns_representation and args.init_from_factorized_columns:
@@ -601,6 +610,7 @@ def generate_random_factorized_columns(
     group_count: int, xz_gaussians_per_group: int, y_gaussians_per_group: int,
     init_opacities: float, init_scale: float, init_albedo: float, *, volume: np.ndarray,
     volume_config: VolumeConfig, column_slab_depth: int = 0, seed_offset: int = 0,
+    use_group_tilt: bool = False, per_xz_y_weights: bool = False,
 ) -> FactorizedGaussianColumn:
     """Initialize local XZ mixtures sharing Y factors; init_opacities is per expanded Gaussian."""
     # validate factor counts before generating the shared layout.
@@ -619,11 +629,54 @@ def generate_random_factorized_columns(
     parameters.pop('primitive_opacity')
     parameters['xz_logits'] = dr.zeros(mi.Float, group_count * xz_gaussians_per_group)
     parameters['y_logits'] = dr.zeros(mi.Float, group_count * y_gaussians_per_group)
+    if per_xz_y_weights:
+        # start each xz factor with the original shared height distribution.
+        logits = mi.TensorXf(parameters['y_logits'], shape=(group_count, 1, y_gaussians_per_group))
+        parameters['y_logits'] = dr.repeat(logits, xz_gaussians_per_group, axis=1).array
     parameters['group_opacity'] = dr.full(mi.Float, init_opacities * xz_gaussians_per_group * y_gaussians_per_group, group_count)
 
+    # initialize tilts at the same geometry as the upright baseline.
+    if use_group_tilt:
+        for name in FactorizedGaussianColumn.tilt_parameter_names:
+            parameters[name] = dr.zeros(mi.Float, group_count)
+
     # retain rendering metadata without creating an optimizer.
-    columns = FactorizedGaussianColumn(parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds)
+    columns = FactorizedGaussianColumn(parameters, xz_gaussians_per_group, y_gaussians_per_group, scale_lower_bounds,
+                                       per_xz_y_weights=per_xz_y_weights)
     columns.init_albedo = float(init_albedo)
+    return columns
+
+
+def load_factorized_columns_for_training(args, volume, volume_config):
+    # initialize from level-zero factors with fresh optimizer state.
+    from gfields.rendering.pipeline import resolve_asset_path
+
+    path = Path(args.fgc_init_from_asset)
+    if path.suffix.lower() != '.ply':
+        path = resolve_asset_path(str(path), asset_pyr=0) / 'data' / 'root.primitives_pyr0.ply'
+    factors = gfields.io.load_ellipsoid_ply(path, use_factorized_columns_representation=True)
+    shape = tuple(factors[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
+    if shape != (args.group_count, args.xz_gaussians_per_group, args.y_gaussians_per_group):
+        raise ValueError(f'FGC initialization requires matching R, J, and K; source layout is {shape}')
+    if factors['per_xz_y_weights']:
+        raise ValueError('FGC initialization requires a shared-height-weight source')
+
+    # keep trainable logits finite and preserve or initialize the shared group rotation.
+    for name in ('xz_weight', 'y_weight'):
+        factors[name] = np.maximum(factors[name], 1e-30)
+    if 'group_tilt_x' in factors and not args.use_fgc_group_tilt:
+        raise ValueError('A tilted FGC source requires --use_fgc_group_tilt')
+    if args.use_fgc_group_tilt:
+        for name in FactorizedGaussianColumn.tilt_parameter_names:
+            factors.setdefault(name, np.zeros(shape[0], dtype=np.float32))
+
+    # retain the same voxel-aware scale bounds as fresh fgc initialization.
+    world_scale = np.abs(np.diag(np.asarray(volume_config.to_world.matrix))[:3])
+    minimum_scales = np.maximum(0.5 * world_scale / np.asarray(volume.shape[::-1]), 1e-5)
+    bounds = {'column_scale_xz': minimum_scales[[0, 2]].tolist(), 'primitive_scale_y': float(minimum_scales[1])}
+    columns = FactorizedGaussianColumn.from_ply_factors(factors, bounds, per_xz_y_weights=True)
+    columns.init_albedo = float(args.init_albedo)
+    columns.init_extent = factors['extent']
     return columns
 
 
@@ -1074,6 +1127,9 @@ def create_lr_dict(args: argparse.Namespace, global_lr: float, level: int) -> Di
             lr_dict['group_opacity'] = global_lr * args.opacity_lr * args.xz_gaussians_per_group * args.y_gaussians_per_group
             lr_dict['xz_logits'] = global_lr * args.mixture_lr
             lr_dict['y_logits'] = global_lr * args.mixture_lr
+            if getattr(args, 'use_fgc_group_tilt', False):
+                for name in FactorizedGaussianColumn.tilt_parameter_names:
+                    lr_dict[name] = lr_dict['column_quaternions']
         else:
             lr_dict['primitive_opacity'] = global_lr * args.opacity_lr
     else:
@@ -1231,6 +1287,13 @@ def write_scene_params_to_optimizer(params: mi.SceneParameters, opt: mi.ad.Optim
             r, j, k = columns.group_count, columns.xz_gaussians_per_group, columns.y_gaussians_per_group
             if dr.width(ellipsoids.center) != r * j * k:
                 raise ValueError('Scene primitive count does not match the FGC layout')
+            # retain local logits and geometry for tilted or per-xz layouts.
+            if columns.use_group_tilt or columns.per_xz_y_weights:
+                for name in columns.parameter_names:
+                    opt[name] = columns.parameters[name]
+                columns.column_optimizer = opt
+                return
+
             xz_indices = dr.arange(mi.UInt32, r * j) * k
             y_indices = dr.arange(mi.UInt32, r * k)
             y_indices = (y_indices // k) * j * k + y_indices % k
@@ -1292,6 +1355,10 @@ def configure_optimizer(opt: mi.ad.Optimizer, args: argparse.Namespace,
         opt.set_bounds('primitive_scale_y', lower=float(columns.scale_lower_bounds['primitive_scale_y']), upper=1.0)
         if use_factorized_columns:
             opt.set_bounds('group_opacity', lower=0.0)
+            if columns.use_group_tilt:
+                limit = float(np.deg2rad(15.0))
+                for name in columns.tilt_parameter_names:
+                    opt.set_bounds(name, lower=-limit, upper=limit)
         else:
             opt.set_bounds('primitive_opacity', lower=1e-8, upper=1.0)
     else:
@@ -1379,6 +1446,10 @@ def save_model(output_path: Path, scene: mi.Scene, level: int, use_columns_repre
             for axis, count in (('xz', columns.xz_gaussians_per_group), ('y', columns.y_gaussians_per_group)):
                 primitive[f'{axis}_weight'] = columns._group_softmax(parameters[f'{axis}_logits'], count).numpy().copy()
             primitive['group_opacity'] = parameters['group_opacity'].numpy().copy()
+            primitive['per_xz_y_weights'] = columns.per_xz_y_weights
+            if columns.use_group_tilt:
+                for name in columns.tilt_parameter_names:
+                    primitive[name] = parameters[name].numpy().copy()
         else:
             primitive['primitive_opacity'] = parameters['primitive_opacity'].numpy().copy()
             primitive['primitives_per_column'] = columns.primitives_per_column

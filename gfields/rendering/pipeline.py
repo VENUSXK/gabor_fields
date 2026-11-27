@@ -65,6 +65,8 @@ class AssetInfo:
     use_factorized_columns_representation: bool = False
     use_fgc_bvh: bool = False
     factorized_group_shapes: Dict[int, tuple[int, int, int]] = field(default_factory=dict)
+    fgc_tilt_levels: set[int] = field(default_factory=set)
+    fgc_per_xz_y_weight_levels: set[int] = field(default_factory=set)
 
     def __repr__(self) -> str:  # noqa: D401
         extent_summary: Dict[int, Any] = {}
@@ -129,6 +131,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
         has_omega, has_albedo, num_primitives, extents, primitives_per_column = {}, {}, {}, {}, {}
         primitive_count_per_column = {}
         factorized_group_shapes = {}
+        fgc_tilt_levels = set()
+        fgc_per_xz_y_weight_levels = set()
         for level in range(num_levels):
             a = gfields.io.load_ellipsoid_ply(
                 os.path.join(ply_folder, f"root.primitives_pyr{level}.ply"), use_columns_representation=use_columns_representation,
@@ -137,6 +141,14 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             if use_factorized_columns_representation:
                 shape = tuple(a[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
                 factorized_group_shapes[level] = shape
+                if 'group_tilt_x' in a:
+                    fgc_tilt_levels.add(level)
+                    if use_fgc_bvh:
+                        raise ValueError('Tilted FGC assets require per-Gaussian traversal')
+                if a['per_xz_y_weights']:
+                    fgc_per_xz_y_weight_levels.add(level)
+                    if use_fgc_bvh:
+                        raise ValueError('FGC per-XZ height weights require per-Gaussian traversal')
                 num_primitives[level] = int(np.prod(shape))
             elif use_columns_representation:
                 num_primitives[level] = len(a['primitive_center_y'])
@@ -156,7 +168,8 @@ def detect_asset_info(asset_path: str | os.PathLike[str], use_columns_representa
             use_columns_representation=use_columns_representation, primitives_per_column=primitives_per_column,
             primitive_count_per_column=primitive_count_per_column,
             use_factorized_columns_representation=use_factorized_columns_representation, use_fgc_bvh=use_fgc_bvh,
-            factorized_group_shapes=factorized_group_shapes)
+            factorized_group_shapes=factorized_group_shapes, fgc_tilt_levels=fgc_tilt_levels,
+            fgc_per_xz_y_weight_levels=fgc_per_xz_y_weight_levels)
 
     # Deprecated fallback: read the legacy per-array npy_data/ layout directly.
     npy_folder = os.path.join(asset_path, "npy_data")
@@ -367,29 +380,24 @@ def load_pyramid_level(
         import mitsuba as mi
         from gfields.integrators.common import GaussianColumn, FactorizedGaussianColumn
 
-        # restore the shared parameter layout without creating an optimizer.
-        parameters = {name: mi.Float(a[name]) for name in ('column_quaternions', 'primitive_center_y', 'primitive_scale_y')}
-        parameters['column_center_xz'] = mi.Point2f(a['column_center_xz'].T)
-        parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
-
         # reconstruct normalized fgc factors and optionally group their bvh bounds.
         if use_factorized_columns:
             shape = tuple(a[name] for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
             if shape != asset_info.factorized_group_shapes[level]:
                 raise ValueError('FGC PLY layout changed after asset detection')
-            parameters['group_opacity'] = mi.Float(a['group_opacity'])
-            for axis in ('xz', 'y'):
-                weights = a[f'{axis}_weight']
-                logits = np.log(weights, out=np.full_like(weights, -np.inf), where=weights > 0)
-                parameters[f'{axis}_logits'] = mi.Float(logits)
-            columns = FactorizedGaussianColumn(parameters, shape[1], shape[2])
+            columns = FactorizedGaussianColumn.from_ply_factors(a)
+            if asset_info.use_fgc_bvh and (columns.use_group_tilt or columns.per_xz_y_weights):
+                raise ValueError('FGC tilt and per-XZ height weights require per-Gaussian traversal')
             grouped_columns = asset_info.use_fgc_bvh
             if grouped_columns:
                 fgc_factors = a
                 primitives_per_column = shape[1] * shape[2]
         else:
-            # preserve fixed and variable-length Column rendering behavior.
-            parameters['primitive_opacity'] = mi.Float(a['primitive_opacity'])
+            # restore the ordinary column geometry and its independent weights.
+            names = ('column_quaternions', 'primitive_center_y', 'primitive_scale_y', 'primitive_opacity')
+            parameters = {name: mi.Float(a[name]) for name in names}
+            parameters['column_center_xz'] = mi.Point2f(a['column_center_xz'].T)
+            parameters['column_scale_xz'] = mi.Vector2f(a['column_scale_xz'].T)
             if a['primitives_per_column'] != primitives_per_column or len(a['primitive_center_y']) != num_prims:
                 raise ValueError('Column PLY layout changed after asset detection')
             counts = a['primitive_count_per_column']

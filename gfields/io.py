@@ -383,7 +383,7 @@ def _load_factorized_ellipsoid_ply(ply):
     required = {
         'metadata': ('format_version', 'group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group', 'extent', 'albedo_r', 'albedo_g', 'albedo_b'),
         'group': ('opacity',), 'xz': ('center_x', 'center_z', 'scale_x', 'scale_z', 'rotation_angle', 'weight'),
-        'y': ('center_y', 'scale_y', 'weight'),
+        'y': ('center_y', 'scale_y'),
     }
     element_names = {element.name for element in ply.elements}
     for name, fields in required.items():
@@ -394,19 +394,34 @@ def _load_factorized_ellipsoid_ply(ply):
 
     # preserve fixed group dimensions and reject inconsistent record counts.
     metadata = ply['metadata'].data[0]
-    if int(metadata['format_version']) != 3:
-        raise ValueError('FGC PLY requires format_version 3')
+    version = int(metadata['format_version'])
+    if version not in (3, 4, 5):
+        raise ValueError('FGC PLY requires format_version 3, 4, or 5')
     group_count, xz_count, y_count = (int(metadata[name]) for name in ('group_count', 'xz_gaussians_per_group', 'y_gaussians_per_group'))
     groups, xz, y = (ply[name].data for name in ('group', 'xz', 'y'))
     if min(group_count, xz_count, y_count) <= 0 or (len(groups), len(xz), len(y)) != (group_count, group_count * xz_count, group_count * y_count):
         raise ValueError('FGC table lengths must match R, R * J, R * K')
+    per_xz_y_weights = version == 5
+    weight_table_name = 'xz_y' if per_xz_y_weights else 'y'
+    if weight_table_name not in element_names:
+        raise ValueError(f'FGC PLY requires a {weight_table_name!r} height weight table')
+    weight_table = ply[weight_table_name].data
+    expected_weights = group_count * y_count * (xz_count if per_xz_y_weights else 1)
+    if 'weight' not in weight_table.dtype.names or len(weight_table) != expected_weights:
+        raise ValueError('FGC height weight table does not match its format and factor counts')
     out = {
         'column_center_xz': np.stack((xz['center_x'], xz['center_z']), axis=-1).astype(np.float32),
         'column_scale_xz': np.stack((xz['scale_x'], xz['scale_z']), axis=-1).astype(np.float32),
         'column_quaternions': xz['rotation_angle'].astype(np.float32), 'xz_weight': xz['weight'].astype(np.float32),
         'primitive_center_y': y['center_y'].astype(np.float32), 'primitive_scale_y': y['scale_y'].astype(np.float32),
-        'y_weight': y['weight'].astype(np.float32), 'group_opacity': groups['opacity'].astype(np.float32),
+        'y_weight': weight_table['weight'].astype(np.float32), 'group_opacity': groups['opacity'].astype(np.float32),
     }
+
+    if version == 4 or (version == 5 and {'tilt_x', 'tilt_z'}.intersection(groups.dtype.names)):
+        if not {'tilt_x', 'tilt_z'}.issubset(groups.dtype.names):
+            raise ValueError('Tilted FGC PLY requires both group tilt fields')
+        for axis in ('x', 'z'):
+            out[f'group_tilt_{axis}'] = groups[f'tilt_{axis}'].astype(np.float32)
 
     # require physical scales, normalized factor weights, and valid rendering settings.
     if not all(np.isfinite(values).all() for values in out.values()):
@@ -414,13 +429,14 @@ def _load_factorized_ellipsoid_ply(ply):
     if np.any(out['column_scale_xz'] <= 0) or np.any(out['primitive_scale_y'] <= 0) or np.any(out['group_opacity'] < 0):
         raise ValueError('FGC requires positive scales and nonnegative group opacity')
     for name, count in (('xz_weight', xz_count), ('y_weight', y_count)):
-        if np.any(out[name] < 0) or not np.allclose(out[name].reshape(group_count, count).sum(axis=1), 1.0, rtol=1e-5, atol=1e-6):
+        if np.any(out[name] < 0) or not np.allclose(out[name].reshape(-1, count).sum(axis=1), 1.0, rtol=1e-5, atol=1e-6):
             raise ValueError('FGC mixture weights must be nonnegative and normalized within each group')
     extent = float(metadata['extent'])
     albedo = np.array([metadata['albedo_r'], metadata['albedo_g'], metadata['albedo_b']], dtype=np.float32)
     if not np.isfinite(extent) or extent <= 0 or not np.isfinite(albedo).all():
         raise ValueError('FGC PLY requires a finite positive extent and finite RGB albedo')
-    out.update(group_count=group_count, xz_gaussians_per_group=xz_count, y_gaussians_per_group=y_count, extent=extent, albedo=albedo)
+    out.update(group_count=group_count, xz_gaussians_per_group=xz_count, y_gaussians_per_group=y_count, extent=extent,
+               albedo=albedo, per_xz_y_weights=per_xz_y_weights)
     return out
 
 

@@ -202,16 +202,19 @@ if not args.skip_gaussian_optim:
         # generate the selected factor layout with the common volume sampling settings.
         sampling_kwargs = dict(volume=gauss_ref_volume, volume_config=volume_config,
                                column_slab_depth=args.column_slab_depth, seed_offset=args.seed_offset)
-        if args.use_factorized_columns_representation:
+        if args.fgc_init_from_asset:
+            gaussian_columns = load_factorized_columns_for_training(args, gauss_ref_volume, volume_config)
+        elif args.use_factorized_columns_representation:
             gaussian_columns = generate_random_factorized_columns(
                 args.group_count, args.xz_gaussians_per_group, args.y_gaussians_per_group,
-                args.init_opacity, args.init_scale, args.init_albedo, **sampling_kwargs)
+                args.init_opacity, args.init_scale, args.init_albedo, use_group_tilt=args.use_fgc_group_tilt,
+                per_xz_y_weights=args.use_fgc_per_xz_y_weights, **sampling_kwargs)
         else:
             gaussian_columns = generate_random_columns(
                 args.column_count, args.primitives_per_column, args.init_opacity, args.init_scale, args.init_albedo, **sampling_kwargs)
 
-        # Column parameters are expanded inside scene creation.
-        gaussian_prims = {}
+        # expand the column parameters inside scene creation and preserve the source extent.
+        gaussian_prims = {'extent': gaussian_columns.init_extent} if args.fgc_init_from_asset else {}
         print(f'Column parameter budget: {gaussian_columns.parameter_stats()}')
     else:
         # Reuse checkpoint kernels or generate independent kernels.
